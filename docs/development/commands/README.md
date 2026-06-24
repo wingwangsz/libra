@@ -101,3 +101,4 @@
 
 - [`_compatibility.md`](_compatibility.md)：Git 兼容治理、D1-D10 拒绝/延后决策、参数级缺口状态。
 - [`_general.md`](_general.md)：跨命令实现规范、CLIG 现代化、测试和文档维护要求。
+- [`grit-gap.md`](grit-gap.md)：相对 Grit 的 Git 命令差距与分阶段补全执行计划（不含 submodule）。
