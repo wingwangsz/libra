@@ -77,6 +77,13 @@ pub enum AuthCommand {
     },
     /// Remove every stored token (Lore's `auth clear`).
     Clear,
+    /// Move stored tokens between backends (file <-> OS keyring) and switch
+    /// `auth.backend` (lore.md 2.7). Idempotent: re-running converges.
+    Migrate {
+        /// Target backend.
+        #[arg(long, value_parser = ["file", "keyring"])]
+        to: String,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -335,6 +342,24 @@ pub async fn execute_safe(args: AuthArgs, output: &OutputConfig) -> CliResult<()
                 } else {
                     println!("removed {removed} token(s)");
                 }
+            }
+            Ok(())
+        }
+        AuthCommand::Migrate { to } => {
+            let target = match to.as_str() {
+                "keyring" => auth::BackendKind::Keyring,
+                _ => auth::BackendKind::File,
+            };
+            let moved = auth::migrate_tokens(target).await.map_err(map_store)?;
+            if output.is_json() {
+                return emit_json_data(
+                    "auth",
+                    &serde_json::json!({ "action": "migrate", "to": to, "moved": moved }),
+                    output,
+                );
+            }
+            if !output.quiet {
+                println!("moved {moved} token(s) to the {to} backend");
             }
             Ok(())
         }

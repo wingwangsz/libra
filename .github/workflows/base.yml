@@ -250,6 +250,14 @@ jobs:
         run: |
           cargo test --features otlp --test otlp_telemetry -- --test-threads=1
 
+      # lore.md 2.7: keyring-backend plumbing over the in-process mock store
+      # (debug builds only honor the mock env; headless-safe).
+      - name: Run keyring auth backend test (--features keyring)
+        env:
+          LIBRA_SKIP_WEB_BUILD: "1"
+        run: |
+          cargo test --features keyring --test auth_keyring_backend -- --test-threads=1
+
       - name: Upload TUI scenario artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4

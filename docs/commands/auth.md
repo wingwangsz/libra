@@ -27,8 +27,15 @@ Tokens are AES-256-GCM-encrypted with the global vault key
 (`~/.libra/vault-unseal-key`, 0600) and stored as ciphertext in the global
 config DB — `libra config get/list/unset` can neither dump nor forge nor
 delete `auth.token.*` entries (the auth surface is the only door). One token
-per host:port scope; re-login overwrites. An OS-keyring backend is the 2.7
-follow-up behind the same module boundary.
+per host:port scope; re-login overwrites. The **OS-keyring backend** (lore.md
+2.7) is selected with `libra config --global auth.backend keyring` (release
+binaries ship it; Linux uses a statically-vendored libdbus): the secret then
+lives in the platform keychain and only a non-secret marker stays in the
+config store. `libra auth migrate --to keyring|file` moves stored tokens
+(probed, verified, idempotent); flipping `auth.backend` alone is
+non-destructive (lookups consult both). Revocation always reaches both
+backends. `status` reports each token's `backend` and an `unreadable` state
+when a keyring entry is missing or the service is unavailable.
 
 **Attach rules (the trust boundary, stored tokens)**: a stored token is sent
 only on requests whose normalized host:port matches, over **https** (http
@@ -45,6 +52,12 @@ honored); `credential store/erase` never manage auth tokens.
 expiry, and `valid` / `expired` / `undecryptable` (key changed — log in
 again). With `--host` it is scriptable: exit 0 iff a valid token exists.
 Expired tokens are warned about at use time with an `auth login` hint.
+
+**Interactive flows**: a 401 on a non-TTY run fails fast with an
+`auth login` hint (piped protocol data is never consumed by a prompt); on a
+TTY the prompt shows the hint once, and after a prompted attempt genuinely
+succeeds you are offered — once per host, default No — to store the
+credential (`auth.saveOnPrompt` = `ask`/`always`/`never`).
 
 `auth logout --host <h>` revokes one host; `--all` / `auth clear` (Lore's
 verb) revoke everything — revocation works even after key rotation (no

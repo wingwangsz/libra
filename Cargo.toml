@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.17.1818"
+version = "0.17.1819"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -20,6 +20,7 @@ test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
 test-provider  = []   # deterministic hidden provider for local TUI automation tests
 subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/commands/agent.md "Step 2 audit closure")
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
+keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release builds enable it; default dev builds unaffected)
 
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
@@ -140,6 +141,11 @@ opentelemetry = { version = "0.32.0", optional = true }
 opentelemetry_sdk = { version = "0.32.1", optional = true }
 opentelemetry-otlp = { version = "0.32.0", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 tracing-opentelemetry = { version = "0.33.0", optional = true }
+
+# OS-keyring auth backend (lore.md 2.7) — optional; Linux uses the sync
+# secret-service transport with VENDORED libdbus (static, no runtime dylib
+# dependency on end-user machines); macOS/Windows use native stores.
+keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
 
 [target.'cfg(unix)'.dependencies] # only on Unix
 libfuse-fs = "0.1.13"
@@ -271,9 +277,18 @@ path = "tests/compat/format_patch_flag_surface.rs"
 name = "compat_otlp_feature_gate_guard"
 path = "tests/compat/otlp_feature_gate_guard.rs"
 
+[[test]]
+name = "compat_keyring_feature_gate_guard"
+path = "tests/compat/keyring_feature_gate_guard.rs"
+
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).
 [[test]]
 name = "otlp_telemetry"
 path = "tests/otlp_telemetry.rs"
 required-features = ["otlp"]
+
+[[test]]
+name = "auth_keyring_backend"
+path = "tests/auth_keyring_backend.rs"
+required-features = ["keyring"]

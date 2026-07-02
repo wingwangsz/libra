@@ -69,6 +69,7 @@ impl BasicAuth {
         const MAX_TRY: usize = 3;
         let mut res;
         let mut try_cnt = 0;
+        let mut prompted = false;
         loop {
             let mut request = request_builder().await; // RequestBuilder can't be cloned
             // Poison-tolerant: the guarded data is a plain Option swap, so a
@@ -148,13 +149,121 @@ impl BasicAuth {
                 eprintln!("fatal: failed to authenticate after {MAX_TRY} attempts");
                 break;
             }
+            // 401 auto-guidance (lore.md 2.7): a non-TTY caller must never
+            // hit the interactive prompt (it would consume piped protocol
+            // data) — fail fast with the auth-login hint instead.
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                let scope = crate::internal::auth::HostScope::from_request_url(res.url());
+                let hint = scope
+                    .map(|scope| scope.display())
+                    .unwrap_or_else(|| "<host>".to_string());
+                eprintln!(
+                    "fatal: authentication required; run 'libra auth login --host {hint}' \
+                     (or 'libra auth status --host {hint}' to inspect the stored token)"
+                );
+                break;
+            }
+            if try_cnt == 0
+                && let Some(scope) = crate::internal::auth::HostScope::from_request_url(res.url())
+            {
+                eprintln!(
+                    "tip: 'libra auth login --host {}' stores a token so you are not \
+                     prompted again",
+                    scope.display()
+                );
+            }
             emit_warning("authentication required, retrying...");
             AUTH.lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .replace(ask_basic_auth());
+            prompted = true;
             try_cnt += 1;
         }
+        // Persist-on-success offer (lore.md 2.7): after a PROMPTED attempt
+        // genuinely succeeds (2xx — a 403 may be rate-limiting with WRONG
+        // credentials, never an identity proof), offer ONCE per scope per
+        // process to store the credential through the auth machinery.
+        // Consent-based: default No; `auth.saveOnPrompt` = ask|always|never.
+        if prompted && res.status().is_success() {
+            maybe_offer_persist(res.url()).await;
+        }
         Ok(res)
+    }
+}
+
+/// The consent flow for storing an interactively-entered credential. Never
+/// silent: `always` skips the question but still prints what it stored
+/// (scope only — no secret ever reaches output or logs).
+async fn maybe_offer_persist(url: &url::Url) {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let Some(scope) = crate::internal::auth::HostScope::from_request_url(url) else {
+        return; // non-https (non-loopback) would never attach anyway
+    };
+    // Once per scope per process.
+    static OFFERED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    {
+        let mut offered = OFFERED.lock().unwrap_or_else(|poison| poison.into_inner());
+        let set = offered.get_or_insert_with(Default::default);
+        if !set.insert(scope.display()) {
+            return;
+        }
+    }
+    let policy = crate::internal::config::ConfigKv::get("auth.saveOnPrompt")
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "ask".to_string());
+    let store = match policy.as_str() {
+        "never" => return,
+        "always" => true,
+        _ => {
+            eprint!(
+                "Store this credential for {} (encrypted at rest)? [y/N] ",
+                scope.display()
+            );
+            let mut answer = String::new();
+            if std::io::stdin().read_line(&mut answer).is_err() {
+                return;
+            }
+            matches!(answer.trim(), "y" | "Y" | "yes")
+        }
+    };
+    if !store {
+        return;
+    }
+    let credentials = AUTH
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let Some(credentials) = credentials else {
+        return;
+    };
+    // The same validation the auth-login path applies (token rules PLUS the
+    // username rules: non-empty, no ':', no control characters).
+    if credentials.password.is_empty()
+        || credentials.password.len() > 8192
+        || credentials.password.chars().any(|c| c.is_control())
+        || credentials.username.is_empty()
+        || credentials.username.contains(':')
+        || credentials.username.chars().any(|c| c.is_control())
+    {
+        return;
+    }
+    match crate::internal::auth::store_token(
+        &scope,
+        &credentials.username,
+        &credentials.password,
+        None,
+    )
+    .await
+    {
+        Ok(()) => eprintln!("Stored token for {}", scope.display()),
+        Err(error) => eprintln!("warning: could not store the credential: {error}"),
     }
 }
 
