@@ -798,7 +798,48 @@ pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
         .build()
         .map_err(|e| CliError::fatal(format!("failed to create tokio runtime: {e}")))?;
 
-    runtime.block_on(Box::pin(parse_async(args)))
+    // The one vetted telemetry span (lore.md 1.7): canonical subcommand name,
+    // duration, and on failure the stable LBR-* code — NOTHING else. Plain
+    // `tracing`, so it is a no-op without a matching layer; the OTLP layer is
+    // feature+endpoint gated, and the fmt layer excludes this target so
+    // LIBRA_LOG output is byte-unchanged. Library embedders calling
+    // parse_async/exec_async directly bypass it (documented).
+    let command_name = canonical_command_name(args);
+    let span = tracing::info_span!(
+        target: "libra::telemetry",
+        "libra.command",
+        libra.command = command_name.as_deref().unwrap_or("<none>"),
+        otel.status_code = tracing::field::Empty,
+        libra.error_code = tracing::field::Empty,
+    );
+    let result = span.in_scope(|| runtime.block_on(Box::pin(parse_async(args))));
+    if let Err(error) = &result {
+        // tracing-opentelemetry maps `otel.status_code` to the OTel status.
+        span.record("otel.status_code", "ERROR");
+        span.record("libra.error_code", error.stable_code().as_str());
+    }
+    result
+}
+
+/// The CANONICAL subcommand name for telemetry: the raw argv token resolved
+/// through clap's own metadata (aliases like `br` canonicalize to `branch`).
+/// Never derived from user argv content beyond the subcommand token itself.
+fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
+    let argv: Vec<String> = match args {
+        Some(args) => args.iter().map(|s| s.to_string()).collect(),
+        None => env::args().collect(),
+    };
+    let (index, _) = find_subcommand_index(&argv)?;
+    let token = argv.get(index)?;
+    let cli = <Cli as clap::CommandFactory>::command();
+    cli.get_subcommands()
+        .find(|candidate| {
+            candidate.get_name() == token.as_str()
+                || candidate
+                    .get_all_aliases()
+                    .any(|alias| alias == token.as_str())
+        })
+        .map(|candidate| candidate.get_name().to_string())
 }
 
 /// Rewrite Git-style `-<n>` shortcuts into the long-form `-n <n>` flag, but only when

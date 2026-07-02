@@ -55,6 +55,7 @@ fn main() {
             Ok(result) => result,
             Err(_) => {
                 eprintln!("fatal: CLI thread panicked\n\nHint: {INTERNAL_ERROR_REPORT_HINT}");
+                flush_telemetry();
                 std::process::exit(1);
             }
         },
@@ -62,6 +63,7 @@ fn main() {
             eprintln!(
                 "fatal: failed to spawn CLI thread: {err}\n\nHint: {INTERNAL_ERROR_REPORT_HINT}"
             );
+            flush_telemetry();
             std::process::exit(1);
         }
     };
@@ -74,8 +76,18 @@ fn main() {
         let argv: Vec<String> = std::env::args().collect();
         let output = OutputConfig::resolve_from_argv(&argv);
         err.print_for_output(&output);
+        flush_telemetry();
         std::process::exit(err.exit_code());
     }
+    flush_telemetry();
+}
+
+/// Flush OTLP telemetry (feature-gated). MUST be called explicitly before
+/// every `std::process::exit` in main — `process::exit` skips destructors,
+/// so a scopeguard would silently miss exactly the error paths.
+fn flush_telemetry() {
+    #[cfg(feature = "otlp")]
+    libra::utils::telemetry::shutdown();
 }
 
 /// Configure the global [`tracing`] subscriber.
@@ -97,62 +109,108 @@ fn main() {
 /// - If `LIBRA_LOG_FILE` cannot be opened, we warn on stderr and leave tracing
 ///   disabled — we never crash the CLI just because logging failed.
 fn init_tracing() {
+    use tracing_subscriber::{layer::SubscriberExt, util::SubscriberInitExt};
+
     let config = resolve_log_config();
-    let Some(filter_directive) = config.filter.as_deref() else {
-        return;
-    };
 
-    let env_filter = build_env_filter(filter_directive);
-    let Some(path) = config.file.as_deref() else {
-        if let Err(err) = tracing_subscriber::fmt()
-            .with_env_filter(env_filter)
-            .try_init()
-        {
-            eprintln!("warning: failed to initialize tracing subscriber: {err}");
-        }
-        return;
-    };
+    // OTLP layer (lore.md 1.7): compiled only with the feature, active only
+    // when the standard OTel endpoint env vars gate it on.
+    #[cfg(feature = "otlp")]
+    let otlp_layer = libra::utils::telemetry::try_build_layer();
+    #[cfg(not(feature = "otlp"))]
+    let otlp_layer: Option<tracing_subscriber::layer::Identity> = None;
 
-    match config.rotation {
+    // Fmt layer: only when a filter directive is configured (preserving the
+    // historical zero-subscriber fast path when neither logging nor
+    // telemetry is requested).
+    let fmt_layer = config
+        .filter
+        .as_deref()
+        .and_then(|directive| build_fmt_layer(directive, config.file.as_deref(), config.rotation));
+
+    // A Vec<Box<dyn Layer<Registry>>> implements Layer, letting the two
+    // optional layers stack without type gymnastics.
+    let mut layers: Vec<BoxedLayer> = Vec::new();
+    if let Some(layer) = fmt_layer {
+        layers.push(layer);
+    }
+    #[cfg(feature = "otlp")]
+    if let Some(layer) = otlp_layer {
+        layers.push(layer);
+    }
+    #[cfg(not(feature = "otlp"))]
+    let _ = otlp_layer;
+
+    if layers.is_empty() {
+        return; // nothing to install — ordinary CLI use stays silent
+    }
+
+    if let Err(err) = tracing_subscriber::registry().with(layers).try_init() {
+        eprintln!("warning: failed to initialize tracing subscriber: {err}");
+    }
+}
+
+type BoxedLayer = Box<dyn tracing_subscriber::Layer<tracing_subscriber::Registry> + Send + Sync>;
+
+/// Build the human-log fmt layer for the configured sink. The layer's
+/// per-layer filter is the user's EnvFilter AND-ed with an exclusion of the
+/// vetted `libra::telemetry` span target: that span exists for the OTLP
+/// exporter only, and letting it through would prepend a span scope to every
+/// dispatch-time log line — an observable format change for LIBRA_LOG users.
+fn build_fmt_layer(
+    directive: &str,
+    file: Option<&Path>,
+    rotation: LogRotation,
+) -> Option<BoxedLayer> {
+    use tracing_subscriber::layer::Layer;
+    let env_filter = build_env_filter(directive);
+    let not_telemetry =
+        tracing_subscriber::filter::filter_fn(|metadata| metadata.target() != "libra::telemetry");
+    let Some(path) = file else {
+        let layer = tracing_subscriber::fmt::layer()
+            .with_filter(env_filter)
+            .with_filter(not_telemetry);
+        return Some(Box::new(layer));
+    };
+    match rotation {
         // Default / pre-0.7 behaviour: one append-mode file at exactly `path`.
-        LogRotation::Never => init_appended_log_file(path, env_filter),
+        LogRotation::Never => match OpenOptions::new().create(true).append(true).open(path) {
+            Ok(log_file) => {
+                let layer = tracing_subscriber::fmt::layer()
+                    .with_ansi(false)
+                    .with_writer(Mutex::new(log_file))
+                    .with_filter(env_filter)
+                    .with_filter(not_telemetry);
+                Some(Box::new(layer))
+            }
+            Err(err) => {
+                eprintln!(
+                    "warning: failed to open LIBRA_LOG_FILE {}; tracing disabled: {err}",
+                    path.display()
+                );
+                None
+            }
+        },
         // lore.md §0.7: roll the file on the requested interval so no single log
         // file grows without limit. Rotation only SPLITS logs by time; it does
         // not delete old files, so total disk use needs external retention
         // (e.g. logrotate) or a dedicated log directory.
-        rotation => init_rolling_log_file(path, rotation, env_filter),
-    }
-}
-
-/// Route tracing to a single append-mode file at `path` (rotation = never).
-fn init_appended_log_file(path: &Path, env_filter: EnvFilter) {
-    match OpenOptions::new().create(true).append(true).open(path) {
-        Ok(file) => {
-            if let Err(err) = tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
-                .with_ansi(false)
-                .with_writer(Mutex::new(file))
-                .try_init()
-            {
-                eprintln!(
-                    "warning: failed to initialize tracing subscriber for LIBRA_LOG_FILE {}: {err}",
-                    path.display()
-                );
-            }
-        }
-        Err(err) => {
-            eprintln!(
-                "warning: failed to open LIBRA_LOG_FILE {}; tracing disabled: {err}",
-                path.display()
-            );
-        }
+        rotation => build_rolling_fmt_layer(path, rotation, env_filter, not_telemetry),
     }
 }
 
 /// Route tracing to a time-rolled file: `<dir>/<name>.<date-suffix>` where the
 /// suffix granularity follows `rotation`. Blocking writer (no worker guard), so
 /// no log lines are lost when the short-lived CLI process exits.
-fn init_rolling_log_file(path: &Path, rotation: LogRotation, env_filter: EnvFilter) {
+fn build_rolling_fmt_layer<F>(
+    path: &Path,
+    rotation: LogRotation,
+    env_filter: EnvFilter,
+    not_telemetry: tracing_subscriber::filter::FilterFn<F>,
+) -> Option<BoxedLayer>
+where
+    F: Fn(&tracing::Metadata<'_>) -> bool + Send + Sync + 'static,
+{
     let directory = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
         // A bare filename rolls in the current directory.
@@ -163,7 +221,7 @@ fn init_rolling_log_file(path: &Path, rotation: LogRotation, env_filter: EnvFilt
             "warning: LIBRA_LOG_FILE {} has no valid UTF-8 file name; tracing disabled",
             path.display()
         );
-        return;
+        return None;
     };
 
     // Create the log directory up front; the builder errors (rather than
@@ -173,7 +231,7 @@ fn init_rolling_log_file(path: &Path, rotation: LogRotation, env_filter: EnvFilt
             "warning: failed to create log directory {}; tracing disabled: {err}",
             directory.display()
         );
-        return;
+        return None;
     }
 
     let rotation_kind = match rotation {
@@ -193,23 +251,20 @@ fn init_rolling_log_file(path: &Path, rotation: LogRotation, env_filter: EnvFilt
         .build(&directory)
     {
         Ok(appender) => {
-            if let Err(err) = tracing_subscriber::fmt()
-                .with_env_filter(env_filter)
+            use tracing_subscriber::layer::Layer;
+            let layer = tracing_subscriber::fmt::layer()
                 .with_ansi(false)
                 .with_writer(appender)
-                .try_init()
-            {
-                eprintln!(
-                    "warning: failed to initialize rolling tracing subscriber for LIBRA_LOG_FILE {}: {err}",
-                    path.display()
-                );
-            }
+                .with_filter(env_filter)
+                .with_filter(not_telemetry);
+            Some(Box::new(layer))
         }
         Err(err) => {
             eprintln!(
                 "warning: failed to open rolling LIBRA_LOG_FILE {}; tracing disabled: {err}",
                 path.display()
             );
+            None
         }
     }
 }

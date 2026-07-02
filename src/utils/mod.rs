@@ -24,6 +24,8 @@ pub mod redact;
 pub mod resource_limits;
 pub mod storage;
 pub mod storage_ext;
+#[cfg(feature = "otlp")]
+pub mod telemetry;
 pub mod test;
 pub mod text;
 pub mod tree;

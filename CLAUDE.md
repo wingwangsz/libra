@@ -160,6 +160,7 @@ pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 | `test-live-cloud` | Gate L3 tests hitting real D1/R2 endpoints |
 | `test-provider` | Deterministic hidden provider for local TUI automation tests (requires `LIBRA_ENABLE_TEST_PROVIDER=1`) |
 | `subagent-scaffold` | Schema-only sub-agent contract scaffold (CEX-S2-10, gated on CP-4 in production) |
+| `otlp` | OTLP trace export (lore.md 1.7): one vetted command-span to an explicitly configured collector; default binary unaffected |
 
 ### CI Pipeline (`.github/workflows/base.yml`)
 
@@ -333,6 +334,7 @@ The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`,
 - `LIBRA_CODE_LEASE_DURATION_MS` — `libra code` automation lease length
 - `LIBRA_SANDBOX_ENFORCEMENT`, `LIBRA_SANDBOX_NETWORK_DISABLED`, `LIBRA_LINUX_SANDBOX_EXE`, `LIBRA_USE_LINUX_SANDBOX_BWRAP` — sandbox toggles (`docs/development/commands/sandbox.md`)
 - `LIBRA_ERROR_JSON`, `LIBRA_FINE_EXIT_CODES` — stable-error-code surface toggles
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SDK_DISABLED` — OTLP telemetry gate (only with `--features otlp`; no default endpoint — unset means nothing is exported)
 
 The following are baked-in constants (no env-var override) — listed
 here so contributors do not waste time trying to set them at runtime:

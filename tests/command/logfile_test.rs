@@ -95,7 +95,15 @@ fn logfile_info_sums_rolled_file_sizes() {
         Some(5),
         "should sum the rolled file's 5 bytes"
     );
-    assert_eq!(json["data"]["file_count"].as_u64(), Some(1));
+    // DATE-ROBUST: the rolling appender eagerly creates an EMPTY active file
+    // named `libra.log.<utc-today>`; when UTC-today happens to equal the
+    // fixture's date they collide into one file, otherwise two exist. The
+    // sum assertion above is the real contract (empty files add 0).
+    let count = json["data"]["file_count"].as_u64().unwrap_or(0);
+    assert!(
+        (1..=2).contains(&count),
+        "rolled fixture plus optionally the empty active file: {json}"
+    );
 }
 
 /// An unknown rotation value falls back to `never` (not an error).
