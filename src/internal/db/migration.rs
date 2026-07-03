@@ -704,6 +704,14 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070501_layer.sql"),
             include_str!("../../../sql/migrations/2026070501_layer_down.sql"),
         ),
+        // lore.md 2.5: index-flagged obliteration tombstone registry. Owner:
+        // `internal::obliteration::ObliterationStore`.
+        sql_migration(
+            2026070601,
+            "object_obliteration",
+            include_str!("../../../sql/migrations/2026070601_object_obliteration.sql"),
+            include_str!("../../../sql/migrations/2026070601_object_obliteration_down.sql"),
+        ),
     ]
 }
 
@@ -832,9 +840,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 18);
+        assert_eq!(runner.len(), 19);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070501));
+        assert_eq!(runner.max_registered_version(), Some(2026070601));
     }
 
     #[test]

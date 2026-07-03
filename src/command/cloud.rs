@@ -1187,6 +1187,26 @@ pub(crate) async fn restore_indexed_objects_from_remote(
             continue;
         }
 
+        // lore.md 2.5: never RESTORE an intentionally-obliterated object from
+        // the durable tier (拒绝重建). Fail CLOSED (Codex P1): if the tombstone
+        // table cannot be read, do NOT restore (an unreadable table must not
+        // let an obliterated payload resurrect) — skip with a warning.
+        match crate::internal::obliteration::ObliterationStore::lookup(&hash).await {
+            Ok(Some(_)) => {
+                report.skipped += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                report.warnings.push(format!(
+                    "warning: cannot verify obliteration tombstone for {}; not restoring: {e}",
+                    idx.o_id
+                ));
+                report.skipped += 1;
+                continue;
+            }
+        }
+
         match r2_storage.get(&hash).await {
             Ok((data, obj_type)) => {
                 let computed = ObjectHash::from_type_and_data(obj_type, &data);

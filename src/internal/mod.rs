@@ -33,6 +33,7 @@ pub mod merge_base;
 pub mod metadata;
 pub mod model;
 pub mod notes;
+pub mod obliteration;
 pub mod operation;
 pub mod operation_wrapper;
 pub mod pack_writer;

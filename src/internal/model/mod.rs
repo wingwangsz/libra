@@ -25,6 +25,7 @@ pub mod layer;
 pub mod layer_path;
 pub mod metadata_kv;
 pub mod object_index;
+pub mod object_obliteration;
 pub mod operation;
 pub mod operation_parent;
 pub mod operation_view;

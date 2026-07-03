@@ -36,7 +36,7 @@ Command Groups:
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, service
-  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree
+  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file
 
 Help Topics:
   error-codes  Print the stable CLI error code table (`libra help error-codes`)
@@ -362,6 +362,11 @@ enum Commands {
         after_help = command::layer::LAYER_EXAMPLES
     )]
     Layer(command::layer::LayerArgs),
+    #[command(
+        about = "Object-level operations incl. payload obliteration (Libra extension)",
+        after_help = command::file::FILE_EXAMPLES
+    )]
+    File(command::file::FileArgs),
     #[command(
         about = "Branch/repo metadata key-value store (Libra extension)",
         after_help = command::metadata::METADATA_EXAMPLES
@@ -1533,6 +1538,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Logfile(cmd_args) => command::logfile::execute_safe(cmd_args, &output).await?,
         Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
         Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,
+        Commands::File(cmd_args) => command::file::execute_safe(cmd_args, &output).await?,
         Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
         Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
         Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,

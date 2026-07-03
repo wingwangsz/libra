@@ -315,6 +315,7 @@ mod dirty_test;
 mod fast_export_test;
 mod fast_import_test;
 mod fetch_test;
+mod file_obliterate_test;
 mod for_each_ref_test;
 mod format_patch_test;
 mod fsck_test;

@@ -201,6 +201,12 @@ pub enum StableErrorCode {
     /// A `layer apply` destination collided with tracked (index/HEAD) content
     /// (lore.md 2.4) — fail-closed; a layer may only ADD untracked paths.
     LayerConflict,
+    /// `file obliterate` on an object with no payload / unknown OID (2.5).
+    ObliterateNotFound,
+    /// `file obliterate` refused a packed-only object (no pack surgery) (2.5).
+    ObliteratePacked,
+    /// `file obliterate` refused to proceed without `--yes` confirmation (2.5).
+    ObliterateConfirm,
     NetworkUnavailable,
     NetworkProtocol,
     AuthMissingCredentials,
@@ -250,6 +256,9 @@ impl StableErrorCode {
             Self::PolicyRefUpdateBlocked => "LBR-POLICY-001",
             Self::ConflictCaseCollision => "LBR-CASE-001",
             Self::LayerConflict => "LBR-LAYER-001",
+            Self::ObliterateNotFound => "LBR-OBLITERATE-001",
+            Self::ObliteratePacked => "LBR-OBLITERATE-002",
+            Self::ObliterateConfirm => "LBR-OBLITERATE-003",
             Self::NetworkUnavailable => "LBR-NET-001",
             Self::NetworkProtocol => "LBR-NET-002",
             Self::AuthMissingCredentials => "LBR-AUTH-001",
@@ -293,6 +302,11 @@ impl StableErrorCode {
             Self::WarningEmitted => CliErrorCategory::Warning,
             Self::AddNothingStaged => CliErrorCategory::Cli,
             Self::BisectNotActive | Self::BisectNoCandidates => CliErrorCategory::Repo,
+            // Obliteration: not-found/packed are object-state (Repo); the
+            // confirmation refusal is a Conflict-style block against an
+            // irreversible destructive action.
+            Self::ObliterateNotFound | Self::ObliteratePacked => CliErrorCategory::Repo,
+            Self::ObliterateConfirm => CliErrorCategory::Conflict,
             // Budget caps surface as runtime/internal failures: the run
             // didn't crash, but the operator-configured cap forced an
             // early abort. Fits the Internal category (the run could
@@ -361,6 +375,13 @@ impl StableErrorCode {
             }
             Self::LayerConflict => {
                 "A layer overlay path collided with tracked content; a layer may only add                  untracked paths."
+            }
+            Self::ObliterateNotFound => "No payload was found for the object to obliterate.",
+            Self::ObliteratePacked => {
+                "The object exists only inside a packfile; v1 obliteration cannot rewrite packs."
+            }
+            Self::ObliterateConfirm => {
+                "Obliteration was not confirmed; it is irreversible and requires --yes."
             }
             Self::ConflictOperationBlocked => {
                 "Operation was blocked to avoid overwriting local or remote state."

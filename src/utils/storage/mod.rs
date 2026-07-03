@@ -92,6 +92,15 @@ pub trait Storage: Send + Sync {
     async fn evict_local(&self, _request: EvictRequest) -> Result<Option<EvictReport>, GitError> {
         Ok(None)
     }
+
+    /// Physically delete an object's PAYLOAD (lore.md 2.5 obliteration). The
+    /// default is a no-op success (a local-only loose store deletes the file
+    /// itself in the obliteration driver). Tiered stores override this to purge
+    /// the durable-tier blob AND the in-memory LRU entry. Idempotent: deleting
+    /// an already-absent payload succeeds.
+    async fn delete_payload(&self, _hash: &ObjectHash) -> Result<(), GitError> {
+        Ok(())
+    }
 }
 
 /// Parameters for [`Storage::evict_local`].

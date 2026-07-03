@@ -711,6 +711,12 @@ impl ClientStorage {
         Ok(result)
     }
 
+    /// Physically delete an object's payload (lore.md 2.5) from the durable
+    /// tier and the in-memory cache; a no-op for a local-only store.
+    pub async fn delete_payload(&self, hash: &ObjectHash) -> Result<(), GitError> {
+        self.storage.delete_payload(hash).await
+    }
+
     /// Check whether an object exists in the configured backend.
     ///
     /// Boundary conditions:

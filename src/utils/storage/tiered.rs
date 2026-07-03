@@ -339,6 +339,23 @@ impl Storage for TieredStorage {
         self.remote.exist_checked(hash).await
     }
 
+    /// Obliteration payload purge (lore.md 2.5): drop the in-memory LRU entry
+    /// (its `CachedFile::Drop` unlinks the local cache file), then delete the
+    /// durable-tier blob. Idempotent. The local loose file is removed by the
+    /// obliteration driver; here we ensure NO cached copy survives to
+    /// resurrect the payload.
+    async fn delete_payload(&self, hash: &ObjectHash) -> Result<(), GitError> {
+        {
+            let mut lru = self
+                .lru
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            // Dropping the entry unlinks the cached file.
+            drop(lru.remove(hash));
+        }
+        self.remote.delete_payload(hash).await
+    }
+
     /// Evict verified-durable large loose objects until under budget
     /// (lore.md 2.9). Safety: every victim gets an error-aware durability
     /// probe IMMEDIATELY before its unlink — confirmed-absent and

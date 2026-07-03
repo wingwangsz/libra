@@ -38,7 +38,7 @@ use crate::{
     },
     utils::{
         client_storage::ClientStorage,
-        error::{CliError, CliResult},
+        error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         path,
     },
@@ -60,6 +60,10 @@ pub enum FsckMsgId {
     HashMismatch,
     Dangling,
     Unreachable,
+    /// lore.md 2.5: the object's payload was intentionally obliterated. A
+    /// DIAGNOSTIC (stdout), distinct from Missing, that NEVER flips the exit
+    /// code.
+    IntentionalAbsence,
     // ===== Error messages (stderr) - Object integrity =====
     BadObjectSha1,
     BadTree,
@@ -113,13 +117,17 @@ impl FsckMsgId {
                 | FsckMsgId::HashMismatch
                 | FsckMsgId::Dangling
                 | FsckMsgId::Unreachable
+                | FsckMsgId::IntentionalAbsence
         )
     }
 
     /// Check if this message should cause non-zero exit code
     /// Only dangling and unreachable are informational; all others cause failure
     pub fn causes_failure(&self) -> bool {
-        !matches!(self, FsckMsgId::Dangling | FsckMsgId::Unreachable)
+        !matches!(
+            self,
+            FsckMsgId::Dangling | FsckMsgId::Unreachable | FsckMsgId::IntentionalAbsence
+        )
     }
 
     /// Get the output format string for this message
@@ -130,6 +138,9 @@ impl FsckMsgId {
             FsckMsgId::HashMismatch => format!("hash mismatch {} {}", obj_type, obj_id),
             FsckMsgId::Dangling => format!("dangling {} {}", obj_type, obj_id),
             FsckMsgId::Unreachable => format!("unreachable {} {}", obj_type, obj_id),
+            FsckMsgId::IntentionalAbsence => {
+                format!("intentionally absent (obliterated) {} {}", obj_type, obj_id)
+            }
             // Error messages - stderr
             FsckMsgId::BadObjectSha1 => format!("bad object sha1: {} {}", obj_type, obj_id),
             FsckMsgId::BadTree => format!("bad tree: {}", obj_id),
@@ -185,6 +196,18 @@ pub fn report(msg_id: FsckMsgId, obj_type: &str, obj_id: &str) -> bool {
         println!("{}", output);
     }
     msg_id.causes_failure()
+}
+
+/// lore.md 2.5: report a referenced object that is ABSENT from storage as
+/// either intentionally-absent (obliterated — diagnostic, exit code stays 0)
+/// or the given `missing_id` (a real integrity error). Returns whether it
+/// flips the exit code.
+fn report_absent_or_intentional(hash: &ObjectHash, obj_type: &str, missing_id: FsckMsgId) -> bool {
+    if is_intentionally_absent(hash) {
+        report(FsckMsgId::IntentionalAbsence, obj_type, &hash.to_string())
+    } else {
+        report(missing_id, obj_type, &hash.to_string())
+    }
 }
 
 fn tag_parse_error_msg_id(error: &impl std::fmt::Display) -> FsckMsgId {
@@ -356,6 +379,9 @@ pub enum CheckStatus {
     Missing,
     InvalidFormat,
     HashMismatch,
+    /// lore.md 2.5: the object's payload was intentionally obliterated (not
+    /// corruption; does not fail fsck).
+    IntentionalAbsence,
 }
 
 /// Outcome of a `libra fsck --heal` repair pass (lore.md §0.4).
@@ -383,6 +409,10 @@ pub struct FsckResult {
     pub objects_checked: usize,
     pub objects_ok: usize,
     pub objects_corrupted: usize,
+    /// lore.md 2.5: objects reported as intentionally obliterated (diagnostic,
+    /// counted separately from corruption; never fails fsck).
+    #[serde(default)]
+    pub objects_intentionally_absent: usize,
     pub refs_checked: usize,
     pub refs_ok: usize,
     pub refs_broken: usize,
@@ -433,6 +463,10 @@ pub async fn execute(args: FsckArgs) {
 }
 
 async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
+    // lore.md 2.5: load the intentional-absence (obliteration) tombstone
+    // snapshot so every seam below distinguishes obliterated objects from
+    // corruption and does NOT flip the exit code (empty set = no-op).
+    crate::internal::obliteration::refresh_snapshot().await;
     // `--heal` repairs FIRST, so the checks below (and therefore the exit code)
     // observe the post-repair state. The repair itself is reported separately.
     let heal_report = if args.heal {
@@ -482,8 +516,8 @@ struct HealTargets {
 /// markers exist and this always returns `false` today. It is the single point
 /// §2.5 will extend; keeping the call here means heal is tombstone-aware from
 /// day one and cannot regress into resurrecting obliterated payloads.
-fn is_intentionally_absent(_hash: &ObjectHash) -> bool {
-    false
+fn is_intentionally_absent(hash: &ObjectHash) -> bool {
+    crate::internal::obliteration::is_tombstoned_cached(hash)
 }
 
 /// Whether a stored object's bytes fail to hash back to its OID (corruption).
@@ -585,9 +619,22 @@ async fn run_heal_pass(explicit: Option<ObjectHash>) -> CliResult<HealReport> {
                 continue;
             }
             // Tombstone check BEFORE any remote action (lore.md §0.4 / §2.5).
-            if is_intentionally_absent(hash) {
-                report.skipped_intentional_absence += 1;
-                continue;
+            // Heal is RESURRECTION-CAPABLE, so this uses the error-aware
+            // lookup and FAILS CLOSED (Codex P1): an unreadable tombstone
+            // table aborts the heal rather than risk rebuilding an obliterated
+            // object.
+            match crate::internal::obliteration::ObliterationStore::lookup(hash).await {
+                Ok(Some(_)) => {
+                    report.skipped_intentional_absence += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(CliError::fatal(format!(
+                        "cannot verify obliteration tombstones during heal; aborting to avoid                          resurrecting an obliterated object: {e}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed));
+                }
             }
             match tiered.heal(hash) {
                 Ok(true) => {
@@ -740,14 +787,21 @@ async fn check_single_object(
             // Error already reported by verify_object, no need to report again
             check_result.status
         }
+        CheckStatus::IntentionalAbsence => {
+            // Diagnostic already emitted by verify_object; not corruption.
+            check_result.status
+        }
     };
 
     let is_ok = overall_status == CheckStatus::Ok;
+    let intentional = overall_status == CheckStatus::IntentionalAbsence;
 
     Ok(FsckResult {
         objects_checked: 1,
         objects_ok: if is_ok { 1 } else { 0 },
-        objects_corrupted: if is_ok { 0 } else { 1 },
+        // An intentionally-obliterated object is neither ok nor corrupt.
+        objects_corrupted: if is_ok || intentional { 0 } else { 1 },
+        objects_intentionally_absent: if intentional { 1 } else { 0 },
         refs_checked: 0,
         refs_ok: 0,
         refs_broken: 0,
@@ -765,6 +819,7 @@ async fn check_all_objects(args: &FsckArgs, storage: &ClientStorage) -> CliResul
         objects_checked: 0,
         objects_ok: 0,
         objects_corrupted: 0,
+        objects_intentionally_absent: 0,
         refs_checked: 0,
         refs_ok: 0,
         refs_broken: 0,
@@ -1175,6 +1230,10 @@ async fn check_objects(
                 if result.overall_status == CheckStatus::Ok {
                     result.overall_status = CheckStatus::InvalidFormat;
                 }
+            }
+            CheckStatus::IntentionalAbsence => {
+                // Diagnostic — NOT corruption, does not change overall_status.
+                result.objects_intentionally_absent += 1;
             }
         }
     }
@@ -1866,17 +1925,32 @@ async fn verify_object(
 ) -> CliResult<(ObjectCheckResult, bool)> {
     let mut has_error = false;
 
-    // Check if object exists
+    // Check if object exists.
     if !storage.exist(hash) {
+        // lore.md 2.5: an intentionally-obliterated object is a DIAGNOSTIC,
+        // distinct from Missing, and never flips the exit code.
+        let intentional = is_intentionally_absent(hash);
         if report_errors {
-            has_error |= report(FsckMsgId::Missing, "unknown", &hash.to_string());
+            has_error |= if intentional {
+                report(FsckMsgId::IntentionalAbsence, "unknown", &hash.to_string())
+            } else {
+                report(FsckMsgId::Missing, "unknown", &hash.to_string())
+            };
         }
         return Ok((
             ObjectCheckResult {
                 object_id: hash.to_string(),
                 object_type: "unknown".to_string(),
-                status: CheckStatus::Missing,
-                error_message: Some("Object not found in storage".to_string()),
+                status: if intentional {
+                    CheckStatus::IntentionalAbsence
+                } else {
+                    CheckStatus::Missing
+                },
+                error_message: Some(if intentional {
+                    "Object payload intentionally obliterated".to_string()
+                } else {
+                    "Object not found in storage".to_string()
+                }),
                 size: 0,
             },
             has_error,
@@ -2032,8 +2106,11 @@ async fn verify_object(
                         for item in &tree.tree_items {
                             // Each entry's target must exist with a matching type.
                             if !storage.exist(&item.id) {
-                                has_error |=
-                                    report(FsckMsgId::Missing, "tree", &item.id.to_string());
+                                has_error |= report_absent_or_intentional(
+                                    &item.id,
+                                    "tree",
+                                    FsckMsgId::Missing,
+                                );
                             } else if let Ok(actual) = storage.get_object_type(&item.id)
                                 && actual != expected_type_for_mode(item.mode)
                             {
@@ -2103,8 +2180,11 @@ async fn verify_object(
                         }
                         // The tree must exist and be a tree.
                         if !storage.exist(&commit.tree_id) {
-                            has_error |=
-                                report(FsckMsgId::MissingTree, "commit", &hash.to_string());
+                            has_error |= report_absent_or_intentional(
+                                &commit.tree_id,
+                                "commit",
+                                FsckMsgId::MissingTree,
+                            );
                         } else if let Ok(tree_type) = storage.get_object_type(&commit.tree_id)
                             && tree_type != ObjectType::Tree
                         {
@@ -2114,8 +2194,11 @@ async fn verify_object(
                         // Parents must exist and be commits.
                         for parent in &commit.parent_commit_ids {
                             if !storage.exist(parent) {
-                                has_error |=
-                                    report(FsckMsgId::Missing, "commit", &parent.to_string());
+                                has_error |= report_absent_or_intentional(
+                                    parent,
+                                    "commit",
+                                    FsckMsgId::Missing,
+                                );
                             } else if let Ok(parent_type) = storage.get_object_type(parent)
                                 && parent_type != ObjectType::Commit
                             {
@@ -2190,22 +2273,38 @@ async fn verify_object(
             }
 
             if !storage.exist(&tag.object_hash) {
+                // lore.md 2.5: an obliterated tag TARGET is intentionally
+                // absent, not corruption — reflect it in the returned status
+                // too (Codex P1: aggregation/JSON must not count it as
+                // corrupt), not only in the diagnostic.
+                let intentional = is_intentionally_absent(&tag.object_hash);
                 if report_errors {
-                    has_error |= report(
-                        FsckMsgId::Missing,
+                    has_error |= report_absent_or_intentional(
+                        &tag.object_hash,
                         &tag.object_type.to_string(),
-                        &tag.object_hash.to_string(),
+                        FsckMsgId::Missing,
                     );
                 }
                 return Ok((
                     ObjectCheckResult {
                         object_id: hash.to_string(),
                         object_type: obj_type.to_string(),
-                        status: CheckStatus::Missing,
-                        error_message: Some(format!(
-                            "Tag {} points to missing {} {}",
-                            hash, tag.object_type, tag.object_hash
-                        )),
+                        status: if intentional {
+                            CheckStatus::IntentionalAbsence
+                        } else {
+                            CheckStatus::Missing
+                        },
+                        error_message: Some(if intentional {
+                            format!(
+                                "Tag {} points to intentionally-obliterated {} {}",
+                                hash, tag.object_type, tag.object_hash
+                            )
+                        } else {
+                            format!(
+                                "Tag {} points to missing {} {}",
+                                hash, tag.object_type, tag.object_hash
+                            )
+                        }),
                         size,
                     },
                     has_error,
@@ -2362,6 +2461,13 @@ fn check_index_file(storage: &ClientStorage) -> CliResult<IndexCheckResult> {
         result.entries_checked += 1;
 
         if let Some(msg_id) = validate_index_entry(entry, storage) {
+            // An intentionally-absent (obliterated) blob is a DIAGNOSTIC, not
+            // index corruption — report it but keep the index valid.
+            if msg_id == FsckMsgId::IntentionalAbsence {
+                let _ = report(msg_id, "blob", &entry.hash.to_string());
+                result.entries_ok += 1;
+                continue;
+            }
             result.entries_corrupted += 1;
             result.valid = false;
             // Report and track error
@@ -2414,6 +2520,11 @@ fn validate_index_entry(
     }
 
     if !storage.exist(&entry.hash) {
+        // lore.md 2.5: an obliterated blob still referenced by the index is
+        // intentionally absent, not corruption.
+        if is_intentionally_absent(&entry.hash) {
+            return Some(FsckMsgId::IntentionalAbsence);
+        }
         return Some(FsckMsgId::Missing);
     }
 

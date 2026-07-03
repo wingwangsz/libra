@@ -169,6 +169,18 @@ impl Storage for RemoteStorage {
         self.inner.head(&path).await.is_ok()
     }
 
+    async fn delete_payload(&self, hash: &ObjectHash) -> Result<(), GitError> {
+        let path = self.hash_to_path(hash);
+        match self.inner.delete(&path).await {
+            Ok(()) => Ok(()),
+            // Idempotent: an already-absent blob is a success.
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(GitError::IOError(std::io::Error::other(format!(
+                "failed to delete durable-tier payload for {hash}: {error}"
+            )))),
+        }
+    }
+
     async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
         let path = self.hash_to_path(hash);
         match self.inner.head(&path).await {
