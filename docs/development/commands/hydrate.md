@@ -47,5 +47,6 @@ libra hydrate x --ignore-sparse         # hydrate an out-of-view path
 
 LFS-pointer blobs (their download path is not yet atomic — skipped cleanly),
 symlink/gitlink entries, transparent FUSE on-access hydration, FastCDC
-byte-range hydration, and cross-machine dependency expansion (needs 3.2 to
-wire `refs/notes/deps` into fetch).
+and byte-range hydration. Cross-machine dependency expansion now works once the
+graph is fetched via 3.2's `libra fetch --notes` / `libra pull --notes` from a
+local Libra source (network / foreign-Git travel is deferred, D17).

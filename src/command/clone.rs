@@ -90,7 +90,8 @@ const CLOUD_CLONE_D1_API_BASE_URL_ENV: &str = "LIBRA_D1_API_BASE_URL";
     libra clone --single-branch -b main <url>             Clone only one branch\n    \
     libra clone --no-checkout <url>                       Set up the repo without checking out files\n    \
     libra clone -o upstream <url>                         Name the remote 'upstream' instead of 'origin'\n    \
-    libra clone --depth 1 <url>                           Shallow clone (latest commit only)")]
+    libra clone --depth 1 <url>                           Shallow clone (latest commit only)\n    \
+    libra clone --deps-of scene.usd <local-libra>         Scope the view to a file's dependency closure (lore.md 3.2)")]
 pub struct CloneArgs {
     /// The remote repository location to clone from, usually a URL with HTTPS or SSH
     pub remote_repo: String,
@@ -248,6 +249,29 @@ pub struct CloneArgs {
     /// given multiple times. Not supported for `libra+cloud://` sources.
     #[clap(long = "shallow-exclude", value_name = "rev")]
     pub shallow_exclude: Vec<String>,
+
+    /// lore.md 3.2 — dependency-filtered clone: after the (full) checkout, scope
+    /// the working-tree VIEW to the forward dependency closure of these root
+    /// path(s) (repeatable). Implies `--notes` (the dependency graph must be
+    /// fetched to compute the closure). intentionally-different (Git has no
+    /// file-dependency concept); it is NOT partial-clone/`--filter` (objects are
+    /// never wire-filtered) and NOT `--sparse` (declined D10). The whole tree is
+    /// still downloaded and checked out — only the sparse VIEW is narrowed (disk
+    /// narrowing is deferred, D18). Only a local Libra source can travel the graph
+    /// in v1 (D17). Conflicts with `--no-checkout`/`--bare`/`--mirror` (they skip
+    /// the checkout that keeps the repository commit-safe). Not supported for
+    /// `libra+cloud://` sources.
+    #[clap(
+        long = "deps-of",
+        value_name = "path",
+        conflicts_with_all = ["no_checkout", "bare", "mirror"]
+    )]
+    pub deps_of: Vec<String>,
+
+    /// Bound the `--deps-of` dependency closure depth (`1` = direct dependencies
+    /// only; unbounded by default). Requires `--deps-of`.
+    #[clap(long = "deps-depth-limit", value_name = "N", requires = "deps_of")]
+    pub deps_depth_limit: Option<usize>,
 }
 
 /// `--reject-shallow`: refuse a clone that ended up shallow without the user
@@ -2505,6 +2529,13 @@ fn validate_cloud_clone_option_compatibility(args: &CloneArgs) -> Result<(), Clo
             hint: "`--filter` (partial clone) is not supported for libra+cloud:// sources; omit it.",
         });
     }
+    if !args.deps_of.is_empty() {
+        return Err(CloneError::UnsupportedCloudCloneOption {
+            option: "--deps-of",
+            reason: "Cloudflare restore must download the complete published object set and does not carry the dependency graph (refs/notes/deps)",
+            hint: "`--deps-of` (dependency-filtered clone) is only supported for a local Libra source; omit it for libra+cloud:// sources.",
+        });
+    }
     if args.shallow_since.is_some() {
         return Err(CloneError::UnsupportedCloudCloneOption {
             option: "--shallow-since",
@@ -3115,6 +3146,133 @@ fn validate_cloud_revision_selector(input: &str, value: &str) -> Result<(), Clon
     Ok(())
 }
 
+/// Convert a repo-relative closure path into a gitignore-syntax include pattern
+/// that matches ONLY that exact path: anchor it with a leading `/` (so a
+/// top-level `README` does not also scope `sub/README`) and escape the gitignore
+/// glob metacharacters `\ * ? [ ]` so a file literally named e.g. `a[1].txt` is
+/// matched verbatim by the sparse VIEW rather than parsed as a character class.
+/// A leading `#`/`!` needs no escaping because the leading `/` means the pattern
+/// never begins with one.
+fn sparse_include_pattern(path: &str) -> String {
+    let mut pattern = String::with_capacity(path.len() + 1);
+    pattern.push('/');
+    for ch in path.chars() {
+        if matches!(ch, '\\' | '*' | '?' | '[' | ']') {
+            pattern.push('\\');
+        }
+        pattern.push(ch);
+    }
+    pattern
+}
+
+/// Apply `clone --deps-of` (lore.md 3.2): after the full, commit-safe checkout,
+/// scope the repo's sparse VIEW to the forward dependency closure of the
+/// requested roots and persist the `remote.<name>.fetchNotesDeps` opt-in so later
+/// pulls keep the graph fresh. Returns human-readable warnings and NEVER fails
+/// the clone (the working tree is already fully materialized). Assumes the cwd is
+/// the freshly-cloned repo.
+async fn apply_deps_of_view(
+    args: &CloneArgs,
+    remote_name: &str,
+    remote_client: &fetch::RemoteClient,
+) -> Vec<String> {
+    if args.deps_of.is_empty() {
+        return Vec::new();
+    }
+    let mut warnings = Vec::new();
+
+    // Honest: objects are never wire-filtered and the whole tree is on disk.
+    warnings.push(
+        "--deps-of narrows the checkout VIEW only; the full object set was still downloaded \
+         (Libra has no partial-clone) and the whole tree remains on disk (disk narrowing is \
+         deferred — see _compatibility.md D18)"
+            .to_string(),
+    );
+
+    // A network or foreign-Git remote cannot travel the dependency graph in v1
+    // (D17) — the fetch already warned. Refuse to set a misleadingly-narrow view
+    // and keep the full clone.
+    let remote_can_travel = matches!(
+        remote_client,
+        fetch::RemoteClient::Local(c) if c.is_libra_source()
+    );
+    if !remote_can_travel {
+        warnings.push(
+            "--deps-of: this remote cannot travel the dependency graph yet (only a local Libra \
+             source can — see _compatibility.md D17); performed a full clone WITHOUT dependency \
+             scoping"
+                .to_string(),
+        );
+        return warnings;
+    }
+
+    // Normalize the roots; a bad root is warned + skipped, never fatal.
+    let mut roots: Vec<String> = Vec::new();
+    for raw in &args.deps_of {
+        match crate::internal::deps::normalize_edge_path(raw) {
+            Ok(p) => roots.push(p),
+            Err(e) => warnings.push(format!("--deps-of: ignoring invalid root '{raw}': {e}")),
+        }
+    }
+    if roots.is_empty() {
+        warnings.push(
+            "--deps-of: no valid root paths; left the working tree fully checked out with no \
+             dependency scoping"
+                .to_string(),
+        );
+        return warnings;
+    }
+
+    // Persist the opt-in so `libra pull` keeps the graph fresh.
+    let _ = ConfigKv::set(
+        &format!("remote.{remote_name}.fetchNotesDeps"),
+        "true",
+        false,
+    )
+    .await;
+
+    // Compute the forward transitive closure at the just-checked-out HEAD.
+    let closure = match crate::internal::deps::DependencyStore::transitive_closure(
+        "HEAD",
+        &roots,
+        crate::internal::deps::Direction::Forward,
+        args.deps_depth_limit,
+    )
+    .await
+    {
+        Ok(closure) => closure,
+        Err(e) => {
+            warnings.push(format!(
+                "--deps-of: could not compute the dependency closure (left full checkout): {e}"
+            ));
+            return warnings;
+        }
+    };
+
+    if closure.reachable.len() == roots.len() {
+        warnings.push(
+            "--deps-of: no dependency edges were declared for the given root(s) at HEAD; scoped \
+             the view to the root(s) only"
+                .to_string(),
+        );
+    }
+
+    // Persist the closure as the sparse VIEW (anchored + glob-escaped patterns so
+    // ls-files/status/diff scope EXACTLY to the closure files).
+    let patterns: Vec<String> = closure
+        .reachable
+        .iter()
+        .map(|p| sparse_include_pattern(p))
+        .collect();
+    if let Err(e) = crate::internal::sparse::SparseViewStore::replace(&patterns).await {
+        warnings.push(format!(
+            "--deps-of: computed the dependency closure but could not set the sparse view: {e}"
+        ));
+    }
+
+    warnings
+}
+
 async fn clone_into_destination(
     args: &CloneArgs,
     remote_url: &str,
@@ -3210,6 +3368,9 @@ async fn clone_into_destination(
         false,
         // A fresh clone has no remote-tracking refs to prune.
         false,
+        // `--deps-of` needs the dependency graph to compute the closure, so it
+        // implies `--notes`; a plain clone never fetches notes (Git parity).
+        !args.deps_of.is_empty(),
         &child_output,
     )
     .await
@@ -3302,6 +3463,11 @@ async fn clone_into_destination(
     warnings.extend(shared_warnings);
     warnings.extend(object_alternates_warning(args));
     warnings.extend(unsupported_fetch_optimization_warnings(args));
+    // lore.md 3.2: `--deps-of` — scope the fresh clone's sparse VIEW to the
+    // forward dependency closure of the requested roots (the graph was imported
+    // by the implied `--notes` fetch above). The working tree stays fully checked
+    // out (commit-safe); only the VIEW is narrowed. cwd is still the new repo.
+    warnings.extend(apply_deps_of_view(args, &remote_name, remote_client).await);
     let mut gitignore_converted = Vec::new();
     if !args.bare {
         let summary = ignore_utils::convert_gitignore_files_to_libraignore(local_path, local_path)
@@ -3939,6 +4105,8 @@ mod tests {
             filter: None,
             shallow_since: None,
             shallow_exclude: vec![],
+            deps_of: vec![],
+            deps_depth_limit: None,
             no_checkout: false,
             no_progress: false,
             remote_repo: "libra+cloud://code.example.com/kepler-ledger".to_string(),
@@ -4308,6 +4476,8 @@ mod tests {
             filter: None,
             shallow_since: None,
             shallow_exclude: vec![],
+            deps_of: vec![],
+            deps_depth_limit: None,
             no_checkout: false,
             no_progress: false,
             remote_repo: "libra+cloud://code.example.com/kepler-ledger".to_string(),
@@ -4411,6 +4581,8 @@ mod tests {
             filter: None,
             shallow_since: None,
             shallow_exclude: vec![],
+            deps_of: vec![],
+            deps_depth_limit: None,
             no_checkout: true,
             no_progress: false,
             remote_repo: "libra+cloud://code.example.com/kepler-ledger".to_string(),
@@ -4502,6 +4674,8 @@ mod tests {
             filter: None,
             shallow_since: None,
             shallow_exclude: vec![],
+            deps_of: vec![],
+            deps_depth_limit: None,
             no_checkout: false,
             no_progress: false,
             remote_repo: "libra+cloud://code.example.com/kepler-ledger?ref=refs/tags/v1.0.0"
@@ -4583,6 +4757,8 @@ mod tests {
             filter: None,
             shallow_since: None,
             shallow_exclude: vec![],
+            deps_of: vec![],
+            deps_depth_limit: None,
             no_checkout: false,
             no_progress: false,
             remote_repo: "libra+cloud://code.example.com/kepler-ledger".to_string(),
@@ -4662,6 +4838,8 @@ mod tests {
             filter: None,
             shallow_since: None,
             shallow_exclude: vec![],
+            deps_of: vec![],
+            deps_depth_limit: None,
             no_checkout: false,
             no_progress: false,
             remote_repo: "libra+cloud://code.example.com/kepler-ledger".to_string(),

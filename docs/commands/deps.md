@@ -27,12 +27,17 @@ rejected.
 The `transitive_closure` API is the reusable seam that 3.2 (dependency-filtered
 clone/sync) and 3.3 (hydrating VFS) call to expand a root file set.
 
-## Wire travel (deferred to 3.2)
+## Wire travel (lore.md 3.2 — local side-channel)
 
-The deps note is durable in the object graph, but — like all `refs/notes/*` —
-Libra does not auto-fetch/push it. Moving edges to another machine (wiring
-`refs/notes/deps` into fetch/push) is a deliverable of lore.md 3.2, not this
-item. A fresh clone reads an empty graph until the deps ref is fetched.
+A Libra deps note is a loose blob (the JSON adjacency doc) plus a row in the
+SQLite `notes` table; `refs/notes/deps` is not a real reference-table ref, so it
+cannot ride the pack/ref want set. lore.md 3.2 travels edges over a dedicated
+local-protocol side-channel: `libra fetch --notes` / `libra pull --notes` imports
+`refs/notes/deps` from a **local Libra source** (union-merging into any local
+edges and re-validating every endpoint), default OFF (Git parity). Persist the
+opt-in with `remote.<name>.fetchNotesDeps=true`; `libra clone --deps-of` implies
+it. Network / foreign-Git / push-side travel is deferred (D17), so a fresh clone
+still reads an empty graph until the notes are fetched with `--notes`.
 
 ## Examples
 
@@ -49,6 +54,6 @@ libra deps add a b --revision <commit>    # target a specific commit
 
 ## Deferred (not v1)
 
-Cross-machine edge travel (3.2), carry-forward of edges onto new commits,
+Network / foreign-Git / push-side edge travel (D17), carry-forward of edges onto new commits,
 rename-following (path-keyed edges do not auto-migrate), and automatic
 dependency inference (v1 edges are author-declared).

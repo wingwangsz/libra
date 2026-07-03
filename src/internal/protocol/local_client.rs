@@ -256,6 +256,98 @@ impl LocalClient {
         &self.repo_path
     }
 
+    /// Export this repo's dependency notes (lore.md 3.2) for cross-machine
+    /// travel. Returns `(entries, warnings)` where each entry is
+    /// `(annotated commit oid, adjacency document text)`. Because a Libra deps
+    /// note is a loose blob + a SQLite `notes` row (not a commit-reachable
+    /// object), it cannot ride the packfile; this reads the source's notes table
+    /// and object store directly over the local protocol. Per-note
+    /// fault-tolerant: a note whose blob is missing or not valid UTF-8 is
+    /// warn-and-skipped, never fatal — a completed fetch must not abort after its
+    /// refs are updated. A plain Git source has no Libra deps notes; it returns
+    /// an empty set plus an honest "deferred" warning (network / foreign-Git
+    /// notes travel is `_compatibility.md` D17).
+    pub async fn export_deps_notes(
+        &self,
+    ) -> Result<(Vec<(String, String)>, Vec<String>), GitError> {
+        match self.source_type {
+            RepoType::GitRepo => Ok((
+                Vec::new(),
+                vec![
+                    "dependency-note travel from a non-Libra (Git) source is not supported yet; \
+                     the dependency graph was not fetched"
+                        .to_string(),
+                ],
+            )),
+            RepoType::LibraRepo => {
+                self.with_repo_current_dir(|| async {
+                    let repo_hash_kind =
+                        self.repo_hash_kind().await.map_err(GitError::CustomError)?;
+                    let _hash_guard = HashKindRestoreGuard::switch_to(repo_hash_kind);
+
+                    // Enumerate every `refs/notes/deps` row on the source. A read
+                    // failure (e.g. absent table) yields nothing to export rather
+                    // than aborting the fetch.
+                    let notes = match crate::internal::notes::list(
+                        crate::internal::deps::REVISION_DEPS_NOTES_REF,
+                        None,
+                    )
+                    .await
+                    {
+                        Ok(notes) => notes,
+                        Err(e) => {
+                            return Ok((
+                                Vec::new(),
+                                vec![format!(
+                                    "could not enumerate dependency notes on the source: {e}"
+                                )],
+                            ));
+                        }
+                    };
+
+                    let storage = ClientStorage::init(crate::utils::path::objects());
+                    let mut entries: Vec<(String, String)> = Vec::new();
+                    let mut warnings: Vec<String> = Vec::new();
+                    for note in notes {
+                        let Some(blob_hash) = note.note_hash else {
+                            continue;
+                        };
+                        let blob_oid = match ObjectHash::from_str(&blob_hash) {
+                            Ok(oid) => oid,
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "skipped source dependency note for {}: invalid blob id \
+                                     {blob_hash}: {e}",
+                                    note.annotated_object
+                                ));
+                                continue;
+                            }
+                        };
+                        let bytes = match storage.get(&blob_oid) {
+                            Ok(bytes) => bytes,
+                            Err(e) => {
+                                warnings.push(format!(
+                                    "skipped source dependency note for {}: {e}",
+                                    note.annotated_object
+                                ));
+                                continue;
+                            }
+                        };
+                        match String::from_utf8(bytes) {
+                            Ok(text) => entries.push((note.annotated_object, text)),
+                            Err(_) => warnings.push(format!(
+                                "skipped source dependency note for {}: content is not valid UTF-8",
+                                note.annotated_object
+                            )),
+                        }
+                    }
+                    Ok((entries, warnings))
+                })
+                .await
+            }
+        }
+    }
+
     async fn repo_hash_kind(&self) -> Result<HashKind, String> {
         let db_path = self.repo_path.join(DATABASE);
         let db_conn = get_db_conn_instance_for_path(&db_path)

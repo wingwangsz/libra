@@ -28,6 +28,7 @@ EXAMPLES:
     libra pull --commit                    Force a merge commit (override a prior --no-commit)
     libra pull --depth 1                   Shallow-fetch then integrate
     libra pull --autostash                 Stash a dirty tree, pull, then re-apply
+    libra pull --notes                     Also fetch the file-dependency graph (local Libra source)
     libra pull --json                      Structured JSON output for agents
     libra pull --quiet                     Suppress progress output
 
@@ -99,6 +100,13 @@ pub struct PullArgs {
     /// Do not show the fetch progress meter, matching `git pull --no-progress`.
     #[clap(long = "no-progress")]
     no_progress: bool,
+
+    /// Also fetch the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from
+    /// the upstream. Default OFF (Git never auto-fetches notes); v1 travels notes
+    /// only from a local Libra source (see `_compatibility.md` D17). Forwarded to
+    /// the underlying fetch.
+    #[clap(long = "notes")]
+    notes: bool,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -244,6 +252,7 @@ impl PullArgs {
             commit: false,
             autostash: false,
             no_progress: false,
+            notes: false,
         }
     }
 }
@@ -302,6 +311,7 @@ pub(crate) async fn run_pull(
         false,
         // `pull` does not prune; use `fetch --prune` or `remote prune`.
         false,
+        args.notes,
         &child_output,
     )
     .await

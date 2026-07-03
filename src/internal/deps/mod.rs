@@ -20,14 +20,19 @@
 //! per-metadata-kind table" red line — a new table would be the forbidden
 //! shape, and a cache would add a coherency window this design avoids).
 //!
-//! ## Wire travel (honest scope)
+//! ## Wire travel (lore.md 3.2)
 //!
-//! The deps note is durable in the object graph, but — like ALL `refs/notes/*`
-//! — Libra does NOT auto-fetch/push it. Moving edges to another machine is
-//! explicitly a deliverable of 3.2 (which must add `refs/notes/deps` to its
-//! dependency-filtered fetch set + push refspec); it is NOT free here. 3.1 v1
-//! delivers standalone LOCAL declare/query value: a fresh clone reads an empty
-//! graph until `refs/notes/deps` is fetched.
+//! A Libra deps note is a loose blob (the JSON adjacency doc) plus a row in the
+//! SQLite `notes` table — NOT a Git notes-tree-commit, and `refs/notes/deps` is
+//! not a real reference-table ref, so it cannot ride the pack/ref want-set. 3.2
+//! moves edges cross-machine over a dedicated local-protocol SIDE-CHANNEL:
+//! [`DependencyStore::import_notes`] union-merges `(commit, doc)` pairs exported
+//! by a source repo's `LocalClient::export_deps_notes`, gated behind
+//! `fetch`/`pull --notes` (default OFF, Git parity). It is opt-in and, in v1,
+//! LibraRepo↔LibraRepo over the local protocol only (network / foreign-Git /
+//! push-side travel are deferred — see `_compatibility.md` D17). A fresh clone
+//! reads an empty graph until the notes are fetched with `--notes` (or via
+//! `clone --deps-of`, which implies it).
 
 use std::collections::{HashSet, VecDeque};
 
@@ -82,6 +87,20 @@ pub struct ClosureResult {
     pub cycles_detected: bool,
     /// Whether the depth limit truncated the traversal.
     pub truncated: bool,
+}
+
+/// Outcome of [`DependencyStore::import_notes`] — the cross-machine deps-note
+/// import (lore.md 3.2). Per-note fault-tolerant: a malformed document or a note
+/// whose annotated commit is absent locally is warn-and-skipped, never fatal.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportOutcome {
+    /// Notes union-merged into the local graph (new edges may be zero if the
+    /// incoming set was already a subset).
+    pub imported: usize,
+    /// Notes skipped (malformed, or annotated commit not present locally).
+    pub skipped: usize,
+    /// Human-readable reasons for each skip (surfaced as fetch warnings).
+    pub warnings: Vec<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -278,6 +297,97 @@ impl DependencyStore {
         Self::load_doc(&oid).await
     }
 
+    /// Decode + validate an incoming (fetched) adjacency document TEXT into a
+    /// trusted edge set. Mirrors [`load_doc`]'s hardening: enforces the size and
+    /// version bounds and re-normalizes + validates every endpoint so a hostile
+    /// peer cannot inject `/abs`, `..` escapes, backslash paths, or self-edges.
+    /// Returns a human-readable reason on rejection (the caller warn-skips it).
+    fn decode_import_doc(text: &str) -> Result<Vec<Edge>, String> {
+        if text.len() > MAX_DOC_LEN {
+            return Err(format!(
+                "document is {} bytes, over the {MAX_DOC_LEN} bound",
+                text.len()
+            ));
+        }
+        let doc: DepsDoc =
+            serde_json::from_str(text).map_err(|e| format!("document is corrupt: {e}"))?;
+        if doc.version != DEPS_DOC_VERSION {
+            return Err(format!(
+                "unsupported document version {} (this binary supports {DEPS_DOC_VERSION})",
+                doc.version
+            ));
+        }
+        let mut edges = doc.edges;
+        for e in &mut edges {
+            e.from = normalize_edge_path(&e.from).map_err(|err| format!("corrupt edge: {err}"))?;
+            e.to = normalize_edge_path(&e.to).map_err(|err| format!("corrupt edge: {err}"))?;
+            if e.from == e.to {
+                return Err(format!("corrupt self-edge: '{}'", e.from));
+            }
+        }
+        Ok(edges)
+    }
+
+    /// Import cross-machine dependency notes (lore.md 3.2). `entries` are
+    /// `(annotated commit oid, adjacency document text)` pairs produced by a
+    /// source repo's `export_deps_notes`. Each note is UNION-merged into the
+    /// local graph for its commit (never a clobbering overwrite — an existing
+    /// locally-authored edge on the same commit survives). Per-note
+    /// fault-tolerant and absence-tolerant: a malformed document, or a note whose
+    /// annotated commit is not present in the local object store (realistic under
+    /// `--single-branch`/`--depth`/partial history), is warn-and-skipped so a
+    /// completed fetch is never aborted after its refs are already updated.
+    pub async fn import_notes(entries: &[(String, String)]) -> ImportOutcome {
+        let mut outcome = ImportOutcome::default();
+        for (raw_oid, text) in entries {
+            let incoming = match Self::decode_import_doc(text) {
+                Ok(edges) => edges,
+                Err(reason) => {
+                    outcome.skipped += 1;
+                    outcome
+                        .warnings
+                        .push(format!("skipped dependency note for {raw_oid}: {reason}"));
+                    continue;
+                }
+            };
+            // Confirm the annotated commit is present locally BEFORE touching the
+            // note store (load_doc/store_doc resolve the commit and would error on
+            // an absent one). A missing commit → warn-skip, not a hard failure.
+            let oid = match Self::resolve_revision(raw_oid).await {
+                Ok(oid) => oid,
+                Err(_) => {
+                    outcome.skipped += 1;
+                    outcome.warnings.push(format!(
+                        "skipped dependency note for {raw_oid}: its commit is not present locally"
+                    ));
+                    continue;
+                }
+            };
+            let mut merged = match Self::load_doc(&oid).await {
+                Ok(existing) => existing,
+                Err(e) => {
+                    outcome.skipped += 1;
+                    outcome
+                        .warnings
+                        .push(format!("skipped dependency note for {raw_oid}: {e}"));
+                    continue;
+                }
+            };
+            // Union: append incoming, let store_doc sort + dedup.
+            merged.extend(incoming);
+            match Self::store_doc(&oid, merged).await {
+                Ok(()) => outcome.imported += 1,
+                Err(e) => {
+                    outcome.skipped += 1;
+                    outcome
+                        .warnings
+                        .push(format!("skipped dependency note for {raw_oid}: {e}"));
+                }
+            }
+        }
+        outcome
+    }
+
     /// Immediate neighbors of `path` at `revision` in the given direction,
     /// optionally filtered by kind.
     pub async fn direct(
@@ -470,6 +580,53 @@ mod tests {
         assert!(normalize_edge_path("").is_err());
         assert!(normalize_edge_path("/etc/passwd").is_err());
         assert!(normalize_edge_path("a/../b").is_err());
+    }
+
+    // The cross-machine import decoder (lore.md 3.2) must accept a well-formed
+    // document and REJECT every hostile/malformed shape so a fetched note cannot
+    // inject unsafe endpoints. `import_notes` warn-skips whatever this rejects.
+    #[test]
+    fn decode_import_doc_accepts_valid_and_rejects_hostile() {
+        // Valid: normalized + backslashes unified.
+        let ok = r#"{"version":1,"edges":[{"from":"a/x.txt","to":"b\\y.txt","kind":"generic"}]}"#;
+        let edges = DependencyStore::decode_import_doc(ok).expect("valid doc");
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].from, "a/x.txt");
+        assert_eq!(edges[0].to, "b/y.txt");
+
+        // `..` escape rejected.
+        assert!(
+            DependencyStore::decode_import_doc(
+                r#"{"version":1,"edges":[{"from":"a.txt","to":"../evil","kind":"generic"}]}"#
+            )
+            .is_err()
+        );
+        // Absolute path rejected.
+        assert!(
+            DependencyStore::decode_import_doc(
+                r#"{"version":1,"edges":[{"from":"a.txt","to":"/etc/passwd","kind":"generic"}]}"#
+            )
+            .is_err()
+        );
+        // Self-edge rejected.
+        assert!(
+            DependencyStore::decode_import_doc(
+                r#"{"version":1,"edges":[{"from":"a.txt","to":"a.txt","kind":"generic"}]}"#
+            )
+            .is_err()
+        );
+        // Unsupported version rejected.
+        assert!(
+            DependencyStore::decode_import_doc(
+                r#"{"version":999,"edges":[{"from":"a.txt","to":"b.txt","kind":"generic"}]}"#
+            )
+            .is_err()
+        );
+        // Not JSON rejected.
+        assert!(DependencyStore::decode_import_doc("not a document").is_err());
+        // Over the size bound rejected.
+        let huge = format!("{}{}", " ".repeat(MAX_DOC_LEN + 1), "x");
+        assert!(DependencyStore::decode_import_doc(&huge).is_err());
     }
 
     // Pure in-memory closure test over a synthetic adjacency (no repo needed):

@@ -1833,6 +1833,7 @@ fn local_fetch_args(repository: &str, prune: bool, dry_run: bool) -> fetch::Fetc
         no_progress: true,
         prune,
         no_prune: false,
+        notes: false,
     }
 }
 

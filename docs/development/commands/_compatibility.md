@@ -50,7 +50,7 @@ flowchart TD
 |---|---|---|---|
 | 命令接入治理 | `gc`、`package`、`prune`、`stats` 的开发文档或源码文件存在，但用户可见 CLI 与 `COMPATIBILITY.md` 未公开。 | `for-each-ref`、`ls-files`、`ls-tree`、`archive` 和 `notes` 已在 `src/cli.rs::Commands`、`COMPATIBILITY.md` 和命令开发文档中公开，不能再列为未公开命令。其余命令仍需按当前 CLI surface 核对是否返回 `LBR-CLI-001` 或应降级为内部资料。 | 作为全局未收口项保留；后续必须二选一：接入 CLI 并同步 `COMPATIBILITY.md`、命令文档和集成场景，或把对应命令文档降级为内部/历史资料。 |
 | 兼容证据治理 | 参数级缺口不能只停留在文字说明；需要在命令开发文档、用户文档和 compat/integration 测试之间闭环。 | 删除独立参数 YAML 后，不再存在 `test_evidence`/`last_verified` 字段；证据必须落到具体测试、脚本或 D 编号说明中。 | 不允许把未验证参数当作完成承诺；新增兼容项时补测试证据，或把状态改为拒绝、延后、有意差异并给出 D 编号。 |
-| 拒绝/延后决策 | submodule family、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、clean pathspec、empty commit message。 | 对应 D1-D10、D15、D16、D-clean-pathspec、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
+| 拒绝/延后决策 | submodule family、本地 file remote push、Git hooks bridge、clone recurse-submodules、Git LFS filter/hooks bridge、bisect replay/terms、stash create/store、sparse checkout、patch mode、interactive rebase/todo、clean pathspec、empty commit message、跨网/foreign-Git/push 侧 notes travel、依赖过滤克隆的工作树磁盘收窄。 | 对应 D1-D10、D15、D16、D17、D18、D-clean-pathspec、D-empty-message；源码/CLI 未暴露或显式拒绝这些 surface。 | 维持 D 编号；只有出现明确需求、设计和测试方案时再重启。 |
 | staging/worktree Git surface | `add --intent-to-add`、`clean -i`、`clean <pathspec>`、`reset --merge/--keep`、`checkout -p` 以及跨命令 patch mode。（`restore --overlay`/`--ours`/`--theirs`/`--merge`/`--conflict` 已实现；`restore --progress` 是全局 `--progress` 冲突，DEAD。） | `mv -k` / `--skip-errors` 已实现，`mv --sparse` 与 `rm --sparse` 均已作为 no-op 暴露；`add`、`clean`、`reset` 的参数结构仍未暴露这些剩余 flag；patch mode 由 D15 拒绝；`switch --detach` 已实现，不能再把 detached HEAD 作为全局缺口。 | 作为命令级 Git 兼容缺口保留；实现时同步命令文档、`COMPATIBILITY.md` 和 integration scenarios。 |
 | commit/rewrite/sequencer | `commit --allow-empty-message`、`rebase -i/--edit-todo/--exec/--rebase-merges/--empty=stop|ask` 类项、`rebase -i/--edit-todo/--exec/--rebase-merges/--empty=stop|ask`、`cherry-pick` 的 `--edit`、sequencer `--skip` / todo 自动续作与 strategy 扩展（`revert` 的 `--edit`/`--skip`/多提交续作均已实现，余为 cherry-pick/rebase 范畴）。 | `CommitArgs` 已公开并实现 `--fixup`、`--squash`、`--cleanup`，以及 `-e/--edit`、`-v/--verbose`（共享编辑器 helper + scissors 剥离）、`--porcelain`（提交状态 porcelain v1 机器输出）、`--status`/`--no-status`、`-t/--template`（含 `commit.template` 配置回落 + unedited-template 中止），这些不能再列为当前缺口；`--allow-empty-message` 仍由 D-empty-message 拒绝；`RebaseArgs` 已支持 `--onto`/`--autosquash`/`--reapply-cherry-picks`/`--keep-empty`/`--no-keep-empty`(丢弃 start-empty)/`--empty=<drop|keep>`(replay 后变空提交，缺省 keep)（仍缺 `-i/--exec/--rebase-merges`/`--empty=stop|ask` 等）；`cherry-pick` 已有较完整 sequencer，`revert` 已有 `--continue`/`--abort`/`--skip`、`--no-edit`（接受式 no-op）与 `-e/--edit`（编辑器，opt-in，经 `RevertState.edit` 串到 `--continue`/`--skip`），并已实现多提交冲突自动续作（冲突时把剩余提交 ID 存入 `RevertState.remaining`，`--continue`/`--skip` 续作其余）。注意 `pull --rebase` 已实现，不列入缺口。 | 保留为重写/序列器能力缺口；不能把已实现的 rebase `--onto`、commit `--fixup`/`--squash`/`--cleanup`/`-e`/`-v` 当作缺失。 |
 | merge/pull strategy surface | octopus merge、自定义 strategy/`-X`。 | `MergeArgs` 已有 `-m`/`--ff-only`/`--no-ff`/`--squash`/`--no-commit`/`--no-edit`/`--verify-signatures`(vault-key PGP 验证，无外部 keyring)（octopus/自定义 strategy/`-X` 仍缺）；`PullArgs` 已有 `--rebase`、`--ff-only`、`--ff`、`--no-ff`、`--squash`、`--commit`、`--no-commit`、`--autostash` 与 fetch `--depth`。 | 仅 octopus/自定义 strategy/`-X` 仍为缺口；不要再把已实现的 merge/pull strategy flags（`--ff-only`/`--no-ff`/`--squash`/`--no-commit`/`-m`/`--no-edit`/`--verify-signatures`、pull `--squash`/`--commit`/`--no-commit`/`--autostash`）当作缺失。 |
@@ -138,6 +138,18 @@ flowchart TD
 - 状态：拒绝。空提交说明不是当前 `commit` 默认可用面。
 - 原因：Libra 依赖提交信息作为人类和 Agent 的审计线索；允许空消息需要显式产品决策和钩子/签名路径测试。
 - 重启条件：存在明确自动化场景，并补齐 commit-msg hook、签名和日志渲染测试。
+
+### D17：跨网 / foreign-Git / push 侧 `refs/notes/deps` travel
+
+- 状态：延后。lore.md 3.2 v1 只在**本地协议 LibraRepo↔LibraRepo** 之间旅行依赖图：`fetch`/`pull --notes` 从本地 Libra 源经专用旁路（`export_deps_notes` → `deps::import_notes` union-merge）导入 `refs/notes/deps`，默认 OFF（Git parity）。跨网远端（`https://`/`ssh://`/`git://`）、本地 **foreign-Git** 源、以及 **push 侧** notes travel 尚未支持——网络/foreign 远端只发一条诚实的 "not supported yet" 警告并不导入任何图。
+- 原因：Libra 的 note 不是 Git 的 notes-tree-commit（是 loose blob + SQLite `notes` 行，`refs/notes/deps` 非 reference 表真 ref），故无法搭 pack/ref want 集旅行；跨网需要线协议能力（双向 notes-tree ⇄ Libra notes-row 翻译，或 Libra 原生能力协商通道），push 侧还叠加 D2（本地 file remote push 有意拒绝）的原子写/并发语义。这些都需要独立的协议设计与端到端测试。
+- 重启条件：先冻结 notes 线协议（能力协商 + 双向翻译 + 鉴权），补齐跨网/foreign-Git 往返与 push 侧原子写测试，再逐通道开放。
+
+### D18：依赖过滤克隆的工作树**磁盘**收窄
+
+- 状态：延后。`clone --deps-of`（lore.md 3.2）在**全量、commit-safe 的 checkout** 之后，只把只读 sparse VIEW（2.2）scope 到依赖闭包——**整棵树仍在磁盘上**，对象也从不 wire 过滤（与 `clone --filter` "不排除对象" 同等诚实）。真正按依赖闭包**收窄工作树磁盘占用**（只物化闭包文件）尚未支持。
+- 原因：commit-safe 地收窄工作树需要 **skip-worktree/materializing-sparse 机制**（Libra 至今无此索引位——正是 D10 延后的 materializing 形）：HEAD 是完整提交树，任何窄于 HEAD 的索引都会让 `commit` 丢文件，而全索引+窄工作树在没有 skip-worktree 位时会让 `status` 谎报删除。因此磁盘收窄与 D10 绑定，不能在 v1 单独安全交付。
+- 重启条件：先落地 D10 的 materializing sparse-checkout / skip-worktree 索引位（含 status/add/commit/checkout 全链一致性与测试），再让 `--deps-of` 复用其物化路径实现磁盘收窄。
 
 ## 维护要求
 

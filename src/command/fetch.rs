@@ -76,6 +76,7 @@ EXAMPLES:
     libra fetch origin --dry-run           Preview ref updates without downloading
     libra fetch origin --porcelain         Machine-readable per-ref update lines
     libra fetch origin -v                  Announce the remote on stderr
+    libra fetch origin --notes             Also fetch the file-dependency graph (local Libra source)
     libra --json fetch origin              Structured JSON output for agents";
 
 pub(crate) enum RemoteClient {
@@ -676,6 +677,15 @@ pub struct FetchArgs {
     /// given, the last one on the command line wins (Git semantics).
     #[clap(long = "no-prune", overrides_with = "prune")]
     pub no_prune: bool,
+
+    /// Also fetch the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from
+    /// the remote. Default OFF (Git never auto-fetches notes). v1 travels notes
+    /// only from a local Libra source over the local protocol; a network or plain
+    /// Git remote emits an honest "not supported yet" warning and fetches no
+    /// graph (see `_compatibility.md` D17). Persist the opt-in per remote with
+    /// `remote.<name>.fetchNotesDeps=true`.
+    #[clap(long = "notes")]
+    pub notes: bool,
 }
 
 /// How tags are handled for a fetch, resolved per-remote from CLI flags then
@@ -1027,6 +1037,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         no_progress,
         prune,
         no_prune: _,
+        notes,
     } = args;
 
     // `--no-progress` forces progress reporting off (the "Receiving objects"
@@ -1064,7 +1075,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
             }
             results.push(
                 fetch_repository_with_result(
-                    remote, None, false, depth, dry_run, tag_cli, force, prune, output,
+                    remote, None, false, depth, dry_run, tag_cli, force, prune, notes, output,
                 )
                 .await
                 .map_err(CliError::from)?,
@@ -1127,6 +1138,7 @@ async fn run_fetch(args: FetchArgs, output: &OutputConfig) -> CliResult<FetchOut
         tag_cli,
         force,
         prune,
+        notes,
         output,
     )
     .await
@@ -1357,6 +1369,7 @@ pub async fn fetch_repository_safe(
         tag_cli,
         false,
         false,
+        false,
         output,
     )
     .await
@@ -1373,6 +1386,7 @@ pub(crate) async fn fetch_repository_with_result(
     tag_cli: Option<TagFetchMode>,
     force: bool,
     prune: bool,
+    notes: bool,
     output: &OutputConfig,
 ) -> Result<FetchRepositoryResult, FetchError> {
     let (remote_client, discovery) =
@@ -1561,6 +1575,21 @@ pub(crate) async fn fetch_repository_with_result(
     };
     refs_updated.extend(persist_fetched_tags(&tags_to_persist, force).await?);
 
+    // Dependency-graph notes (`refs/notes/deps`, lore.md 3.2). When `--notes` (or
+    // the persisted `remote.<name>.fetchNotesDeps` opt-in) is set, pull the
+    // source's file-dependency graph over a dedicated side-channel: a Libra deps
+    // note is a loose blob + a SQLite row, NOT a commit-reachable object, so it
+    // cannot ride the pack. v1 travels notes only from a local Libra source; a
+    // network or foreign-Git remote emits an honest deferred warning (D17). This
+    // is per-note fault-tolerant and never aborts a fetch whose refs are already
+    // updated.
+    let notes_enabled = notes || remote_fetch_notes_deps(&remote_config.name).await;
+    if notes_enabled {
+        for warning in fetch_deps_notes(&remote_client).await {
+            eprintln!("warning: {warning}");
+        }
+    }
+
     // `--prune`/`-p`: after the fetch has updated tracking refs, delete any
     // `refs/remotes/<name>/*` the remote no longer advertises (transactionally,
     // with an audit reflog entry). Only stale tracking refs for *this* remote
@@ -1584,6 +1613,52 @@ pub(crate) async fn fetch_repository_with_result(
         bytes_received,
         pruned,
     })
+}
+
+/// Effective `--notes` opt-in for a remote: the CLI flag OR the persisted
+/// `remote.<name>.fetchNotesDeps=true` config (written by `clone --deps-of` so
+/// later pulls keep the dependency graph fresh). Best-effort — a missing/broken
+/// config resolves to `false`, never an error.
+async fn remote_fetch_notes_deps(remote_name: &str) -> bool {
+    match ConfigKv::get_best_effort(&format!("remote.{remote_name}.fetchNotesDeps")).await {
+        Ok(Some(entry)) => matches!(entry.value.trim(), "true" | "1" | "yes" | "on"),
+        _ => false,
+    }
+}
+
+/// Import the file-dependency graph (`refs/notes/deps`, lore.md 3.2) from
+/// `remote_client` into the current repo. Returns non-fatal warnings (a deferred
+/// remote, or a skipped malformed / absent-commit note). NEVER aborts the fetch:
+/// the graph is best-effort metadata layered on top of an already-completed pack
+/// + ref update.
+async fn fetch_deps_notes(remote_client: &RemoteClient) -> Vec<String> {
+    match remote_client {
+        RemoteClient::Local(client) => {
+            let (entries, mut warnings) = match client.export_deps_notes().await {
+                Ok(pair) => pair,
+                Err(e) => (
+                    Vec::new(),
+                    vec![format!(
+                        "could not read the dependency graph from the source: {e}"
+                    )],
+                ),
+            };
+            let outcome = crate::internal::deps::DependencyStore::import_notes(&entries).await;
+            if outcome.imported > 0 {
+                tracing::debug!(
+                    "imported {} dependency note(s) from the remote",
+                    outcome.imported
+                );
+            }
+            warnings.extend(outcome.warnings);
+            warnings
+        }
+        _ => vec![
+            "dependency-graph (refs/notes/deps) travel over network remotes is not supported \
+             yet; the graph was not fetched (see _compatibility.md D17)"
+                .to_string(),
+        ],
+    }
 }
 
 #[derive(Default)]
