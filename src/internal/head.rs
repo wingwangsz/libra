@@ -59,13 +59,21 @@ impl Head {
     where
         C: ConnectionTrait,
     {
+        // lore.md 2.1: scope HEAD to the CURRENT worktree (ambient, cwd-derived
+        // like `path::index()`). None = main (worktree_id IS NULL); a linked
+        // worktree resolves ONLY its own HEAD row, so every caller — public AND
+        // `_with_conn` (commit/switch/reset/reflog inside a txn) — reads the
+        // same worktree's HEAD and can never leak the main worktree's.
+        let worktree_id = crate::utils::util::current_worktree_id();
         for attempt in 0..=Self::SQLITE_BUSY_MAX_RETRIES {
-            match reference::Entity::find()
+            let mut query = reference::Entity::find()
                 .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
-                .filter(reference::Column::Remote.is_null())
-                .one(db)
-                .await
-            {
+                .filter(reference::Column::Remote.is_null());
+            query = match &worktree_id {
+                Some(id) => query.filter(reference::Column::WorktreeId.eq(id.clone())),
+                None => query.filter(reference::Column::WorktreeId.is_null()),
+            };
+            match query.one(db).await {
                 Ok(Some(model)) => return Ok(model),
                 Ok(None) => {
                     return Err(BranchStoreError::Corrupt {
@@ -280,7 +288,15 @@ impl Head {
         for attempt in 0..=Self::SQLITE_BUSY_MAX_RETRIES {
             let head = match remote {
                 Some(remote) => Self::query_remote_head_with_conn(db, remote).await,
-                None => Some(Self::query_local_head_result_with_conn(db).await?),
+                // lore.md 2.1: a linked worktree has no HEAD row until first
+                // seeded — a missing per-worktree HEAD falls to the INSERT
+                // branch (which tags the row with the current worktree id)
+                // rather than erroring.
+                None => match Self::query_local_head_result_with_conn(db).await {
+                    Ok(model) => Some(model),
+                    Err(BranchStoreError::Corrupt { .. }) => None,
+                    Err(e) => return Err(e),
+                },
             };
 
             let write_result = match head {
@@ -309,6 +325,11 @@ impl Head {
                     };
                     if remote.is_some() {
                         head.remote = Set(remote.map(|s| s.to_owned()));
+                    } else {
+                        // lore.md 2.1: a NEW local HEAD row is tagged with the
+                        // current worktree id (NULL for main) so it is private
+                        // to this worktree.
+                        head.worktree_id = Set(crate::utils::util::current_worktree_id());
                     }
                     match &new_head {
                         Head::Detached(commit_hash) => {
@@ -339,6 +360,25 @@ impl Head {
         Err(BranchStoreError::Query(
             "failed to update HEAD reference after sqlite busy retries".to_string(),
         ))
+    }
+
+    /// lore.md 2.1: the worktree id (if any) OTHER than the current one that
+    /// currently has `branch` checked out as HEAD. Branches are SHARED across
+    /// worktrees, so two worktrees on one branch would both move the same
+    /// pointer — `switch`/`checkout` use this to refuse (git parity).
+    pub async fn branch_checked_out_elsewhere(branch: &str) -> Option<String> {
+        let db = get_db_conn_instance().await;
+        let current = crate::utils::util::current_worktree_id();
+        let rows = reference::Entity::find()
+            .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+            .filter(reference::Column::Remote.is_null())
+            .filter(reference::Column::Name.eq(branch))
+            .all(&db)
+            .await
+            .unwrap_or_default();
+        rows.into_iter()
+            .find(|row| row.worktree_id != current)
+            .map(|row| row.worktree_id.unwrap_or_else(|| "(main)".to_string()))
     }
 
     pub async fn update_with_conn<C>(db: &C, new_head: Self, remote: Option<&str>)

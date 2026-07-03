@@ -549,6 +549,7 @@ pub async fn execute(args: MergeArgs) {
 /// Returns [`CliError`] when the target is invalid, histories are unrelated,
 /// conflicts need resolution, objects cannot be read, or HEAD/worktree updates fail.
 pub async fn execute_safe(args: MergeArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::ensure_main_worktree("merge")?;
     // Symmetric sequencer mutex (lore.md 2.6): refuse a merge while ANY other
     // sequence (cherry-pick/revert/rebase) is unresolved. Same-op (a merge
     // already in progress) is intentionally deferred to merge's OWN typed

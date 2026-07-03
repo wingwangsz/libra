@@ -720,6 +720,14 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070701_sparse_view.sql"),
             include_str!("../../../sql/migrations/2026070701_sparse_view_down.sql"),
         ),
+        // lore.md 2.1: per-worktree HEAD/index/HEAD-reflog isolation — adds a
+        // nullable `worktree_id` scoping column to `reference` and `reflog`.
+        sql_migration(
+            2026070801,
+            "worktree_isolation",
+            include_str!("../../../sql/migrations/2026070801_worktree_isolation.sql"),
+            include_str!("../../../sql/migrations/2026070801_worktree_isolation_down.sql"),
+        ),
     ]
 }
 
@@ -848,9 +856,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 20);
+        assert_eq!(runner.len(), 21);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070701));
+        assert_eq!(runner.max_registered_version(), Some(2026070801));
     }
 
     #[test]

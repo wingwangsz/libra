@@ -107,6 +107,12 @@ fn is_valid_storage_dir(path: &Path) -> bool {
     if path.join(DATABASE).exists() {
         return true;
     }
+    // lore.md 2.1: a linked worktree's `.libra` holds only `commondir` +
+    // `worktree_id` + `index` (db/objects live in the common storage), so
+    // recognize it by its commondir pointer.
+    if path.join("commondir").exists() {
+        return true;
+    }
 
     ["objects", "info/exclude", "hooks"]
         .iter()
@@ -226,7 +232,35 @@ pub fn find_git_repository(path: Option<&Path>) -> Option<GitRepositoryLocation>
     }
 }
 
-fn try_get_paths(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf), io::Error> {
+/// The shared/common storage for a worktree gitdir (lore.md 2.1): follow a
+/// `commondir` pointer if present (a linked worktree borrows the main repo's
+/// db/objects/hooks), else the gitdir itself (the main worktree). The
+/// per-worktree `index` and `worktree_id` always live in the local gitdir.
+fn worktree_common_storage(gitdir: &Path) -> PathBuf {
+    if let Ok(contents) = fs::read_to_string(gitdir.join("commondir"))
+        && let Some(raw) = contents
+            .lines()
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+    {
+        let common = Path::new(raw);
+        let resolved = if common.is_absolute() {
+            common.to_path_buf()
+        } else {
+            gitdir.join(common)
+        };
+        return fs::canonicalize(&resolved).unwrap_or(resolved);
+    }
+    gitdir.to_path_buf()
+}
+
+/// Resolve `(common_storage, workdir, worktree_gitdir)` for a path.
+/// - `worktree_gitdir`: the LOCAL `.libra` for this working tree (holds the
+///   private `index` and `worktree_id`).
+/// - `common_storage`: the SHARED `.libra` (db / objects / hooks). Equals the
+///   gitdir for the main worktree; the `commondir` target for a linked one.
+fn try_get_paths_full(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf, PathBuf), io::Error> {
     let mut path = path.clone().unwrap_or_else(cur_dir);
     let orig = path.clone();
 
@@ -234,12 +268,13 @@ fn try_get_paths(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf), io::Error>
         let standard_repo = path.join(ROOT_DIR);
         if standard_repo.is_dir() && is_valid_storage_dir(&standard_repo) {
             // unwrap_or is safe here: if canonicalize fails, we use the original path
-            let storage = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
-            return Ok((storage, path.clone()));
+            let gitdir = fs::canonicalize(&standard_repo).unwrap_or(standard_repo);
+            let common = worktree_common_storage(&gitdir);
+            return Ok((common, path.clone(), gitdir));
         }
 
         if path.join(DATABASE).exists() && path.join("objects").exists() {
-            return Ok((path.clone(), path.clone()));
+            return Ok((path.clone(), path.clone(), path.clone()));
         }
 
         if !path.pop() {
@@ -249,6 +284,82 @@ fn try_get_paths(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf), io::Error>
             ));
         }
     }
+}
+
+/// `(common_storage, workdir)` — db/objects/hooks storage + the working dir.
+fn try_get_paths(path: Option<PathBuf>) -> Result<(PathBuf, PathBuf), io::Error> {
+    let (common, workdir, _gitdir) = try_get_paths_full(path)?;
+    Ok((common, workdir))
+}
+
+/// The LOCAL `.libra` gitdir for this working tree (lore.md 2.1): where the
+/// per-worktree `index` + `worktree_id` live. Equals the common storage for the
+/// main worktree; the linked worktree's own `.libra` otherwise.
+pub fn try_get_worktree_gitdir(path: Option<PathBuf>) -> Result<PathBuf, io::Error> {
+    let (_common, _workdir, gitdir) = try_get_paths_full(path)?;
+    Ok(gitdir)
+}
+
+/// The current worktree's gitdir (panics outside a repo — mirrors `storage_path`).
+pub fn worktree_gitdir() -> PathBuf {
+    try_get_worktree_gitdir(None).expect("worktree_gitdir() called outside a libra repository")
+}
+
+/// The current worktree's stable instance id (lore.md 2.1), read ambiently from
+/// `<gitdir>/worktree_id`. `None` = the MAIN worktree (HEAD/index/reflog rows
+/// with `worktree_id IS NULL`). Resolved from the process cwd exactly like
+/// `path::index()`; a single process operates in one worktree, so this is
+/// stable for its lifetime.
+/// Whether the current process runs in a LINKED worktree (lore.md 2.1). v1
+/// refuses in-progress sequencer operations (merge/rebase/cherry-pick/revert/
+/// bisect) here because their state (rebase_state / sequence_state /
+/// MERGE_HEAD) is still shared across worktrees.
+pub fn is_linked_worktree() -> bool {
+    current_worktree_id().is_some()
+}
+
+pub fn current_worktree_id() -> Option<String> {
+    let gitdir = try_get_worktree_gitdir(None).ok()?;
+    if let Ok(id) = fs::read_to_string(gitdir.join("worktree_id")) {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    // FAIL-CLOSED (Codex P1): a LINKED worktree is identified by its
+    // `commondir` pointer. If its `worktree_id` file is missing/empty/unreadable
+    // (corruption), we must NEVER return `None` — that aliases to the MAIN
+    // worktree and would graft the main HEAD. Synthesize a stable id from the
+    // canonical workdir (matching creation's derivation) so a recovered
+    // worktree stays isolated from main and keeps its rows.
+    if gitdir.join("commondir").exists() {
+        let workdir = gitdir.parent().unwrap_or(&gitdir);
+        let canonical = fs::canonicalize(workdir).unwrap_or_else(|_| workdir.to_path_buf());
+        return Some(worktree_instance_id(&canonical));
+    }
+    None
+}
+
+/// A stable, unique instance id for a worktree (lore.md 2.1), derived from its
+/// canonical path so it is deterministic across invocations. FNV-1a keeps it
+/// dependency-free and filesystem-safe. Shared by worktree creation and the
+/// fail-closed fallback in [`current_worktree_id`].
+pub fn worktree_instance_id(canonical_path: &Path) -> String {
+    let bytes = canonical_path.to_string_lossy();
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for b in bytes.as_bytes() {
+        hash ^= *b as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let base = canonical_path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "wt".to_string());
+    let sanitized: String = base
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    format!("{sanitized}-{hash:016x}")
 }
 
 /// Try to get the storage path of the repository, which is the path of the `.libra` directory

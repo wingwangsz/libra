@@ -1040,6 +1040,7 @@ pub async fn execute(args: RebaseArgs) {
 
 /// Safe CLI entry point with preflight validation for argument and state errors.
 pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::ensure_main_worktree("rebase")?;
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     // Refuse to start a NEW rebase while a cherry-pick sequence is in progress

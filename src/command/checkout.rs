@@ -421,6 +421,7 @@ async fn run_checkout(
                         previous_branch,
                         previous_commit,
                         output,
+                        args.ignore_other_worktrees,
                     )
                     .await
                 }
@@ -572,7 +573,7 @@ async fn current_commit_string() -> Result<Option<String>, CheckoutError> {
 }
 
 pub async fn switch_branch(branch_name: &str) -> CliResult<()> {
-    switch_branch_with_output(branch_name, &OutputConfig::default())
+    switch_branch_with_output(branch_name, &OutputConfig::default(), false)
         .await
         .map(|_| ())
         .map_err(CliError::from)
@@ -581,10 +582,24 @@ pub async fn switch_branch(branch_name: &str) -> CliResult<()> {
 async fn switch_branch_with_output(
     branch_name: &str,
     output: &OutputConfig,
+    ignore_other_worktrees: bool,
 ) -> Result<ObjectHash, CheckoutError> {
     if is_ai_managed_branch(branch_name) {
         return Err(CheckoutError::SwitchingToBranchBlocked(
             branch_name.to_string(),
+        ));
+    }
+    // lore.md 2.1: refuse a branch already checked out in another worktree
+    // (branches are shared) unless --ignore-other-worktrees. git parity.
+    if !ignore_other_worktrees
+        && let Some(other) = Head::branch_checked_out_elsewhere(branch_name).await
+    {
+        return Err(CheckoutError::DelegatedCli(
+            crate::utils::error::CliError::fatal(format!(
+                "branch '{branch_name}' is already checked out at worktree '{other}'"
+            ))
+            .with_stable_code(crate::utils::error::StableErrorCode::ConflictOperationBlocked)
+            .with_hint("check out a different branch, use --detach, or --ignore-other-worktrees"),
         ));
     }
     let target_branch = Branch::find_branch_result(branch_name, None)
@@ -607,7 +622,8 @@ async fn create_and_switch_new_branch(
     branch::create_branch_safe(new_branch.to_string(), get_current_branch().await)
         .await
         .map_err(CheckoutError::DelegatedCli)?;
-    switch_branch_with_output(new_branch, output).await
+    // A freshly created branch cannot be checked out elsewhere.
+    switch_branch_with_output(new_branch, output, true).await
 }
 
 async fn get_remote(branch_name: &str, output: &OutputConfig) -> Result<ObjectHash, CheckoutError> {
@@ -699,6 +715,7 @@ async fn check_and_switch_branch(
     previous_branch: Option<String>,
     previous_commit: Option<String>,
     output: &OutputConfig,
+    ignore_other: bool,
 ) -> Result<CheckoutOutput, CheckoutError> {
     let child_output = silent_child_output(output);
     match check_branch_with_output(branch_name, &child_output).await? {
@@ -724,7 +741,7 @@ async fn check_and_switch_branch(
             })
         }
         Some(false) => {
-            let commit = switch_branch_with_output(branch_name, &child_output)
+            let commit = switch_branch_with_output(branch_name, &child_output, ignore_other)
                 .await?
                 .to_string();
             Ok(CheckoutOutput {

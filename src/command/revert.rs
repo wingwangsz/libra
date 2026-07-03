@@ -305,6 +305,7 @@ pub async fn execute(args: RevertArgs) {
 /// errors and exiting. Reverses one or more commits by replaying their inverse
 /// changes into the index/worktree and optionally creating new commits.
 pub async fn execute_safe(args: RevertArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::ensure_main_worktree("revert")?;
     // Symmetric sequencer mutex (lore.md 2.6): refuse a NEW revert while any
     // OTHER sequence is unresolved. Control verbs are exempt; same-op falls
     // through to run_revert's own RevertInProgress check.

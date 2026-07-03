@@ -2777,6 +2777,7 @@ mod tests {
                     kind: reference::ConfigKind::Head,
                     commit: None,
                     remote: None,
+                    worktree_id: None,
                 },
                 reference::Model {
                     id: 0,
@@ -2784,6 +2785,7 @@ mod tests {
                     kind: reference::ConfigKind::Branch,
                     commit: Some(restored_commit.clone()),
                     remote: None,
+                    worktree_id: None,
                 },
             ];
             let remote = RemoteStorage::new(Arc::new(InMemory::new()));
@@ -2862,6 +2864,7 @@ mod tests {
                 kind: reference::ConfigKind::Branch,
                 commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
                 remote: None,
+                worktree_id: None,
             }];
             let metadata = serde_json::to_vec(&refs).expect("metadata should serialize");
             remote.put_metadata(&metadata).await.unwrap();

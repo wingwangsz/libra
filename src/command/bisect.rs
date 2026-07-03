@@ -561,6 +561,7 @@ impl From<BisectError> for CliError {
 /// - All variants forward their errors as `Err(CliError::fatal)` derived from
 ///   either DB failures, missing state, or rev-resolution failures.
 pub async fn execute_safe(bisect_cmd: Bisect, output: &OutputConfig) -> CliResult<()> {
+    crate::command::ensure_main_worktree("bisect")?;
     let result = run_bisect(bisect_cmd).await?;
     render_bisect_output(&result, output)
 }

@@ -578,6 +578,7 @@ pub async fn execute(args: CherryPickArgs) {
 /// errors and exiting. Replays one or more commit changes onto the current
 /// branch, optionally creating new commits or leaving them staged.
 pub async fn execute_safe(args: CherryPickArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::ensure_main_worktree("cherry-pick")?;
     // Symmetric sequencer mutex (lore.md 2.6): a NEW cherry-pick is refused
     // while ANY other sequence (merge/revert/rebase) is unresolved. Control
     // verbs are exempt (they conclude the in-progress cherry-pick). Same-op

@@ -4640,6 +4640,7 @@ mod tests {
             kind: reference::ConfigKind::Branch,
             commit: Some(commit_id.to_string()),
             remote: None,
+            worktree_id: None,
         }];
         let metadata = serde_json::to_vec(&refs).expect("metadata should serialize");
         remote
@@ -4761,6 +4762,7 @@ mod tests {
                     kind: reference::ConfigKind::Head,
                     commit: None,
                     remote: None,
+                    worktree_id: None,
                 },
                 reference::Model {
                     id: 0,
@@ -4768,6 +4770,7 @@ mod tests {
                     kind: reference::ConfigKind::Branch,
                     commit: Some(commit.id.to_string()),
                     remote: None,
+                    worktree_id: None,
                 },
                 reference::Model {
                     id: 0,
@@ -4775,6 +4778,7 @@ mod tests {
                     kind: reference::ConfigKind::Tag,
                     commit: Some(commit.id.to_string()),
                     remote: None,
+                    worktree_id: None,
                 },
             ];
             let metadata = serde_json::to_vec(&refs).expect("refs metadata should serialize");

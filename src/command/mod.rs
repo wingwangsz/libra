@@ -145,6 +145,22 @@ use crate::{
 };
 
 // impl load for all objects
+/// lore.md 2.1: refuse an in-progress sequencer operation inside a LINKED
+/// worktree. Merge/rebase/cherry-pick/revert/bisect state (rebase_state /
+/// sequence_state / MERGE_HEAD) is still shared across worktrees in v1, so
+/// running one in a linked worktree could collide with the main worktree's
+/// operation. Allowed in the main worktree.
+pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
+    if crate::utils::util::is_linked_worktree() {
+        return Err(crate::utils::error::CliError::fatal(format!(
+            "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: in-progress \
+             operation state is shared across worktrees) \u{2014} run it in the main worktree"
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::Unsupported));
+    }
+    Ok(())
+}
+
 pub fn load_object<T>(hash: &ObjectHash) -> Result<T, GitError>
 where
     T: ObjectTrait,

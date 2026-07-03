@@ -5,11 +5,13 @@ use std::{io, path::PathBuf};
 use crate::utils::util;
 
 pub fn index() -> PathBuf {
-    util::storage_path().join("index")
+    // lore.md 2.1: the index is PER-WORKTREE — it lives in the local gitdir,
+    // not the shared/common storage (db/objects stay shared).
+    util::worktree_gitdir().join("index")
 }
 
 pub fn try_index() -> io::Result<PathBuf> {
-    Ok(util::try_get_storage_path(None)?.join("index"))
+    Ok(util::try_get_worktree_gitdir(None)?.join("index"))
 }
 
 pub fn objects() -> PathBuf {

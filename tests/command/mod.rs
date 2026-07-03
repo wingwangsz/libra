@@ -397,5 +397,6 @@ mod verify_pack_stat_test;
 mod verify_pack_test;
 #[cfg(all(unix, feature = "worktree-fuse"))]
 mod worktree_fuse_test;
+mod worktree_isolation_test;
 mod worktree_test;
 mod write_tree_test;

@@ -131,6 +131,10 @@ pub enum SwitchError {
     #[error("{0}")]
     CaseCollision(crate::utils::error::CliError),
 
+    /// lore.md 2.1: the target branch is already checked out in another worktree.
+    #[error("{0}")]
+    WorktreeConflict(crate::utils::error::CliError),
+
     #[error("remote branch name is required")]
     MissingTrackTarget,
 
@@ -199,6 +203,7 @@ impl From<SwitchError> for CliError {
     fn from(error: SwitchError) -> Self {
         match error {
             SwitchError::CaseCollision(inner) => inner,
+            SwitchError::WorktreeConflict(inner) => inner,
             SwitchError::MissingTrackTarget => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("provide a remote branch name, for example 'origin/main'."),
@@ -1140,6 +1145,19 @@ async fn switch_to_resolved_branch(
         // rendered by render_switch_output() based on the `already_on` flag,
         // so we must not emit anything here (it would corrupt --json stdout).
         return Ok(target_commit_id);
+    }
+
+    // lore.md 2.1: branches are SHARED across worktrees, so refuse switching to
+    // a branch already checked out in another worktree (both would move the
+    // same pointer). git parity — detach instead to share the tip read-only.
+    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+        return Err(SwitchError::WorktreeConflict(
+            CliError::fatal(format!(
+                "branch '{branch_name}' is already checked out at worktree '{other}'"
+            ))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("switch to a different branch, or use --detach to share its tip"),
+        ));
     }
 
     let action = ReflogAction::Switch {
