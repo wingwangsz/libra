@@ -143,6 +143,14 @@ pub enum AddError {
     /// [`StableErrorCode::RepoNotFound`].
     #[error("not a libra repository (or any of the parent directories): .libra")]
     NotInRepo,
+    /// The `lfs.lockEnforce` gate refused the operation (lore.md 2.8); the
+    /// carried [`CliError`] already has its stable code and hints.
+    #[error("{0}")]
+    LockPolicy(CliError),
+    /// A layer-owned overlay path was requested for staging (lore.md 2.4).
+    /// Layers are purely local and must never enter a commit.
+    #[error("'{path}' is a layer overlay path and cannot be staged ({count} such path(s))")]
+    LayerPath { path: String, count: usize },
     /// A user-supplied pathspec matched neither tracked files, working-tree
     /// changes, nor an ignored entry — typically a typo. Mapped to
     /// [`StableErrorCode::CliInvalidTarget`].
@@ -185,6 +193,10 @@ pub enum AddError {
 impl From<AddError> for CliError {
     fn from(error: AddError) -> Self {
         match &error {
+            AddError::LockPolicy(inner) => inner.clone(),
+            AddError::LayerPath { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::LayerConflict)
+                .with_hint("layer overlays are local-only; 'libra layer unapply' to remove them"),
             AddError::NotInRepo => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoNotFound)
                 .with_hint("run 'libra init' to create a repository"),
@@ -446,6 +458,9 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
 /// See: tests::test_add_all_flag in tests/command/add_test.rs:100;
 /// tests::test_add_force_tracks_ignored_file in tests/command/add_test.rs:319.
 pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
+    // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
+    // ignore resolver skips layer-owned paths (a no-op with no layers).
+    crate::internal::layer::refresh_exclusion_snapshot().await;
     let workdir = util::try_working_dir().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -576,6 +591,56 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     files.sort();
     files.dedup();
 
+    // Layer never-enters-commit guard (lore.md 2.4): a layer-owned overlay
+    // path must NEVER be staged, EVEN under --force (which bypasses ignore
+    // filtering — the ignore-exclusion chokepoint alone is not airtight).
+    // Under Respect, layer paths are already ignore-excluded so `files` is
+    // empty of them (this loop is a no-op — zero overhead with no layers).
+    {
+        // Fail-CLOSED (Codex P1): a real DB read failure here must NOT allow
+        // staging (the invariant is never-enters-commit). `materialized_paths`
+        // is absence-tolerant for a missing table (fresh repo) but propagates
+        // any other error.
+        let owned: std::collections::HashSet<String> =
+            crate::internal::layer::LayerStore::materialized_paths()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "cannot verify layer-owned paths before staging: {e}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .into_iter()
+                .map(|p| p.path)
+                .collect();
+        if !owned.is_empty() {
+            let blocked: Vec<String> = files
+                .iter()
+                .filter_map(|file| crate::internal::layer::normalize_key(file))
+                .filter(|key| owned.contains(key))
+                .collect();
+            if let Some(first) = blocked.first() {
+                return Err(CliError::from(AddError::LayerPath {
+                    path: first.clone(),
+                    count: blocked.len(),
+                }));
+            }
+        }
+    }
+
+    // `lfs.lockEnforce` gate (lore.md 2.8): before ANY blob/index write, and
+    // never on --dry-run (previews must not touch the network). `--refresh`
+    // returned above (stat-only rewrite — no content change to gate).
+    if !args.dry_run {
+        let candidates: Vec<String> = files
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect();
+        crate::command::lfs::enforce_lock_policy(&candidates)
+            .await
+            .map_err(AddError::LockPolicy)?;
+    }
+
     if args.dry_run {
         // Classify files for dry-run preview.
         for file in &files {
@@ -612,6 +677,78 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         }
         return check_ignored_only_error(add_output);
     }
+
+    // Case-collision guard (lore.md 1.14): on a case-insensitive view, a
+    // candidate whose FOLD matches a DIFFERENT-cased tracked entry must never
+    // create an index twin (`Foo` + `foo`). Under the conservative default
+    // (`core.casehandling=error`) the whole add refuses BEFORE mutating the
+    // index; `warn`/`allow` skip the colliding candidates (staging under the
+    // existing casing is the engine's job — v1 skips, documented).
+    let ignore_case = crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let files = if ignore_case {
+        let policy = crate::utils::path_case::case_handling_from_config()
+            .await
+            .map_err(|error| {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            })?;
+        let tracked_fold: std::collections::HashMap<String, String> = index
+            .tracked_files()
+            .iter()
+            .map(|path| {
+                let text = crate::utils::util::path_to_string(path);
+                (crate::utils::path_case::fold_path_key(&text), text)
+            })
+            .collect();
+        let mut kept = Vec::with_capacity(files.len());
+        let mut collisions: Vec<(String, String)> = Vec::new();
+        for file in files {
+            let text = crate::utils::util::path_to_string(&file);
+            match tracked_fold.get(&crate::utils::path_case::fold_path_key(&text)) {
+                Some(existing) if existing != &text => {
+                    collisions.push((text, existing.clone()));
+                }
+                _ => kept.push(file),
+            }
+        }
+        if !collisions.is_empty() {
+            match policy {
+                crate::utils::path_case::CaseHandling::Error => {
+                    let listing = collisions
+                        .iter()
+                        .map(|(candidate, tracked)| {
+                            format!("'{candidate}' collides with tracked '{tracked}'")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(
+                        CliError::failure(format!("case-fold path collision: {listing}"))
+                            .with_stable_code(StableErrorCode::ConflictCaseCollision)
+                            .with_hint(
+                                "rename deliberately with 'libra mv <Tracked> <tracked>', or set \
+                         core.casehandling=warn to proceed",
+                            ),
+                    );
+                }
+                crate::utils::path_case::CaseHandling::Warn => {
+                    for (candidate, tracked) in &collisions {
+                        crate::utils::error::emit_warning(format!(
+                            "case-fold collision: '{candidate}' matches tracked '{tracked}' \
+                             (skipped; use 'libra mv' for a deliberate case rename)"
+                        ));
+                    }
+                }
+                crate::utils::path_case::CaseHandling::Allow => {}
+            }
+        }
+        kept
+    } else {
+        files
+    };
 
     // Stage each file (`--renormalize` force-rewrites instead of diffing).
     for file in &files {

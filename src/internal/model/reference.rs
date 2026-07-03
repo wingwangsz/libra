@@ -19,6 +19,10 @@ pub struct Model {
     /// None for local references; Some("origin") for remote references.
     /// Empty string is not valid.
     pub remote: Option<String>,
+    /// lore.md 2.1: per-worktree scoping for HEAD rows (kind='Head', remote
+    /// NULL). NULL = the main worktree (and all shared Branch/Tag rows);
+    /// Some(id) = a linked worktree's private HEAD. Shared refs keep this NULL.
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

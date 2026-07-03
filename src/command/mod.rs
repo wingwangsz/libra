@@ -10,8 +10,10 @@
 
 pub mod add;
 pub mod agent;
+pub mod alternates;
 pub mod apply;
 pub mod archive;
+pub mod auth;
 pub mod automation;
 pub mod bisect;
 pub mod blame;
@@ -31,9 +33,11 @@ pub mod code;
 pub mod code_control;
 pub mod code_control_files;
 pub mod commit;
+pub mod commit_tree;
 pub mod completions;
 pub mod config;
 pub mod credential;
+pub mod deps;
 pub mod describe;
 pub mod diff;
 pub mod diff_plumbing;
@@ -42,6 +46,7 @@ pub mod editor;
 pub mod fast_export;
 pub mod fast_import;
 pub mod fetch;
+pub mod file;
 pub mod for_each_ref;
 pub mod format_patch;
 pub mod fsck;
@@ -49,11 +54,13 @@ pub mod graph;
 pub mod grep;
 pub mod hash_object;
 pub mod hooks;
+pub mod hydrate;
 pub mod index_pack;
 mod index_pack_support;
 mod index_pack_v1;
 mod index_pack_v2;
 pub mod init;
+pub mod layer;
 pub mod lfs;
 pub mod lfs_schema;
 pub mod log;
@@ -62,6 +69,8 @@ pub mod ls_files;
 pub mod ls_remote;
 pub mod ls_tree;
 pub mod maintenance;
+#[cfg(feature = "fastcdc")]
+pub mod media;
 pub mod merge;
 pub mod merge_base;
 pub mod merge_file;
@@ -88,6 +97,7 @@ pub mod restore;
 pub mod rev_list;
 pub mod rev_parse;
 pub mod revert;
+pub mod revision;
 pub mod sandbox;
 pub mod service;
 pub mod shortlog;
@@ -97,6 +107,7 @@ mod show_ref_check;
 mod show_ref_deref;
 mod show_ref_exclude_existing;
 mod show_ref_render;
+pub mod sparse_view;
 pub mod symbolic_ref;
 pub mod tag;
 pub mod update_index;
@@ -138,6 +149,22 @@ use crate::{
 };
 
 // impl load for all objects
+/// lore.md 2.1: refuse an in-progress sequencer operation inside a LINKED
+/// worktree. Merge/rebase/cherry-pick/revert/bisect state (rebase_state /
+/// sequence_state / MERGE_HEAD) is still shared across worktrees in v1, so
+/// running one in a linked worktree could collide with the main worktree's
+/// operation. Allowed in the main worktree.
+pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
+    if crate::utils::util::is_linked_worktree() {
+        return Err(crate::utils::error::CliError::fatal(format!(
+            "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: in-progress \
+             operation state is shared across worktrees) \u{2014} run it in the main worktree"
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::Unsupported));
+    }
+    Ok(())
+}
+
 pub fn load_object<T>(hash: &ObjectHash) -> Result<T, GitError>
 where
     T: ObjectTrait,

@@ -345,7 +345,35 @@ struct StatusData {
     stash_count: Option<usize>,
     upstream: Option<UpstreamInfo>,
     merge_state: Option<MergeStatusInfo>,
+    /// A non-merge sequence in progress (cherry-pick/revert/rebase), surfaced
+    /// as a one-line human advisory (lore.md 2.6). Merge has its own richer
+    /// rendering; porcelain/JSON are unchanged.
+    sequence_notice: Option<String>,
+    /// lore.md 2.2: a read-only sparse view is ACTIVELY filtering (enabled AND
+    /// non-empty AND compiled — matches SparseView::is_active). status itself
+    /// is NEVER filtered (it must stay honest about what commit will record);
+    /// this is only an advisory that ls-files/diff are scoped. An
+    /// enabled-but-empty view is a no-op, so no advisory.
+    sparse_view_active: bool,
     porcelain_v2: Option<PorcelainV2Data>,
+}
+
+/// Human advisory for a non-merge sequence in progress (read-only detection).
+async fn sequence_notice() -> Option<String> {
+    use crate::internal::sequencer::{self, SequenceKind};
+    match sequencer::detect_active().await.ok().flatten() {
+        Some(SequenceKind::CherryPick) => Some(
+            "cherry-pick in progress; run 'libra cherry-pick --continue' or '--abort'".to_string(),
+        ),
+        Some(SequenceKind::Revert) => {
+            Some("revert in progress; run 'libra revert --continue' or '--abort'".to_string())
+        }
+        Some(SequenceKind::Rebase) => {
+            Some("rebase in progress; run 'libra rebase --continue' or '--abort'".to_string())
+        }
+        // Merge has its own dedicated rendering below.
+        Some(SequenceKind::Merge) | None => None,
+    }
 }
 
 impl StatusData {
@@ -357,6 +385,9 @@ impl StatusData {
 /// Collect all status data in one pass, eliminating duplicate computation
 /// between human/JSON/short/porcelain renderers.
 async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
+    // lore.md 2.4: layer-overlay paths are excluded from status like ignored
+    // files (a no-op with no layers).
+    crate::internal::layer::refresh_exclusion_snapshot().await;
     if is_bare_repository().await {
         return Err(CliError::fatal("this operation must be run in a work tree")
             .with_stable_code(StableErrorCode::RepoStateInvalid)
@@ -475,6 +506,10 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         stash_count,
         upstream,
         merge_state,
+        sequence_notice: sequence_notice().await,
+        sparse_view_active: crate::internal::sparse::SparseView::load()
+            .await
+            .is_active(),
         porcelain_v2,
     })
 }
@@ -1095,6 +1130,10 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         stash_count: None,
         upstream,
         merge_state,
+        sequence_notice: sequence_notice().await,
+        sparse_view_active: crate::internal::sparse::SparseView::load()
+            .await
+            .is_active(),
         porcelain_v2: None,
     };
 
@@ -1278,6 +1317,16 @@ fn render_human_status(
         render_upstream_human(upstream, buffer)?;
     }
 
+    if let Some(notice) = &data.sequence_notice {
+        writeln!(buffer, "{notice}").map_err(write_error)?;
+    }
+    if data.sparse_view_active {
+        writeln!(
+            buffer,
+            "note: a sparse view is active (scopes 'ls-files'/'diff' output; status is not filtered)"
+        )
+        .map_err(write_error)?;
+    }
     if let Some(merge_state) = &data.merge_state {
         render_merge_state_human(merge_state, buffer)?;
     }

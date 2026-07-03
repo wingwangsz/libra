@@ -1202,6 +1202,7 @@ mod tests {
             committer_email: "test@test.com".to_string(),
             action: "commit".to_string(),
             message: "Test message".to_string(),
+            worktree_id: None,
         };
 
         let entry2 = Model {
@@ -1214,6 +1215,7 @@ mod tests {
             committer_email: "test@test.com".to_string(),
             action: "commit".to_string(),
             message: "Another message".to_string(),
+            worktree_id: None,
         };
 
         let filter = ReflogFilter::new(Some(1_720_000_000), None, None, None);
@@ -1237,6 +1239,7 @@ mod tests {
             committer_email: "test@test.com".to_string(),
             action: "commit".to_string(),
             message: "Add feature".to_string(),
+            worktree_id: None,
         };
 
         let entry2 = Model {
@@ -1249,6 +1252,7 @@ mod tests {
             committer_email: "test@test.com".to_string(),
             action: "merge".to_string(),
             message: "Merge branch".to_string(),
+            worktree_id: None,
         };
 
         let filter = ReflogFilter::new(None, None, Some("COMMIT".to_string()), None);
@@ -1272,6 +1276,7 @@ mod tests {
             committer_email: "test@test.com".to_string(),
             action: "commit".to_string(),
             message: "Add feature".to_string(),
+            worktree_id: None,
         };
 
         let filter = ReflogFilter::new(
@@ -1303,6 +1308,7 @@ mod tests {
             committer_email: "alice@example.com".to_string(),
             action: "commit".to_string(),
             message: "Test message".to_string(),
+            worktree_id: None,
         };
 
         let entry2 = Model {
@@ -1315,6 +1321,7 @@ mod tests {
             committer_email: "bob@example.com".to_string(),
             action: "commit".to_string(),
             message: "Another message".to_string(),
+            worktree_id: None,
         };
 
         // Test author filtering by name

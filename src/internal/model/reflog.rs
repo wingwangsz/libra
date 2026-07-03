@@ -15,6 +15,10 @@ pub struct Model {
     pub committer_email: String,
     pub action: String,
     pub message: String,
+    /// lore.md 2.1: per-worktree scoping for HEAD-reflog rows (ref_name='HEAD').
+    /// NULL = the main worktree (and all branch reflogs); Some(id) = a linked
+    /// worktree's private HEAD reflog.
+    pub worktree_id: Option<String>,
 }
 
 #[derive(Copy, Clone, Debug, EnumIter, DeriveRelation)]

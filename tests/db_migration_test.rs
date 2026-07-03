@@ -49,7 +49,7 @@ fn builtin_migrations_register_current_schema_migrations() {
         vec![
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
-            2026070202
+            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801
         ]
     );
     assert_eq!(
@@ -70,13 +70,19 @@ fn builtin_migrations_register_current_schema_migrations() {
             "rename_agent_traces_branch",
             "metadata_kv",
             "working_dirty",
+            "revision_ordinal",
+            "sequence_state",
+            "layer",
+            "object_obliteration",
+            "sparse_view",
+            "worktree_isolation",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 15);
-    assert_eq!(runner.max_registered_version(), Some(2026070202));
+    assert_eq!(runner.len(), 21);
+    assert_eq!(runner.max_registered_version(), Some(2026070801));
 }
 
 // ---------------------------------------------------------------------------
@@ -1053,13 +1059,21 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
         vec![
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
-            2026070202
+            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
+    assert!(column_exists(&conn, "reference", "worktree_id").await);
+    assert!(column_exists(&conn, "reflog", "worktree_id").await);
+    assert!(table_exists(&conn, "sparse_view").await);
+    assert!(table_exists(&conn, "object_obliteration").await);
+    assert!(table_exists(&conn, "layer").await);
+    assert!(table_exists(&conn, "layer_path").await);
     assert!(table_exists(&conn, "metadata_kv").await);
     assert!(table_exists(&conn, "working_dirty").await);
     assert!(table_exists(&conn, "working_dirty_meta").await);
+    assert!(table_exists(&conn, "revision_ordinal").await);
+    assert!(table_exists(&conn, "revision_ordinal_meta").await);
     assert!(table_exists(&conn, "ai_final_decision").await);
     assert!(table_exists(&conn, "automation_log").await);
     assert!(table_exists(&conn, "agent_usage_stats").await);
@@ -1072,8 +1086,12 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
     assert!(index_exists(&conn, "idx_source_call_log_session").await);
     assert!(column_exists(&conn, "source_call_log", "agent_run_id").await);
     assert!(index_exists(&conn, "idx_source_call_log_agent_run_id").await);
-    assert!(table_exists(&conn, "cherry_pick_state").await);
-    assert!(table_exists(&conn, "revert_sequence").await);
+    // lore.md 2.6: the 2026070401 migration folds cherry-pick into the unified
+    // `sequence_state` and drops both the cherry_pick_state table and the
+    // never-read revert_sequence orphan.
+    assert!(!table_exists(&conn, "cherry_pick_state").await);
+    assert!(!table_exists(&conn, "revert_sequence").await);
+    assert!(table_exists(&conn, "sequence_state").await);
     assert!(table_exists(&conn, "notes").await);
     assert!(index_exists(&conn, "idx_notes_ref").await);
 }
@@ -1105,8 +1123,9 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201,
-            2026053101, 2026052301, 2026050801, 2026050601
+            2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202,
+            2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101,
+            2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -1131,7 +1150,8 @@ async fn approved_permission_up_down_up_round_trip() {
         reapplied,
         vec![
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
-            2026061401, 2026062301, 2026070201, 2026070202
+            2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
+            2026070601, 2026070701, 2026070801
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);

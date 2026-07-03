@@ -278,6 +278,32 @@ This applies to standard clones; `libra+cloud` clones always use `origin`.
 libra clone -o upstream git@github.com:user/repo.git
 ```
 
+### `--deps-of <path>` / `--deps-depth-limit <N>` (dependency-filtered clone, lore.md 3.2)
+
+Libra-only extension (`intentionally-different` — Git has no file-dependency
+concept). After a normal, **fully checked-out and commit-safe** clone, scope the
+read-only sparse VIEW ([`sparse-view`](sparse-view.md), lore.md 2.2) to the
+forward dependency closure ([`deps`](deps.md), lore.md 3.1) of the given root
+path(s). `--deps-of` is repeatable; `--deps-depth-limit <N>` bounds the closure
+depth (`1` = direct dependencies only). It implies `--notes` (the dependency
+graph must be fetched to compute the closure) and records
+`remote.<name>.fetchNotesDeps=true` so later `libra pull` keeps the graph fresh.
+
+This is **not** partial clone (`--filter`) and **not** `--sparse` (declined,
+D10): objects are never wire-filtered — the whole pack is downloaded and the
+whole tree stays on disk. Only the VIEW is narrowed (`ls-files`/`status`/`diff`
+scope to the closure); reducing on-disk footprint is deferred (D18, needs the
+D10 skip-worktree machinery). Only a **local Libra source** can travel the
+dependency graph in v1 (D17); a network or plain-Git source performs a full
+clone without scoping and warns. Conflicts with `--no-checkout`/`--bare`/
+`--mirror` (they skip the checkout that keeps the repository commit-safe) and is
+rejected for `libra+cloud://` sources.
+
+```bash
+libra clone --deps-of scene.usd /path/to/local-libra-repo my-scene
+libra clone --deps-of a.txt --deps-depth-limit 1 /path/to/src direct-only
+```
+
 ## Common Commands
 
 ```bash

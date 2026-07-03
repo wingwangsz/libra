@@ -189,11 +189,14 @@ async fn test_clone_branch() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -237,11 +240,14 @@ async fn test_clone_bare_repository() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -300,11 +306,14 @@ async fn test_clone_branch_single_branch() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -347,11 +356,14 @@ async fn test_clone_default_branch() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -394,11 +406,14 @@ async fn test_clone_default_branch_single_branch() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -443,11 +458,14 @@ async fn test_clone_to_existing_empty_dir() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -495,11 +513,14 @@ async fn test_clone_to_existing_dir() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -543,11 +564,14 @@ async fn test_clone_to_dir_with_existing_file_name() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -590,11 +614,14 @@ async fn test_clone_with_depth() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -637,11 +664,14 @@ async fn test_clone_with_depth_and_branch() {
         reference: vec![],
         reference_if_able: vec![],
         shared: false,
+        no_shared: false,
         dissociate: false,
         mirror: false,
         filter: None,
         shallow_since: None,
         shallow_exclude: vec![],
+        deps_of: vec![],
+        deps_depth_limit: None,
         no_checkout: false,
         no_progress: false,
         remote_repo: repo.https_url.clone(),
@@ -1043,7 +1073,7 @@ fn test_clone_object_alternates_flags_are_noops() {
     assert!(d1.join(".libra").exists(), "clone created");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
-        stderr.contains("--reference/--shared have no effect"),
+        stderr.contains("--reference has no effect"),
         "--reference warns it is a no-op, got: {stderr}"
     );
 
@@ -1068,7 +1098,9 @@ fn test_clone_object_alternates_flags_are_noops() {
         "--reference-if-able is silently ignored (no warning)"
     );
 
-    // -s/--shared is accepted and warns.
+    // -s/--shared now REGISTERS the source as an alternate for a LOCAL Libra
+    // source (lore.md 2.11) — no longer a no-op. The clone succeeds and the
+    // source becomes a protected shared store.
     let d3 = dest_root.path().join("d3");
     let out = run_libra_command(
         &["clone", "-s", source_str, d3.to_str().unwrap()],
@@ -1076,8 +1108,15 @@ fn test_clone_object_alternates_flags_are_noops() {
     );
     assert!(out.status.success(), "clone with --shared succeeds");
     assert!(
-        String::from_utf8_lossy(&out.stderr).contains("--reference/--shared have no effect"),
-        "--shared warns it is a no-op"
+        String::from_utf8_lossy(&out.stderr).contains("registered")
+            && String::from_utf8_lossy(&out.stderr).contains("object alternate"),
+        "--shared registers the alternate: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let alts = run_libra_command(&["alternates", "list"], &d3);
+    assert!(
+        String::from_utf8_lossy(&alts.stdout).contains(".libra/objects"),
+        "clone d3 borrows from the source"
     );
 }
 

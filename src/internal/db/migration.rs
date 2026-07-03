@@ -677,6 +677,57 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070202_working_dirty.sql"),
             include_str!("../../../sql/migrations/2026070202_working_dirty_down.sql"),
         ),
+        // 2026-07-03: revision ordinal index (lore.md 1.16) — rebuildable
+        // OID<->ordinal mapping over per-ref first-parent chains, freshness
+        // fingerprinted on tip OID + refs/replace digest. Owner API:
+        // `internal::revision_ordinal::RevisionOrdinalIndex`.
+        sql_migration(
+            2026070301,
+            "revision_ordinal",
+            include_str!("../../../sql/migrations/2026070301_revision_ordinal.sql"),
+            include_str!("../../../sql/migrations/2026070301_revision_ordinal_down.sql"),
+        ),
+        // lore.md 2.6: unified sequencer state (`sequence_state`). Folds the
+        // in-progress cherry-pick forward, retires cherry-pick's lazy DDL and
+        // the `revert_sequence` orphan. Owner: `internal::sequencer`.
+        sql_migration(
+            2026070401,
+            "sequence_state",
+            include_str!("../../../sql/migrations/2026070401_sequence_state.sql"),
+            include_str!("../../../sql/migrations/2026070401_sequence_state_down.sql"),
+        ),
+        // lore.md 2.4: Lore's `layer` local-overlay primitive. Owner:
+        // `internal::layer::LayerStore`. Never serialized into a commit.
+        sql_migration(
+            2026070501,
+            "layer",
+            include_str!("../../../sql/migrations/2026070501_layer.sql"),
+            include_str!("../../../sql/migrations/2026070501_layer_down.sql"),
+        ),
+        // lore.md 2.5: index-flagged obliteration tombstone registry. Owner:
+        // `internal::obliteration::ObliterationStore`.
+        sql_migration(
+            2026070601,
+            "object_obliteration",
+            include_str!("../../../sql/migrations/2026070601_object_obliteration.sql"),
+            include_str!("../../../sql/migrations/2026070601_object_obliteration_down.sql"),
+        ),
+        // lore.md 2.2: read-only sparse view include patterns. Owner:
+        // `internal::sparse::SparseViewStore`.
+        sql_migration(
+            2026070701,
+            "sparse_view",
+            include_str!("../../../sql/migrations/2026070701_sparse_view.sql"),
+            include_str!("../../../sql/migrations/2026070701_sparse_view_down.sql"),
+        ),
+        // lore.md 2.1: per-worktree HEAD/index/HEAD-reflog isolation — adds a
+        // nullable `worktree_id` scoping column to `reference` and `reflog`.
+        sql_migration(
+            2026070801,
+            "worktree_isolation",
+            include_str!("../../../sql/migrations/2026070801_worktree_isolation.sql"),
+            include_str!("../../../sql/migrations/2026070801_worktree_isolation_down.sql"),
+        ),
     ]
 }
 
@@ -805,9 +856,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 15);
+        assert_eq!(runner.len(), 21);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070202));
+        assert_eq!(runner.max_registered_version(), Some(2026070801));
     }
 
     #[test]

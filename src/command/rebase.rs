@@ -1040,13 +1040,17 @@ pub async fn execute(args: RebaseArgs) {
 
 /// Safe CLI entry point with preflight validation for argument and state errors.
 pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::ensure_main_worktree("rebase")?;
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     // Refuse to start a NEW rebase while a cherry-pick sequence is in progress
     // (rebase's own --continue/--abort/--skip operate on rebase state, not
     // cherry-pick, so they are exempt from this guard).
     if !(args.continue_rebase || args.abort || args.skip) {
-        crate::command::cherry_pick::ensure_no_cherry_pick_in_progress().await?;
+        crate::internal::sequencer::ensure_none_in_progress(
+            crate::internal::sequencer::SequenceKind::Rebase,
+        )
+        .await?;
     }
 
     // For --continue, --abort, --skip: verify that a rebase is actually in

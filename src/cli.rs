@@ -28,15 +28,36 @@ use crate::{
     },
 };
 
-const ROOT_AFTER_HELP: &str = "\
+// The `media` command (lore.md §6) is a cfg-gated `Commands` variant, so its
+// Command-Groups entry must appear ONLY under `--features fastcdc` — otherwise
+// the default-features compat matrix (which cross-checks every listed command
+// against the real CLI surface) would see a command that does not exist. A
+// cfg-selected macro fragment splices it into the Working Tree row.
+#[cfg(feature = "fastcdc")]
+macro_rules! media_group_entry {
+    () => {
+        ", media"
+    };
+}
+#[cfg(not(feature = "fastcdc"))]
+macro_rules! media_group_entry {
+    () => {
+        ""
+    };
+}
+
+const ROOT_AFTER_HELP: &str = concat!(
+    "\
 Command Groups:
   Repository Setup        init, clone, config, completions
-  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
-  History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive
+  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, sparse-view, hydrate",
+    media_group_entry!(),
+    ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
+  History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
-  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle
+  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, service
-  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref
+  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
   error-codes  Print the stable CLI error code table (`libra help error-codes`)
@@ -49,7 +70,8 @@ Output Examples:
   libra --color=never log              Force-disable colors (also via NO_COLOR=1)
 
 For per-command flags, see `libra <cmd> --help`.
-";
+"
+);
 
 const ERROR_CODES_HELP: &str = include_str!("../docs/error-codes.md");
 
@@ -358,6 +380,43 @@ enum Commands {
     )]
     Cache(command::cache::CacheArgs),
     #[command(
+        about = "Manage local, never-committed working-tree overlays (Libra extension)",
+        after_help = command::layer::LAYER_EXAMPLES
+    )]
+    Layer(command::layer::LayerArgs),
+    #[command(
+        about = "Object-level operations incl. payload obliteration (Libra extension)",
+        after_help = command::file::FILE_EXAMPLES
+    )]
+    File(command::file::FileArgs),
+    #[command(
+        about = "Manage object alternates — borrow objects from a shared store (Libra extension)",
+        after_help = command::alternates::ALTERNATES_EXAMPLES
+    )]
+    Alternates(command::alternates::AlternatesArgs),
+    #[command(
+        about = "Manage the file dependency graph (Libra extension)",
+        after_help = command::deps::DEPS_EXAMPLES
+    )]
+    Deps(command::deps::DepsArgs),
+    #[command(
+        about = "Hydrate working-tree content on demand (Libra extension)",
+        after_help = command::hydrate::HYDRATE_EXAMPLES
+    )]
+    Hydrate(command::hydrate::HydrateArgs),
+    #[cfg(feature = "fastcdc")]
+    #[command(
+        about = "FastCDC LFS media chunking client (Libra extension, lore.md §6)",
+        after_help = command::media::MEDIA_EXAMPLES
+    )]
+    Media(command::media::MediaArgs),
+    #[command(
+        name = "sparse-view",
+        about = "Manage the read-only sparse view filter over ls-files/diff (Libra extension)",
+        after_help = command::sparse_view::SPARSE_VIEW_EXAMPLES
+    )]
+    SparseView(command::sparse_view::SparseViewArgs),
+    #[command(
         about = "Branch/repo metadata key-value store (Libra extension)",
         after_help = command::metadata::METADATA_EXAMPLES
     )]
@@ -367,6 +426,16 @@ enum Commands {
         after_help = command::dirty::DIRTY_EXAMPLES
     )]
     Dirty(command::dirty::DirtyArgs),
+    #[command(
+        about = "Manage host-scoped HTTP tokens: login, status, logout (Libra extension)",
+        after_help = command::auth::AUTH_EXAMPLES
+    )]
+    Auth(command::auth::AuthArgs),
+    #[command(
+        about = "Look up revisions by ordinal on a branch's first-parent chain (Libra extension)",
+        after_help = command::revision::REVISION_EXAMPLES
+    )]
+    Revision(command::revision::RevisionArgs),
     #[command(
         about = "Run a headless local service: notification bus + dirty-mark ingestion (Libra extension)",
         after_help = command::service::SERVICE_EXAMPLES
@@ -466,6 +535,12 @@ enum Commands {
         after_help = command::write_tree::WRITE_TREE_EXAMPLES
     )]
     WriteTree(command::write_tree::WriteTreeArgs),
+    #[command(
+        about = "Create a commit object from an existing tree (plumbing; no ref updates)",
+        after_help = command::commit_tree::COMMIT_TREE_EXAMPLES,
+        name = "commit-tree"
+    )]
+    CommitTree(command::commit_tree::CommitTreeArgs),
     #[command(
         about = "Read a tree object into the index",
         after_help = command::read_tree::READ_TREE_EXAMPLES
@@ -788,7 +863,48 @@ pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
         .build()
         .map_err(|e| CliError::fatal(format!("failed to create tokio runtime: {e}")))?;
 
-    runtime.block_on(Box::pin(parse_async(args)))
+    // The one vetted telemetry span (lore.md 1.7): canonical subcommand name,
+    // duration, and on failure the stable LBR-* code — NOTHING else. Plain
+    // `tracing`, so it is a no-op without a matching layer; the OTLP layer is
+    // feature+endpoint gated, and the fmt layer excludes this target so
+    // LIBRA_LOG output is byte-unchanged. Library embedders calling
+    // parse_async/exec_async directly bypass it (documented).
+    let command_name = canonical_command_name(args);
+    let span = tracing::info_span!(
+        target: "libra::telemetry",
+        "libra.command",
+        libra.command = command_name.as_deref().unwrap_or("<none>"),
+        otel.status_code = tracing::field::Empty,
+        libra.error_code = tracing::field::Empty,
+    );
+    let result = span.in_scope(|| runtime.block_on(Box::pin(parse_async(args))));
+    if let Err(error) = &result {
+        // tracing-opentelemetry maps `otel.status_code` to the OTel status.
+        span.record("otel.status_code", "ERROR");
+        span.record("libra.error_code", error.stable_code().as_str());
+    }
+    result
+}
+
+/// The CANONICAL subcommand name for telemetry: the raw argv token resolved
+/// through clap's own metadata (aliases like `br` canonicalize to `branch`).
+/// Never derived from user argv content beyond the subcommand token itself.
+fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
+    let argv: Vec<String> = match args {
+        Some(args) => args.iter().map(|s| s.to_string()).collect(),
+        None => env::args().collect(),
+    };
+    let (index, _) = find_subcommand_index(&argv)?;
+    let token = argv.get(index)?;
+    let cli = <Cli as clap::CommandFactory>::command();
+    cli.get_subcommands()
+        .find(|candidate| {
+            candidate.get_name() == token.as_str()
+                || candidate
+                    .get_all_aliases()
+                    .any(|alias| alias == token.as_str())
+        })
+        .map(|candidate| candidate.get_name().to_string())
 }
 
 /// Rewrite Git-style `-<n>` shortcuts into the long-form `-n <n>` flag, but only when
@@ -1164,9 +1280,18 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         | Commands::Completions(_)
         // `logfile` only inspects env-derived tracing configuration.
         | Commands::Logfile(_)
-        // `cache info` only inspects env/config-derived storage tunables.
-        | Commands::Cache(_)
+        // `auth` manages host-global tokens in the GLOBAL store; it works
+        // outside a repository and touches no objects.
+        | Commands::Auth(_)
         | Commands::Sandbox(_) => Ok(CommandPreflight::none()),
+        // `cache info` only inspects env/config-derived storage tunables and
+        // works outside a repository; `cache evict` deletes local objects, so
+        // it takes the standard repo + hash-kind preflight.
+        Commands::Cache(cache_args)
+            if matches!(cache_args.command, command::cache::CacheCommand::Info) =>
+        {
+            Ok(CommandPreflight::none())
+        }
         Commands::HashObject(args) if !args.write => {
             match utils::util::try_get_storage_path(None) {
                 Ok(storage) => Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
@@ -1461,8 +1586,22 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
         Commands::Logfile(cmd_args) => command::logfile::execute_safe(cmd_args, &output).await?,
         Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
+        Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,
+        Commands::File(cmd_args) => command::file::execute_safe(cmd_args, &output).await?,
+        Commands::Alternates(cmd_args) => {
+            command::alternates::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Deps(cmd_args) => command::deps::execute_safe(cmd_args, &output).await?,
+        Commands::Hydrate(cmd_args) => command::hydrate::execute_safe(cmd_args, &output).await?,
+        #[cfg(feature = "fastcdc")]
+        Commands::Media(cmd_args) => command::media::execute_safe(cmd_args, &output).await?,
+        Commands::SparseView(cmd_args) => {
+            command::sparse_view::execute_safe(cmd_args, &output).await?
+        }
         Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
         Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
+        Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
+        Commands::Revision(cmd_args) => command::revision::execute_safe(cmd_args, &output).await?,
         Commands::Service(cmd_args) => command::service::execute_safe(cmd_args, &output).await?,
         Commands::Shortlog(cmd_args) => command::shortlog::execute_safe(cmd_args, &output).await?,
         Commands::Show(cmd_args) => command::show::execute_safe(cmd_args, &output).await?,
@@ -1536,6 +1675,9 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         }
         Commands::WriteTree(cmd_args) => {
             command::write_tree::execute_safe(cmd_args, &output).await?
+        }
+        Commands::CommitTree(cmd_args) => {
+            command::commit_tree::execute_safe(cmd_args, &output).await?
         }
         Commands::ReadTree(cmd_args) => command::read_tree::execute_safe(cmd_args, &output).await?,
         Commands::UpdateIndex(cmd_args) => {

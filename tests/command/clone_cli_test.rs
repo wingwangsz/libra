@@ -482,6 +482,7 @@ fn create_cloud_clone_cli_fixture() -> CloudCloneCliFixture {
                 kind: reference::ConfigKind::Head,
                 commit: None,
                 remote: None,
+                worktree_id: None,
             },
             reference::Model {
                 id: 0,
@@ -489,6 +490,7 @@ fn create_cloud_clone_cli_fixture() -> CloudCloneCliFixture {
                 kind: reference::ConfigKind::Branch,
                 commit: Some(commit.id.to_string()),
                 remote: None,
+                worktree_id: None,
             },
             reference::Model {
                 id: 0,
@@ -496,6 +498,7 @@ fn create_cloud_clone_cli_fixture() -> CloudCloneCliFixture {
                 kind: reference::ConfigKind::Tag,
                 commit: Some(commit.id.to_string()),
                 remote: None,
+                worktree_id: None,
             },
         ];
         let metadata = serde_json::to_vec(&refs).expect("refs metadata should serialize");

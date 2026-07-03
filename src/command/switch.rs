@@ -128,6 +128,13 @@ pub struct SwitchOutput {
 
 #[derive(Debug, thiserror::Error)]
 pub enum SwitchError {
+    #[error("{0}")]
+    CaseCollision(crate::utils::error::CliError),
+
+    /// lore.md 2.1: the target branch is already checked out in another worktree.
+    #[error("{0}")]
+    WorktreeConflict(crate::utils::error::CliError),
+
     #[error("remote branch name is required")]
     MissingTrackTarget,
 
@@ -195,6 +202,8 @@ pub enum SwitchError {
 impl From<SwitchError> for CliError {
     fn from(error: SwitchError) -> Self {
         match error {
+            SwitchError::CaseCollision(inner) => inner,
+            SwitchError::WorktreeConflict(inner) => inner,
             SwitchError::MissingTrackTarget => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("provide a remote branch name, for example 'origin/main'."),
@@ -1073,6 +1082,12 @@ async fn switch_to_commit(
         Head::Detached(hash) => hash.to_string()[..7].to_string(), // Use short hash for detached HEAD
     };
 
+    // Case-collision preflight BEFORE any mutation — refusing after the
+    // HEAD update would strand HEAD on the target with an unrestored tree.
+    guard_target_tree_case(&commit_hash)
+        .await
+        .map_err(SwitchError::CaseCollision)?;
+
     let action = ReflogAction::Switch {
         from: from_ref_name,
         to: commit_hash.to_string()[..7].to_string(), // Use short hash for target commit
@@ -1132,10 +1147,27 @@ async fn switch_to_resolved_branch(
         return Ok(target_commit_id);
     }
 
+    // lore.md 2.1: branches are SHARED across worktrees, so refuse switching to
+    // a branch already checked out in another worktree (both would move the
+    // same pointer). git parity — detach instead to share the tip read-only.
+    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+        return Err(SwitchError::WorktreeConflict(
+            CliError::fatal(format!(
+                "branch '{branch_name}' is already checked out at worktree '{other}'"
+            ))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("switch to a different branch, or use --detach to share its tip"),
+        ));
+    }
+
     let action = ReflogAction::Switch {
         from: from_ref_name,
         to: branch_name.clone(),
     };
+    // Case-collision preflight BEFORE any mutation (see the detached flow).
+    guard_target_tree_case(&target_commit_id)
+        .await
+        .map_err(SwitchError::CaseCollision)?;
     let context = ReflogContext {
         old_oid,
         new_oid: target_commit_id.to_string(),
@@ -1161,6 +1193,38 @@ async fn switch_to_resolved_branch(
 
     restore_to_commit(target_commit_id, output).await?;
     Ok(target_commit_id)
+}
+
+/// Case-collision preflight for tree materialization (lore.md 1.14): list
+/// the target commit's tree paths and run the fold-collision guard BEFORE
+/// any worktree write (shared by switch and checkout — both restore paths).
+pub(crate) async fn guard_target_tree_case(
+    commit_id: &ObjectHash,
+) -> Result<(), crate::utils::error::CliError> {
+    use crate::{
+        command::load_object,
+        utils::{error::StableErrorCode, object_ext::TreeExt},
+    };
+    let commit: git_internal::internal::object::commit::Commit =
+        load_object(commit_id).map_err(|error| {
+            crate::utils::error::CliError::fatal(format!(
+                "failed to load commit {commit_id}: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt)
+        })?;
+    let Some(tree) = git_internal::internal::object::tree::Tree::try_load(&commit.tree_id) else {
+        return Err(crate::utils::error::CliError::fatal(format!(
+            "failed to load tree {}",
+            commit.tree_id
+        ))
+        .with_stable_code(StableErrorCode::RepoCorrupt));
+    };
+    let paths: Vec<String> = tree
+        .get_plain_items()
+        .into_iter()
+        .map(|(path, _)| crate::utils::util::path_to_string(&path))
+        .collect();
+    crate::utils::path_case::guard_tree_case_collisions(&paths).await
 }
 
 async fn restore_to_commit(

@@ -246,6 +246,23 @@ fn should_ignore_with_workdir(
 ) -> bool {
     let is_tracked = path_is_tracked_or_unknown_encoding(path, index);
 
+    // lore.md 2.4: a materialized layer-overlay path is UN-NEGATABLY excluded
+    // (highest precedence, above tracked/.libraignore/`!` negations) so a
+    // purely-local overlay can never be swept into `status`/`add .`. This is
+    // consulted for EVERY policy except IncludeIgnored (force-add), where the
+    // `add` staging guard is the airtight backstop instead. Empty snapshot
+    // (no layers) → no-op.
+    if !matches!(policy, IgnorePolicy::IncludeIgnored)
+        && let Some(key) = crate::internal::layer::normalize_key(path)
+        && crate::internal::layer::is_layer_owned(&key)
+    {
+        // Respect: the layer path is excluded from `status`/`add .` (un-negatable).
+        // OnlyIgnored (the `clean -x` candidate scan): NOT a candidate — protect
+        // the active local overlay from being deleted by `clean -x` (only a
+        // re-apply could restore it).
+        return matches!(policy, IgnorePolicy::Respect);
+    }
+
     match policy {
         IgnorePolicy::Respect => {
             if is_tracked {
