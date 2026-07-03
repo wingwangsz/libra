@@ -1079,6 +1079,18 @@ pub fn check_gitignore(work_dir: &PathBuf, target_file: &PathBuf) -> bool {
         return true;
     }
 
+    // lore.md 2.4: a materialized layer-overlay path is UN-NEGATABLY excluded
+    // (above every `.libraignore` rule) so a purely-local overlay is never
+    // swept into `status`/`add`. Zero overhead with no layers (empty
+    // snapshot). The `add` staging guard is the airtight backstop for
+    // `--force` (which extends ignored files back into the staged set).
+    if let Ok(relative) = target_file.strip_prefix(work_dir)
+        && let Some(key) = crate::internal::layer::normalize_key(relative)
+        && crate::internal::layer::is_layer_owned(&key)
+    {
+        return true;
+    }
+
     let mut dir = target_file.clone();
     dir.pop();
 

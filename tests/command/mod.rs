@@ -330,6 +330,7 @@ mod init_from_git_test;
 mod init_json_test;
 mod init_separate_libra_dir_test;
 mod init_test;
+mod layer_test;
 mod lfs_test;
 mod log_test;
 mod logfile_test;

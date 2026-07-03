@@ -56,6 +56,7 @@ mod index_pack_support;
 mod index_pack_v1;
 mod index_pack_v2;
 pub mod init;
+pub mod layer;
 pub mod lfs;
 pub mod lfs_schema;
 pub mod log;

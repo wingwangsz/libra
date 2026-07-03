@@ -31,7 +31,7 @@ use crate::{
 const ROOT_AFTER_HELP: &str = "\
 Command Groups:
   Repository Setup        init, clone, config, completions
-  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
+  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
@@ -357,6 +357,11 @@ enum Commands {
         after_help = command::cache::CACHE_EXAMPLES
     )]
     Cache(command::cache::CacheArgs),
+    #[command(
+        about = "Manage local, never-committed working-tree overlays (Libra extension)",
+        after_help = command::layer::LAYER_EXAMPLES
+    )]
+    Layer(command::layer::LayerArgs),
     #[command(
         about = "Branch/repo metadata key-value store (Libra extension)",
         after_help = command::metadata::METADATA_EXAMPLES
@@ -1527,6 +1532,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
         Commands::Logfile(cmd_args) => command::logfile::execute_safe(cmd_args, &output).await?,
         Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
+        Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,
         Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
         Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
         Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,

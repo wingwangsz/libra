@@ -198,6 +198,9 @@ pub enum StableErrorCode {
     /// A case-fold path collision was refused under `core.casehandling=error`
     /// (lore.md 1.14) — mv/add/checkout/switch on case-insensitive views.
     ConflictCaseCollision,
+    /// A `layer apply` destination collided with tracked (index/HEAD) content
+    /// (lore.md 2.4) — fail-closed; a layer may only ADD untracked paths.
+    LayerConflict,
     NetworkUnavailable,
     NetworkProtocol,
     AuthMissingCredentials,
@@ -246,6 +249,7 @@ impl StableErrorCode {
             Self::ConflictOperationBlocked => "LBR-CONFLICT-002",
             Self::PolicyRefUpdateBlocked => "LBR-POLICY-001",
             Self::ConflictCaseCollision => "LBR-CASE-001",
+            Self::LayerConflict => "LBR-LAYER-001",
             Self::NetworkUnavailable => "LBR-NET-001",
             Self::NetworkProtocol => "LBR-NET-002",
             Self::AuthMissingCredentials => "LBR-AUTH-001",
@@ -278,7 +282,8 @@ impl StableErrorCode {
             // Policy refusals ride the Conflict category (no dedicated
             // Policy category yet; the JSON envelope reads "conflict").
             | Self::PolicyRefUpdateBlocked
-            | Self::ConflictCaseCollision => CliErrorCategory::Conflict,
+            | Self::ConflictCaseCollision
+            | Self::LayerConflict => CliErrorCategory::Conflict,
             Self::NetworkUnavailable | Self::NetworkProtocol => CliErrorCategory::Network,
             Self::AuthMissingCredentials | Self::AuthPermissionDenied => CliErrorCategory::Auth,
             Self::IoReadFailed | Self::IoWriteFailed => CliErrorCategory::Io,
@@ -353,6 +358,9 @@ impl StableErrorCode {
             }
             Self::ConflictCaseCollision => {
                 "Paths that differ only by case collide on a case-insensitive filesystem."
+            }
+            Self::LayerConflict => {
+                "A layer overlay path collided with tracked content; a layer may only add                  untracked paths."
             }
             Self::ConflictOperationBlocked => {
                 "Operation was blocked to avoid overwriting local or remote state."

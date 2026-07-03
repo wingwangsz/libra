@@ -21,6 +21,8 @@ pub mod ai_thread_provider_metadata;
 pub mod ai_validation_report;
 pub mod config;
 pub mod config_kv;
+pub mod layer;
+pub mod layer_path;
 pub mod metadata_kv;
 pub mod object_index;
 pub mod operation;

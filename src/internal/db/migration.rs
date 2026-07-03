@@ -696,6 +696,14 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070401_sequence_state.sql"),
             include_str!("../../../sql/migrations/2026070401_sequence_state_down.sql"),
         ),
+        // lore.md 2.4: Lore's `layer` local-overlay primitive. Owner:
+        // `internal::layer::LayerStore`. Never serialized into a commit.
+        sql_migration(
+            2026070501,
+            "layer",
+            include_str!("../../../sql/migrations/2026070501_layer.sql"),
+            include_str!("../../../sql/migrations/2026070501_layer_down.sql"),
+        ),
     ]
 }
 
@@ -824,9 +832,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 17);
+        assert_eq!(runner.len(), 18);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070401));
+        assert_eq!(runner.max_registered_version(), Some(2026070501));
     }
 
     #[test]

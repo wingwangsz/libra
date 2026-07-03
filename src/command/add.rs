@@ -147,6 +147,10 @@ pub enum AddError {
     /// carried [`CliError`] already has its stable code and hints.
     #[error("{0}")]
     LockPolicy(CliError),
+    /// A layer-owned overlay path was requested for staging (lore.md 2.4).
+    /// Layers are purely local and must never enter a commit.
+    #[error("'{path}' is a layer overlay path and cannot be staged ({count} such path(s))")]
+    LayerPath { path: String, count: usize },
     /// A user-supplied pathspec matched neither tracked files, working-tree
     /// changes, nor an ignored entry — typically a typo. Mapped to
     /// [`StableErrorCode::CliInvalidTarget`].
@@ -190,6 +194,9 @@ impl From<AddError> for CliError {
     fn from(error: AddError) -> Self {
         match &error {
             AddError::LockPolicy(inner) => inner.clone(),
+            AddError::LayerPath { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::LayerConflict)
+                .with_hint("layer overlays are local-only; 'libra layer unapply' to remove them"),
             AddError::NotInRepo => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoNotFound)
                 .with_hint("run 'libra init' to create a repository"),
@@ -451,6 +458,9 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
 /// See: tests::test_add_all_flag in tests/command/add_test.rs:100;
 /// tests::test_add_force_tracks_ignored_file in tests/command/add_test.rs:319.
 pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
+    // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
+    // ignore resolver skips layer-owned paths (a no-op with no layers).
+    crate::internal::layer::refresh_exclusion_snapshot().await;
     let workdir = util::try_working_dir().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -580,6 +590,43 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     filter_out_current_executable(&mut files);
     files.sort();
     files.dedup();
+
+    // Layer never-enters-commit guard (lore.md 2.4): a layer-owned overlay
+    // path must NEVER be staged, EVEN under --force (which bypasses ignore
+    // filtering — the ignore-exclusion chokepoint alone is not airtight).
+    // Under Respect, layer paths are already ignore-excluded so `files` is
+    // empty of them (this loop is a no-op — zero overhead with no layers).
+    {
+        // Fail-CLOSED (Codex P1): a real DB read failure here must NOT allow
+        // staging (the invariant is never-enters-commit). `materialized_paths`
+        // is absence-tolerant for a missing table (fresh repo) but propagates
+        // any other error.
+        let owned: std::collections::HashSet<String> =
+            crate::internal::layer::LayerStore::materialized_paths()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "cannot verify layer-owned paths before staging: {e}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .into_iter()
+                .map(|p| p.path)
+                .collect();
+        if !owned.is_empty() {
+            let blocked: Vec<String> = files
+                .iter()
+                .filter_map(|file| crate::internal::layer::normalize_key(file))
+                .filter(|key| owned.contains(key))
+                .collect();
+            if let Some(first) = blocked.first() {
+                return Err(CliError::from(AddError::LayerPath {
+                    path: first.clone(),
+                    count: blocked.len(),
+                }));
+            }
+        }
+    }
 
     // `lfs.lockEnforce` gate (lore.md 2.8): before ANY blob/index write, and
     // never on --dry-run (previews must not touch the network). `--refresh`

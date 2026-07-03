@@ -121,6 +121,7 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026050601`  | `approved_permission` | `2026050601_approved_permission{,_down}.sql`  |
 | `2026050801`  | `agent_usage_stats_agent_name` | `2026050801_agent_usage_stats_agent_name{,_down}.sql` |
 | `2026070401`  | `sequence_state` | `2026070401_sequence_state{,_down}.sql` (lore.md 2.6: unified sequencer store; folds cherry-pick forward, drops the `cherry_pick_state`/`revert_sequence` legacy tables) |
+| `2026070501`  | `layer` | `2026070501_layer{,_down}.sql` (lore.md 2.4: `layer`+`layer_path` local-overlay side-tables; owner `internal::layer`) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no
