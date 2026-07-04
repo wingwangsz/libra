@@ -184,34 +184,34 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
 ### OpenCode 安装流程契约（第一批必须满足）
 
-OpenCode 是第一批 supported agent；执行本文档时必须补齐 OpenCode HookProvider，而不能继续只把它当 generic stable-promoted transcript adapter。HookProvider 落地前，OpenCode capability row 只能显示 `supported=true`、`registered=true`、`transcript_readable=true`、`hook_installable=false`、`installed=false`；实现完成后才可置为 hook-installable。
+**状态（2026-07-05，AG-19 已落地）**：OpenCode HookProvider 已实现（`src/internal/ai/hooks/providers/opencode/`），capability row 为 `supported=true`、`hook_installable=true`、`capabilities.hooks=true`。以下契约以真实 `opencode 1.17.13` 实测固定（探测记录见 plan.md A4 行）。
 
 1. **注册与状态输出**
 
-   `opencode` 行必须暴露：`supported=true`、`support_wave="first_batch"`、`registered=true`、`agent_kind=opencode`、`db_value=opencode`、`provider_name=opencode`、`stability=stable`、`protected_dirs=[".opencode"]`、`transcript_readable=true`、`hook_installable=<bool>`、`installed=<bool>`、`capabilities.native_transcript=true`。HookProvider 落地后还必须有 `capabilities.hooks=true`。
+   `opencode` 行暴露：`supported=true`、`support_wave="first_batch"`、`registered=true`、`agent_kind=opencode`、`db_value=opencode`、`provider_name=opencode`、`stability=stable`、`protected_dirs=[".opencode"]`、`transcript_readable=true`、`hook_installable=true`、`installed=<运行时>`、`capabilities.native_transcript=true`、`capabilities.hooks=true`、`config_paths=[".opencode/plugin/libra-hooks.js"]`。
 
-2. **启用顺序**
+2. **启用顺序（已实现）**
 
-   未来 `libra agent enable --agent opencode` / `add opencode` 的实现顺序必须是：解析 CLI slug `opencode` / alias `open-code` → 映射 `AgentKind::OpenCode` → 查找 `provider_name=opencode` 的 `HookProvider` → 构造 `ProviderInstallOptions`（二进制/入口路径同 Claude Code 契约：canonicalize 绝对路径，禁止裸 `libra` PATH 查找）→ 读取实现 PR 经真实 OpenCode CLI 版本验证的项目级 plugin/config 入口 → upsert Libra-managed plugin 文件或条目 → 原子写回 → 重新读取验证 → 运行真实 `opencode run` smoke 证明 plugin/hook 被读取并触发 → `list/status` 报告 `installed=true`。任一步失败都必须 fail-closed，不得把 `installed` 标为 true。
+   `libra agent enable --agent opencode` / `add opencode`：解析 CLI slug → 映射 `AgentKind::OpenCode` → **经 registry adapter `as_hooks()` 取得 `HookProvider`（AG-19 已删除 provider-name 字符串桥）** → 构造 `ProviderInstallOptions`（二进制路径同 Claude Code 契约：`resolve_hook_binary_path` canonicalize 绝对路径，禁止裸 `libra` PATH 查找）→ 原子写 Libra-managed plugin 文件（临时文件 + rename）→ 重新读取验证。任一步失败 fail-closed，不得把 `installed` 标为 true。
 
-3. **安装配置目标形态**
+3. **安装配置目标形态（1.17.13 实测固定）**
 
-   当前计划不得再把 `.opencode/hooks.json` 当作事实源。OpenCode 上游已知口径是 plugin 机制而非 hooks.json；AG-19 实现 PR 必须先用当时的 `opencode --version` / help / 最小 smoke 固定实际入口，并在同 PR 更新本节、fixture 和 compat test。允许的新写入目标形态只有两类：
+   实测结论：`<project>/.opencode/plugin/`（单数）、`.opencode/plugins/`（复数）与 `opencode.json` 的 `"plugin"` 数组条目**同时全部加载**（无优先级互斥）；plugin 为 JS/TS 模块，导出 `async ({ project, client, directory, worktree, serverUrl, $ }) => Hooks` 工厂（SDK typings：`@opencode-ai/plugin`）。加载失败按 plugin 粒度非致命，仅 `--print-logs` 可见；`--pure` / `OPENCODE_PURE=1` 关闭全部外部 plugin（安装文档必须注明该盲区）。
 
-   - `.opencode/plugins/` 下 Libra-managed plugin 文件，文件名、event API 和加载规则以实现 PR 实测为准；如上游仍兼容 `.opencode/plugin/`，实现可读取并诊断该旧目录，但不得把它作为新写入目标。
-   - `opencode.json` 或等价项目配置中的 Libra-managed plugin 条目，只增删 Libra 自有条目，不触碰用户其它 plugin/config。
+   - **Libra 唯一写入目标**：`.opencode/plugin/libra-hooks.js`（上游 SDK 文档使用的规范目录），文件首行携带 Libra-managed 标记注释；install/uninstall 同时检测 `.opencode/plugins/` 下携带标记的重复受管文件并清理（双目录同载会导致事件双发）。不携带标记的用户文件在任何路径下都不触碰（同名用户文件导致 install 硬错误而非覆盖）。
+   - plugin 内 forward 命令以 canonicalize 绝对路径起始（`<binary> agent hooks opencode <verb>`），事件转发 best-effort、handler 全 try/catch 永不抛出。
 
-   provider event 到 Libra lifecycle 的映射必须随实现 PR 固定，例如 `session.created -> SessionStart`、message 更新或 user prompt 边界 -> `TurnStart`/`TurnEnd`、`tool.execute.before/after -> ToolUse`、`session.idle`/`session.deleted` -> `SessionEnd` 或等价 terminal event。若需要由 OpenCode 进程退出推导 terminal event，必须由实现 PR 实测并固定为 Libra 侧推断规则；不得把它写成 OpenCode 官方 plugin event。若上游事件名不同，以实测结果替换示例，不得在未验证时声称 OpenCode hook install 已完成。
+   **事件映射（实测固定）**：`session.created -> SessionStart`；`message.updated`（`properties.info.role == "user"`，plugin 侧过滤）`-> TurnStart`；`tool.execute.after -> ToolUse`；`session.idle -> TurnEnd`（**Libra 侧推断规则**：headless run 的可靠 turn 完成信号，非 OpenCode 官方 terminal event）；`session.deleted -> SessionEnd`；`session.compacted -> Compaction`。流式事件（`message.part.updated/delta`、`session.status/updated/diff` 等）一律不转发。
 
-4. **停用与移除**
+4. **停用与移除（已实现）**
 
-   `disable/remove opencode` 只能删除 Libra-managed plugin 文件或配置条目；不得删除用户自定义 OpenCode 配置，也不得删除已捕获数据。OpenCode hook parser 只能产 `LifecycleEvent`，不得直接写 checkpoint；写入仍必须走统一 validation/redaction/owner filtering/checkpoint writer。
+   `disable/remove opencode` 只删除携带 Libra-managed 标记的 plugin 文件（两个目录都检查）；不删除用户自定义 OpenCode 配置，也不删除已捕获数据。OpenCode hook parser 只产 `LifecycleEvent`，不直接写 checkpoint；写入走统一 validation/redaction/owner filtering/checkpoint writer。
 
-### Codex 捕获目标契约（未来 hook provider，不是当前实现）
+### Codex 捕获目标契约（AG-19 已落地）
 
-本小节描述 **AG-19 之后 Codex HookProvider 落地时** `libra agent` 应满足的外部 Codex 捕获目标契约，不能作为当前可运行能力解读。当前源码中 Codex 已是 stable-promoted observed adapter，具备 `registered`、`stability=stable`、`transcript_readable=true`（读取 `AgentSessionCtx.transcript_path` 指向的 transcript bytes），但 **没有 Codex `HookProvider`**，不属于当前代码的 `STABLE_AGENT_SLUGS`，`hook_installable=false`、`installed=false`，`libra agent enable --agent codex` 只会因没有 provider 被跳过。执行本文档时必须补齐 Codex HookProvider，使 Codex 进入第一批 supported roster；当前代码里 Gemini 可安装只是历史实现事实，不属于本文第一批支持目标。
+**状态（2026-07-05）**：Codex HookProvider 已实现（`src/internal/ai/hooks/providers/codex/`），Codex 进入第一批 supported roster，`hook_installable=true`。本节契约以真实 `codex-cli 0.142.4` 实测固定，并与上游源码 `rust-v0.142.4`（commit `57d253ad`）逐字节核对（trusted_hash 算法外部复现全部命中）。Gemini 可安装只是历史实现事实，不属于本文第一批支持目标。
 
-以下流程只用于固定未来 Codex hook provider 的 public contract：当 Codex provider 真正实现后，Libra 可以安装 `.codex` hook、读取 Codex JSONL transcript、把捕获结果写入 `agent_session` / `agent_checkpoint` / `agent_usage_stats`，并把 checkpoint blob 推送到 `refs/libra/traces`。这里描述的是外部 Codex 捕获路径；内部受控执行、tool approval、sandbox 和 workspace mutation 仍属于 `libra code` AgentRuntime。
+Libra 安装用户级 Codex hook、读取 Codex JSONL transcript、把捕获结果写入 `agent_session` / `agent_checkpoint` / `agent_usage_stats`，并把 checkpoint blob 推送到 `refs/libra/traces`。这里描述的是外部 Codex 捕获路径；内部受控执行、tool approval、sandbox 和 workspace mutation 仍属于 `libra code` AgentRuntime。
 
 1. **注册与可见性检查**
 
@@ -223,11 +223,11 @@ OpenCode 是第一批 supported agent；执行本文档时必须补齐 OpenCode 
    libra agent doctor
    ```
 
-   AG-16/AG-17 目标态中，`codex` 行必须至少暴露这些状态字段：`registered=true`、`agent_kind=codex`、`provider_name=codex`、`stability=stable`、`protected_dirs=[".codex"]`、`transcript_readable=true`、`hook_installable=false`、`installed=false`、`capabilities.hooks=false`、`capabilities.native_transcript=true`。未来 Codex HookProvider 落地的同一 PR 才能把 `hook_installable` / `capabilities.hooks` 改成 true，并必须同步本节、用户文档与 schema pin tests。`list --json` 与未来 capability-matrix JSON 是自动化脚本和测试的事实源；人类输出只用于诊断，不得作为稳定解析面。
+   AG-19 落地后，`codex` 行暴露：`registered=true`、`agent_kind=codex`、`provider_name=codex`、`stability=stable`、`protected_dirs=[".codex"]`、`transcript_readable=true`、**`hook_installable=true`、`capabilities.hooks=true`**、`installed=<运行时>`、`capabilities.native_transcript=true`、`config_paths=[".codex/hooks.json"]`（project 级可见的加载路径；实际写入目标是用户级，见下）。同 PR 已同步 schema pin tests（`compat_agent_capability_matrix_pin`）。`list --json` 与 capability-matrix JSON 是自动化脚本和测试的事实源；人类输出只用于诊断，不得作为稳定解析面。
 
-2. **启用（未来安装 Codex hook）**
+2. **启用（安装 Codex hook，已落地）**
 
-   当前 `libra agent enable --agent codex` 不会安装 hook；实现必须保持 actionable unsupported / skip diagnostic，不得静默标记 installed。未来 Codex HookProvider 落地后，canonical 命令仍是 `enable`，`add` 只是兼容别名，二者必须同语义、同退出码、同 JSON schema：
+   canonical 命令是 `enable`，`add` 只是兼容别名，二者同语义、同退出码、同 JSON schema：
 
    ```bash
    libra agent enable --agent codex
@@ -235,39 +235,38 @@ OpenCode 是第一批 supported agent；执行本文档时必须补齐 OpenCode 
    libra agent add codex --force
    ```
 
-   未来启用命令的实现顺序必须是：解析 CLI slug `codex` → 映射 `AgentKind::Codex` → 查找 `provider_name=codex` 的 `HookProvider` → 构造 `ProviderInstallOptions`（二进制路径同 Claude Code 契约：`resolve_hook_binary_path` canonicalize 绝对路径，禁止回退裸 `libra`）→ 读取实现 PR 经真实 Codex CLI 版本验证的 hooks/plugin/config 入口 → upsert Libra-managed hook entry 与用户级 trust/enabled 记录 → 原子写回项目或用户级配置 → 重新读取配置验证安装结果 → 运行真实 `codex exec` smoke 证明 hook 被读取并触发 → `list/status` 报告 `installed=true`。任一步失败都必须 fail-closed：不得留下半写入 JSON/TOML，不得创建 `agent_session`，不得把 `installed` 标成 true。
+   启用实现顺序（已落地）：解析 CLI slug `codex` → 映射 `AgentKind::Codex` → **经 registry adapter `as_hooks()` 取得 `HookProvider`（AG-19 删除了 provider-name 字符串桥）** → 构造 `ProviderInstallOptions`（二进制路径同 Claude Code 契约：`resolve_hook_binary_path` canonicalize 绝对路径，禁止回退裸 `libra`）→ upsert 用户级 `$CODEX_HOME/hooks.json` Libra-managed hook entry 与 `config.toml` `[hooks.state]` trust 记录（自算 trusted_hash）→ 原子写回 → 重新读取验证（`hooks_are_installed` 同时要求零 trust gap）。任一步失败 fail-closed：不留半写入 JSON/TOML，不创建 `agent_session`，不把 `installed` 标成 true。安装级真实 `codex exec` 冒烟属 A6.5 采集 smoke 任务口径（hook 触发机制本身已在本节证据中以相同 hash 算法/相同文件形态实测证明）。
 
-   安装成功后的副作用只允许是 Libra 管理的 Codex hook 配置：
+   安装成功后的副作用只允许是 Libra 管理的 Codex hook 配置（0.142.4 实测固定）：
 
-   - 只写实现 PR 已通过真实 Codex CLI 验证的项目级 hook/plugin/config 入口；当前文档不得假定 `.codex/hooks.json` 会被 Codex 加载。
-   - Codex hooks 受用户级 trust/enable 双重门控；installer 可在 `~/.codex/config.toml` `[hooks.state]` 中只增删 Libra 自有 entry（`trusted_hash` + `enabled=true`），或采用经实测的等价 bypass/approval 机制并写清豁免理由。
-   - `.codex/config.toml` 可作为项目级配置候选，但未经当前 Codex 版本验证的 `[features] hooks = true` 不能作为完成态写入；若实现 PR 发现真实 key，必须替换本节并加 compat test 固定。
-   - 安装 canonical provider events：`SessionStart`、`UserPromptSubmit`、`Stop`、`PostToolUse`。`PreToolUse` 可解析但不产生 lifecycle event，不进入 checkpoint 写入链。
+   - **写入目标是用户级** `$CODEX_HOME/hooks.json`（`CODEX_HOME` env 缺省 `~/.codex`）：形如 `{"hooks": {"<EventName>": [{"hooks": [{"type": "command", "command": "<canonical binary> hooks codex <verb>", "timeout": 30, "statusMessage": "libra capture"}]}]}}`（顶层 key 必须是 `hooks`，handler 字段 `deny_unknown_fields`）。project 级 `.codex/hooks.json` 是真实加载路径，但只对用户 config 中 `[projects."<abs>"] trust_level = "trusted"` 的项目生效（且 bypass flag 也不解锁未受信项目层），Libra 因此不写 project 级。
+   - hooks feature 在 0.142.4 默认启用（Stage::Stable），无需也不得写 `[features] hooks = true`。
+   - **trust 双重门控（实测 + 源码核对）**：用户级 `$CODEX_HOME/config.toml` `[hooks.state."<hooks.json 绝对路径>:<event_snake>:<group_idx>:<handler_idx>"]`，字段 `enabled`（缺省 true）+ `trusted_hash = "sha256:" + sha256(紧凑、键递归排序的 JSON {"event_name","matcher"?,"hooks":[{"type","command","timeout"(生效值,缺省600),"async":false,"statusMessage"?}]})`。installer 自算 hash 只增删 Libra 自有 entry（带 `# libra-managed codex hook trust entry (AG-19)` 标记注释行），其余字节原样保留（byte-for-byte pin 测试）。**未受信 hook 在 `codex exec` 下静默不执行**（零 stderr 信号），故 `hooks_are_installed` 要求零 trust gap；state key 是位置型（上游 TODO durable id），重装必须按最终文件重算 index 并清理指向本文件的陈旧 Libra key。
+   - 安装 canonical provider events：`SessionStart`、`UserPromptSubmit`、`PostToolUse`、`Stop`、**`SubagentStart`、`SubagentStop`**（Codex 原生 subagent 生命周期 hook，映射 Libra `SubagentStart`/`SubagentEnd`）。`PreToolUse`/`PreCompact`/`PostCompact`/`PermissionRequest` 可解析（`recognizes_event` 全表 10 名）但默认不安装转发。
+   - **trust-gap banner（AG-19）**：Codex `SessionStart` ingest 成功后，结构性比较 hooks.json 中 Libra-managed handler 与 `[hooks.state]` 当前 hash，仅当存在未批准 entry 时向 stderr 输出一条 banner（提示 `libra agent enable --agent codex` 刷新）；`enabled=false` 且 hash 匹配是刻意停用，不算 gap。
    - `--force` 只能重写 Libra-managed Codex hook entries，不得删除用户自定义 hook。
 
-3. **未来安装后的配置证据**
+3. **安装后的配置证据（2026-07-05 实测记录）**
 
-   AG-19 实现 PR 必须在本节写回实际配置证据，而不是保留假想 JSON 示例。证据最少包括：
+   - Codex CLI 版本 `codex-cli 0.142.4`；smoke 入口 `codex exec -C <repo> --skip-git-repo-check --sandbox read-only "<短 prompt>" </dev/null`（**stdin 必须重定向**：非 tty 打开的 stdin 会让 exec 永久等待）。hook 触发时 exec transcript 打印 `hook: <EventName>` / `hook: <EventName> Completed`。
+   - hook 收到的 stdin payload 为 Claude Code 兼容单行 JSON：`session_id`、`transcript_path`（`$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*.jsonl`）、`cwd`、`hook_event_name`、`model`、`permission_mode`，事件特有字段 `prompt`/`turn_id`（UserPromptSubmit）、`tool_name`/`tool_input`/`tool_response`/`tool_use_id`（Pre/PostToolUse）、`stop_hook_active`/`last_assistant_message`（Stop）、`source`（SessionStart：`startup|resume|clear|compact`）。
+   - Libra-managed entry 识别规则：handler `command` 含子串 `" hooks codex "`（兼容旧拼写 `agent hooks codex`）；卸载按该规则反向匹配，只删自有 handler/state，group 清空才删除，文件永不删除。trusted_hash 算法已用两个已知向量外部复现逐字节命中（探测记录：`session_start` 向量 `sha256:11a16641…f6195`）。
+   - 保留用户配置断言均有 pin 测试：用户 hooks.json group/handler 结构保留、config.toml 用户字节做前缀精确保留、卸载后 byte-for-byte 还原。
 
-   - Codex CLI 版本、`codex exec` 入口参数、项目级 hook/plugin/config 文件路径或用户级 `[hooks.state]` entry 形态。
-   - Libra-managed entry 的唯一识别方式、trusted hash / enabled 状态、卸载时的反向匹配规则。
-   - 真实 smoke 中证明 hook 被触发的 redacted summary，且不能包含 prompt、token、provider credential、raw transcript 或 `.env.test` 内容。
-   - 保留用户配置的断言：用户已有 config/plugin/hook entry 语义等价保留；`--force` 只重写 Libra-managed entry。
+4. **运行 Codex 并自动捕获（已落地）**
 
-   在上述证据落地前，`codex` 行最多可声明 `registered=true`、`transcript_readable=true`，不得声明 `hook_installable=true` 或 `installed=true`。
-
-4. **未来运行 Codex 并自动捕获**
-
-   当前没有 Codex hook 自动捕获路径。未来启用后，用户正常运行外部 Codex。Libra 不接管 Codex 进程，也不替 Codex 执行 tool；Codex 在自己的生命周期事件上调用 hook 命令，把事件 JSON 从 stdin 传给 Libra：
+   启用后，用户正常运行外部 Codex。Libra 不接管 Codex 进程，也不替 Codex 执行 tool；Codex 在自己的生命周期事件上调用 hook 命令，把事件 JSON 从 stdin 传给 Libra：
 
    ```bash
    libra hooks codex session-start
    libra hooks codex prompt
    libra hooks codex tool-use
    libra hooks codex stop
+   libra hooks codex subagent-start
+   libra hooks codex subagent-end
    ```
 
-   为兼容 agent 模块内部路由，`libra agent hooks codex <verb>` 可以保留为同一路径的内部入口；但 hook 文件写出的稳定调用面是 `libra hooks codex <verb>`。provider event 到 Libra lifecycle event 的映射必须固定：
+   hook 文件写出的稳定调用面是 `libra hooks codex <verb>`（路由到 AgentTraces 捕获路径 `refs/libra/traces`）；`libra agent hooks codex <verb>` 保留为同一路径的内部入口。provider event 到 Libra lifecycle event 的映射（已固定）：
 
    | Codex 事件 | Hook 命令 | Libra lifecycle | 最小捕获字段 | 写入边界 |
    |---|---|---|---|---|
@@ -275,6 +274,8 @@ OpenCode 是第一批 supported agent；执行本文档时必须补齐 OpenCode 
    | `UserPromptSubmit` | `prompt` | `TurnStart` | `session_id`、`turn_id`、`prompt`、`transcript_path` | 追加 session event，允许 prompt 摘要进入 metadata |
    | `PostToolUse` | `tool-use` | `ToolUse` | `tool_name`、`tool_use_id`、`tool_input`、`cwd` | 只把 `apply_patch` / `Write` / `Edit` 归入文件变更集 |
    | `Stop` | `stop` | `TurnEnd` | `session_id`、`turn_id`、`transcript_path` | 形成 checkpoint 边界，触发 transcript 增量读取 |
+   | `SubagentStart` | `subagent-start` | `SubagentStart` | `session_id`、`cwd` | 记入 session `subagent_events` metadata（capped） |
+   | `SubagentStop` | `subagent-end` | `SubagentEnd` | `session_id`、`cwd` | 同上；未来接通 `CheckpointScope::Subagent`（AG-20） |
 
 5. **Transcript 读取与解析**
 
@@ -297,7 +298,7 @@ OpenCode 是第一批 supported agent；执行本文档时必须补齐 OpenCode 
 
    默认 `list/show` 只展示 metadata，不自动展示 raw prompt、context、stderr 或完整 transcript；需要 redacted detail 的命令必须显式声明（受 cap/streaming/redaction 约束）；需要未脱敏 raw 的命令必须 `--allow-raw` 并写 audit log。
 
-7. **未来停用与移除**
+7. **停用与移除（已落地）**
 
    canonical 停用命令是 `disable`，`remove` 只是兼容别名：
 
@@ -306,7 +307,7 @@ OpenCode 是第一批 supported agent；执行本文档时必须补齐 OpenCode 
    libra agent remove codex
    ```
 
-   当前 `libra agent disable --agent codex` 不应删除任何 `.codex` 配置。未来停用只移除实现 PR 固定的 Libra-managed Codex hook/plugin/config entry，并清理 Libra 写入的 `[hooks.state]` trust/enabled 记录或等价批准记录；不得删除用户自定义 Codex 配置，也不得删除已经捕获的 `agent_session`、`agent_checkpoint`、`refs/libra/traces` 数据。未来 provider 已落地但停用后 `libra agent list --json` 必须显示 `registered=true`、`hook_installable=true`、`installed=false`。历史数据清理仍走 `libra agent clean` / retention / GC 策略。
+   停用只移除 Libra-managed Codex hook entry（`$CODEX_HOME/hooks.json` 中 command 匹配 `" hooks codex "` 的 handler）并清理 Libra 写入的 `[hooks.state]` trust 记录（带标记注释的自有 section）；不删除用户自定义 Codex 配置（byte-for-byte pin 测试），也不删除已经捕获的 `agent_session`、`agent_checkpoint`、`refs/libra/traces` 数据。停用后 `libra agent list --json` 显示 `registered=true`、`hook_installable=true`、`installed=false`。历史数据清理仍走 `libra agent clean` / retention / GC 策略。
 
 8. **消费与执行边界**
 

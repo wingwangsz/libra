@@ -25,9 +25,13 @@ libra agent rpc <subcommand>
 removes provider hooks, reports captured session/checkpoint state, exposes
 read-only diagnostics, and can push `refs/libra/traces` to a remote.
 
-The supported roster is `claude-code`, `codex` and `opencode` (first batch).
-`claude-code` is hook-installable today; `codex` and `opencode` are
-transcript-readable and gain hook installation once their hook providers land.
+The supported roster is `claude-code`, `codex` and `opencode` (first batch),
+and all three are hook-installable: `claude-code` writes `.claude/settings.json`,
+`codex` writes user-level `$CODEX_HOME/hooks.json` plus Libra-managed trust
+entries in `$CODEX_HOME/config.toml` (untrusted Codex hooks are skipped
+silently, so trust entries are part of the install), and `opencode` writes the
+Libra-managed plugin `.opencode/plugin/libra-hooks.js` (note: `opencode --pure`
+disables all external plugins, including capture).
 `gemini` was demoted out of the supported roster and is uninstall-only:
 `libra agent remove gemini` removes previously installed Libra-managed hooks
 (idempotent), captured sessions stay readable, and `add`/`enable` for it — or

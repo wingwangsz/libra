@@ -31,6 +31,12 @@ use crate::internal::ai::{runtime::event::Event, session::SessionState};
 /// projection logic can distinguish, for example, `TurnStart` (a new user prompt
 /// arrived) from `Compaction` (the model summarised history to fit its context
 /// window).
+/// AG-19: `#[non_exhaustive]` so downstream matches must carry a fallback
+/// arm — adding a lifecycle kind is an additive, non-breaking change.
+/// New variants must be **appended at the end**: `event_id()` folds
+/// `kind as u8` into its UUIDv5 name, so reordering renumbers every
+/// previously persisted event id.
+#[non_exhaustive]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum LifecycleEventKind {
     SessionStart,
@@ -44,6 +50,13 @@ pub enum LifecycleEventKind {
     SourceDisabled,
     TurnEnd,
     SessionEnd,
+    /// A sub-agent (nested agent run inside the same provider session)
+    /// started (AG-19; synthesized from transcript analysis or provider
+    /// envelopes that carry a subagent id — not a first-class hook
+    /// command for any current provider).
+    SubagentStart,
+    /// A sub-agent finished (AG-19; see [`Self::SubagentStart`]).
+    SubagentEnd,
 }
 
 impl fmt::Display for LifecycleEventKind {
@@ -60,6 +73,8 @@ impl fmt::Display for LifecycleEventKind {
             LifecycleEventKind::SourceDisabled => "source_disabled",
             LifecycleEventKind::TurnEnd => "turn_end",
             LifecycleEventKind::SessionEnd => "session_end",
+            LifecycleEventKind::SubagentStart => "subagent_start",
+            LifecycleEventKind::SubagentEnd => "subagent_end",
         };
         write!(f, "{value}")
     }
@@ -118,6 +133,8 @@ impl Event for LifecycleEvent {
             LifecycleEventKind::SourceDisabled => "source_disabled",
             LifecycleEventKind::TurnEnd => "turn_end",
             LifecycleEventKind::SessionEnd => "session_end",
+            LifecycleEventKind::SubagentStart => "subagent_start",
+            LifecycleEventKind::SubagentEnd => "subagent_end",
         }
     }
 
@@ -378,6 +395,32 @@ pub fn apply_lifecycle_event(
             }
         }
         LifecycleEventKind::SessionEnd => {}
+        // AG-19: sub-agent boundaries are recorded as bounded metadata
+        // entries (mirroring automation_events) so a parent session's
+        // projection can see nested runs without a schema change.
+        LifecycleEventKind::SubagentStart | LifecycleEventKind::SubagentEnd => {
+            let entry = json!({
+                "kind": event.kind.to_string(),
+                "source": event.source,
+                "tool": event.tool_name,
+                "timestamp": event.timestamp.to_rfc3339(),
+            });
+            let slot = session
+                .metadata
+                .entry("subagent_events".to_string())
+                .or_insert_with(|| Value::Array(Vec::new()));
+            let Value::Array(items) = slot else {
+                session
+                    .metadata
+                    .insert("subagent_events".to_string(), Value::Array(vec![entry]));
+                return;
+            };
+            items.push(entry);
+            if items.len() > max_tool_events {
+                let drop_n = items.len() - max_tool_events;
+                items.drain(0..drop_n);
+            }
+        }
     }
 }
 
@@ -612,6 +655,37 @@ mod tests {
         );
         assert_eq!(LifecycleEventKind::TurnEnd.to_string(), "turn_end");
         assert_eq!(LifecycleEventKind::SessionEnd.to_string(), "session_end");
+        assert_eq!(
+            LifecycleEventKind::SubagentStart.to_string(),
+            "subagent_start"
+        );
+        assert_eq!(LifecycleEventKind::SubagentEnd.to_string(), "subagent_end");
+    }
+
+    /// AG-19 ordinal-stability pin: `event_id()` folds `kind as u8` into
+    /// its UUIDv5 name, so the discriminants of PRE-EXISTING variants are
+    /// part of the persisted-id contract. New variants must be appended
+    /// (SubagentStart=11, SubagentEnd=12) — inserting one mid-enum shifts
+    /// every later ordinal and silently renumbers persisted event ids.
+    #[test]
+    fn lifecycle_event_kind_ordinals_are_stable() {
+        for (kind, ordinal) in [
+            (LifecycleEventKind::SessionStart, 0u8),
+            (LifecycleEventKind::TurnStart, 1),
+            (LifecycleEventKind::ToolUse, 2),
+            (LifecycleEventKind::ModelUpdate, 3),
+            (LifecycleEventKind::Compaction, 4),
+            (LifecycleEventKind::CompactionCompleted, 5),
+            (LifecycleEventKind::PermissionRequest, 6),
+            (LifecycleEventKind::SourceEnabled, 7),
+            (LifecycleEventKind::SourceDisabled, 8),
+            (LifecycleEventKind::TurnEnd, 9),
+            (LifecycleEventKind::SessionEnd, 10),
+            (LifecycleEventKind::SubagentStart, 11),
+            (LifecycleEventKind::SubagentEnd, 12),
+        ] {
+            assert_eq!(kind as u8, ordinal, "{kind:?} discriminant drifted");
+        }
     }
 
     // Scenario: a path-traversal style session ID is rejected by the validator.

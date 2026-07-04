@@ -458,19 +458,21 @@ async fn ingest_agent_traces(
     .await
 }
 
-/// Connection-bound core of [`ingest_agent_traces`]. `pub(crate)` so unit
-/// tests in this module can drive the function without stubbing stdin or
-/// the process-wide working directory; it is intentionally NOT re-exported
-/// from the crate root. Fully deterministic given `payload`, the
-/// connection, and (optionally) `repo_path` — round-2 BLOCK #10 acceptance
-/// criterion.
+/// Connection-bound core of [`ingest_agent_traces`]. `pub` for the AG-19
+/// span integration tests (`tests/agent_hook_span_test.rs`), which must
+/// drive an in-process ingest under a fake tracing sink — NOT a stable
+/// API, and intentionally not re-exported from the crate root. Unit tests
+/// in this module use it for the same reason: no stdin stubbing, no
+/// process-wide working-directory mutation. Fully deterministic given
+/// `payload`, the connection, and (optionally) `repo_path` — round-2
+/// BLOCK #10 acceptance criterion.
 ///
 /// `repo_path` is the `.libra` directory used to resolve the Git object
 /// store for checkpoint commit creation (Phase 2.1). Passing `None` skips
 /// the checkpoint commit step on `SessionEnd` and only persists the
 /// `agent_session` summary; tests use that path so they don't need a live
 /// `libra init` workspace.
-pub(crate) async fn ingest_agent_traces_payload(
+pub async fn ingest_agent_traces_payload(
     payload: &[u8],
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -482,17 +484,62 @@ pub(crate) async fn ingest_agent_traces_payload(
 
     use crate::internal::ai::observed_agents::{RedactionMatch, Redactor};
 
+    // AG-19 observability (`agent.md` 落地执行补充规格 §6): one span per
+    // ingest with required fields present and raw stdin / tool_input
+    // deliberately absent. Fields unknown at open time are recorded later.
+    let ingest_span = tracing::info_span!(
+        "agent.hook.ingest",
+        provider = provider.provider_name(),
+        verb = %command,
+        event_kind = tracing::field::Empty,
+        frame_bytes = payload.len() as u64,
+        validated = tracing::field::Empty,
+        partial = tracing::field::Empty,
+    );
+
     if payload.len() > MAX_STDIN_BYTES {
+        ingest_span.record("validated", false);
         bail!("hook input exceeds {MAX_STDIN_BYTES} bytes");
     }
     let stdin = std::str::from_utf8(payload).context("hook input is not valid UTF-8")?;
     if stdin.trim().is_empty() {
+        ingest_span.record("validated", false);
         bail!("hook input is empty");
     }
 
     let envelope: SessionHookEnvelope =
         serde_json::from_str(stdin).map_err(|err| anyhow!("invalid hook JSON payload: {err}"))?;
-    validate_session_hook_envelope(&envelope, MAX_TRANSCRIPT_PATH_BYTES)?;
+    if let Err(err) = validate_session_hook_envelope(&envelope, MAX_TRANSCRIPT_PATH_BYTES) {
+        ingest_span.record("validated", false);
+        return Err(err);
+    }
+    ingest_span.record("validated", true);
+
+    // Test-only crash knob (强制补强项 #10, `tests/agent_hook_crash_test.rs`):
+    // panic after the payload has been fully read and validated but before
+    // any database write, so crash-regression tests can prove a mid-ingest
+    // failure leaves no partial session/checkpoint state and echoes no raw
+    // stdin bytes. Mirrors the `LIBRA_TEST_*` env convention; never set in
+    // production.
+    if std::env::var_os("LIBRA_TEST_HOOK_PANIC_AFTER_READ").is_some() {
+        panic!("test-injected hook panic (LIBRA_TEST_HOOK_PANIC_AFTER_READ)");
+    }
+
+    // AG-19 forward compatibility: an event name this build does not know
+    // (newer upstream agent) is skipped-and-logged — never a panic, never
+    // a checkpoint write, never a blocker for later known events.
+    if !provider.recognizes_event(&envelope.hook_event_name) {
+        ingest_span.record("partial", true);
+        let _entered = ingest_span.enter();
+        tracing::warn!(
+            target: "agent.hook.ingest",
+            provider = provider.provider_name(),
+            hook_event_name = %envelope.hook_event_name,
+            reason = "unknown_event_type",
+            "skipping unrecognized lifecycle event name"
+        );
+        return Ok(());
+    }
 
     let mut event = provider.parse_hook_event(&envelope.hook_event_name, &envelope)?;
     if event.kind != expected_kind {
@@ -503,31 +550,53 @@ pub(crate) async fn ingest_agent_traces_payload(
             envelope.hook_event_name
         );
     }
+    ingest_span.record("event_kind", tracing::field::display(event.kind));
+    ingest_span.record("partial", false);
 
-    // Redact free-form text fields before they get anywhere near durable
-    // storage. We aggregate the per-field reports into a single JSON document
-    // that lands in `agent_session.redaction_report` so the persisted row is
-    // observably scrubbed (Codex round-3 review: "assert observable redaction
+    // Redact every free-form text field before it gets anywhere near
+    // durable storage (AG-19 redaction-before-persist: prompt, tool
+    // input/response and assistant message alike). We aggregate the
+    // per-field reports into a single JSON document that lands in
+    // `agent_session.redaction_report` so the persisted row is observably
+    // scrubbed (Codex round-3 review: "assert observable redaction
     // outcome").
-    let redactor = Redactor::new_default();
-    let mut all_matches: Vec<RedactionMatch> = Vec::new();
-    let mut bytes_scanned: usize = 0;
-    let mut bytes_redacted: usize = 0;
-    if let Some(prompt) = event.prompt.take() {
-        let (redacted, report) = redactor.redact(prompt.as_bytes());
-        event.prompt = Some(String::from_utf8_lossy(redacted.bytes()).into_owned());
-        bytes_scanned += report.bytes_scanned;
-        bytes_redacted += report.bytes_redacted;
-        all_matches.extend(report.matches);
-    }
-    if let Some(input) = event.tool_input.take() {
-        let serialized = serde_json::to_vec(&input).unwrap_or_default();
-        let (redacted, report) = redactor.redact(&serialized);
-        event.tool_input = serde_json::from_slice(redacted.bytes()).ok();
-        bytes_scanned += report.bytes_scanned;
-        bytes_redacted += report.bytes_redacted;
-        all_matches.extend(report.matches);
-    }
+    let redaction_span = tracing::info_span!(
+        "agent.redaction.apply",
+        rules_hit = tracing::field::Empty,
+        size_cap_triggered = false,
+        fail_closed = false,
+    );
+    let (all_matches, bytes_scanned, bytes_redacted) = redaction_span.in_scope(|| {
+        let redactor = Redactor::new_default();
+        let mut all_matches: Vec<RedactionMatch> = Vec::new();
+        let mut bytes_scanned: usize = 0;
+        let mut bytes_redacted: usize = 0;
+        let mut redact_string = |value: &mut Option<String>| {
+            if let Some(text) = value.take() {
+                let (redacted, report) = redactor.redact(text.as_bytes());
+                *value = Some(String::from_utf8_lossy(redacted.bytes()).into_owned());
+                bytes_scanned += report.bytes_scanned;
+                bytes_redacted += report.bytes_redacted;
+                all_matches.extend(report.matches);
+            }
+        };
+        redact_string(&mut event.prompt);
+        redact_string(&mut event.assistant_message);
+        let mut redact_value = |value: &mut Option<serde_json::Value>| {
+            if let Some(inner) = value.take() {
+                let serialized = serde_json::to_vec(&inner).unwrap_or_default();
+                let (redacted, report) = redactor.redact(&serialized);
+                *value = serde_json::from_slice(redacted.bytes()).ok();
+                bytes_scanned += report.bytes_scanned;
+                bytes_redacted += report.bytes_redacted;
+                all_matches.extend(report.matches);
+            }
+        };
+        redact_value(&mut event.tool_input);
+        redact_value(&mut event.tool_response);
+        (all_matches, bytes_scanned, bytes_redacted)
+    });
+    redaction_span.record("rules_hit", all_matches.len() as u64);
     let redaction_report_json = serde_json::to_string(&serde_json::json!({
         "matches": all_matches,
         "bytes_scanned": bytes_scanned,
@@ -562,6 +631,56 @@ pub(crate) async fn ingest_agent_traces_payload(
         "gemini" => "gemini",
         other => other,
     };
+
+    // AG-19 owner filtering: first-writer-wins by recorded owner agent
+    // kind per provider session id, so two adapters forwarding the same
+    // underlying session cannot double-write checkpoints. SessionStart /
+    // TurnStart are exempt (they may establish a claim); every other
+    // event from a non-owner agent kind is skipped-and-logged, never a
+    // hard error (`agent.md` AG-19 owner-filtering row).
+    //
+    // Ownership is `rowid ASC` — true insertion order. `agent_session` is
+    // an ordinary rowid table and the UPSERT preserves rowids, so the
+    // first physically-inserted claim wins permanently. The previous
+    // `(started_at ASC, session_id ASC)` ordering used second-granularity
+    // timestamps: a later-arriving row inserted within the same second
+    // could win the lexicographic tiebreak AFTER the earlier row's owner
+    // had already confirmed and written a checkpoint, yielding
+    // checkpoints from two agent kinds for one provider session (caught
+    // by `agent_lifecycle_event_test::
+    // simultaneous_stop_race_yields_single_owner_checkpoints`).
+    if !matches!(
+        event.kind,
+        LifecycleEventKind::SessionStart | LifecycleEventKind::TurnStart
+    ) {
+        let owner_row = conn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT agent_kind FROM agent_session WHERE provider_session_id = ? \
+                 ORDER BY rowid ASC LIMIT 1",
+                [envelope.session_id.clone().into()],
+            ))
+            .await
+            .context("failed to query agent_session owner claim")?;
+        if let Some(row) = owner_row {
+            let owner_kind: String = row
+                .try_get("", "agent_kind")
+                .context("failed to read agent_session owner kind")?;
+            if owner_kind != agent_kind {
+                ingest_span.record("partial", true);
+                let _entered = ingest_span.enter();
+                tracing::warn!(
+                    target: "agent.hook.ingest",
+                    provider = provider.provider_name(),
+                    owner = %owner_kind,
+                    event_kind = %event.kind,
+                    reason = "owner_mismatch",
+                    "skipping non-owner lifecycle event (first-writer-wins)"
+                );
+                return Ok(());
+            }
+        }
+    }
 
     let new_state = match event.kind {
         LifecycleEventKind::SessionStart => "active",
@@ -634,6 +753,42 @@ pub(crate) async fn ingest_agent_traces_payload(
         LifecycleEventKind::SessionEnd | LifecycleEventKind::TurnEnd
     ) && let Some(repo) = repo_path
     {
+        // AG-19 owner-race closure: the pre-upsert owner check above is a
+        // fast path, but two providers racing on a fresh provider session
+        // can BOTH pass it (each sees no owner) and both upsert. Re-read
+        // the claim now that our row is durably in place. Ordering by
+        // `rowid ASC` makes this confirmation *monotone*: an existing
+        // row's rowid never changes and no later insert can obtain a
+        // smaller one, so once a racer confirms itself as owner no
+        // subsequently-arriving row can flip the answer — exactly one of
+        // the racers writes the checkpoint. The loser keeps its metadata
+        // row but is skipped fail-closed here.
+        let confirmed_owner: String = conn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT agent_kind FROM agent_session WHERE provider_session_id = ? \
+                 ORDER BY rowid ASC LIMIT 1",
+                [envelope.session_id.clone().into()],
+            ))
+            .await
+            .context("failed to re-confirm agent_session owner claim")?
+            .map(|row| row.try_get("", "agent_kind"))
+            .transpose()
+            .context("failed to read confirmed agent_session owner kind")?
+            .unwrap_or_else(|| agent_kind.to_string());
+        if confirmed_owner != agent_kind {
+            ingest_span.record("partial", true);
+            let _entered = ingest_span.enter();
+            tracing::warn!(
+                target: "agent.hook.ingest",
+                provider = provider.provider_name(),
+                owner = %confirmed_owner,
+                event_kind = %event.kind,
+                reason = "owner_mismatch",
+                "skipping checkpoint write for non-owner (post-upsert confirmation)"
+            );
+            return Ok(());
+        }
         write_committed_checkpoint(
             conn,
             repo,
@@ -1079,7 +1234,10 @@ fn transition_phase(session: &mut SessionState, event_kind: LifecycleEventKind) 
         | LifecycleEventKind::CompactionCompleted
         | LifecycleEventKind::PermissionRequest
         | LifecycleEventKind::SourceEnabled
-        | LifecycleEventKind::SourceDisabled => SessionPhase::Active,
+        | LifecycleEventKind::SourceDisabled
+        // AG-19: nested sub-agent activity keeps the parent session live.
+        | LifecycleEventKind::SubagentStart
+        | LifecycleEventKind::SubagentEnd => SessionPhase::Active,
         LifecycleEventKind::ModelUpdate => current_phase.unwrap_or(SessionPhase::Active),
     };
 

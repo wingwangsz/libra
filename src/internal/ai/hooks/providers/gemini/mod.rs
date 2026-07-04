@@ -48,6 +48,10 @@ impl HookProvider for GeminiProvider {
         parser::parse_gemini_hook_event(hook_event_name, envelope)
     }
 
+    fn recognizes_event(&self, hook_event_name: &str) -> bool {
+        parser::GEMINI_HOOK_EVENT_NAMES.contains(&hook_event_name)
+    }
+
     fn dedup_identity_keys(&self) -> &'static [&'static str] {
         CANONICAL_DEDUP_IDENTITY_KEYS
     }

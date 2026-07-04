@@ -132,18 +132,18 @@ static REGISTRY: [AgentRegistration; 7] = [
         support_wave: Some(FIRST_BATCH_WAVE),
         registered: true,
         transcript_readable: true,
-        // Codex HookProvider has not landed (AG-19); until then the row is
-        // transcript-readable only and must not be marked installable.
-        hook_installable: false,
+        // AG-19: Codex HookProvider landed. Install target verified
+        // against codex-cli 0.142.4 (2026-07-05): USER-level
+        // `$CODEX_HOME/hooks.json` + Libra-managed `[hooks.state]` trust
+        // entries in `$CODEX_HOME/config.toml`; project `.codex/hooks.json`
+        // only loads for user-trusted projects, so Libra does not write it.
+        hook_installable: true,
         installed: false,
         launchable_review: false,
         launchable_investigate: false,
         external_binary: false,
-        // Upstream config surface unverified — fixed in AG-19 per real CLI
-        // testing (candidates: project `.codex/config.toml`, user-level
-        // `[hooks.state]`). Deliberately empty until then.
-        config_paths: &[],
-        capabilities: NO_CAPS,
+        config_paths: &[".codex/hooks.json"],
+        capabilities: HOOKS_ONLY,
     },
     AgentRegistration {
         slug: "gemini",
@@ -172,14 +172,16 @@ static REGISTRY: [AgentRegistration; 7] = [
         support_wave: Some(FIRST_BATCH_WAVE),
         registered: true,
         transcript_readable: true,
-        // OpenCode HookProvider has not landed (AG-19); see codex note.
-        hook_installable: false,
+        // AG-19: OpenCode HookProvider landed. Install target verified
+        // against opencode 1.17.13 (2026-07-05): Libra-managed plugin file
+        // `.opencode/plugin/libra-hooks.js` (project-local).
+        hook_installable: true,
         installed: false,
         launchable_review: false,
         launchable_investigate: false,
         external_binary: false,
-        config_paths: &[],
-        capabilities: NO_CAPS,
+        config_paths: &[".opencode/plugin/libra-hooks.js"],
+        capabilities: HOOKS_ONLY,
     },
     AgentRegistration {
         slug: "copilot",

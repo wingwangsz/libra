@@ -82,21 +82,26 @@ fn known_agent_capability_matrix_matches_current_roster() {
         }
     }
 
-    // Claude Code is hook-installable today; Codex/OpenCode must stay
-    // transcript-readable-only until their HookProviders land (AG-19).
+    // AG-19: the whole first batch — Claude Code, Codex, OpenCode — is
+    // hook-installable, each with its verified upstream config target
+    // (Claude `.claude/settings.json`; Codex user-level hooks.json with
+    // the project-visible `.codex/hooks.json` load path pinned here;
+    // OpenCode Libra-managed plugin file).
     let claude = registration_for(AgentKind::ClaudeCode);
     assert!(claude.hook_installable);
     assert!(claude.capabilities.hooks);
     assert_eq!(claude.config_paths, [".claude/settings.json"]);
-    for kind in [AgentKind::Codex, AgentKind::OpenCode] {
-        let row = registration_for(kind);
-        assert!(
-            !row.hook_installable,
-            "{}: HookProvider not landed",
-            row.slug
-        );
-        assert!(!row.capabilities.hooks, "{}", row.slug);
-    }
+    let codex = registration_for(AgentKind::Codex);
+    assert!(codex.hook_installable, "codex: AG-19 HookProvider landed");
+    assert!(codex.capabilities.hooks);
+    assert_eq!(codex.config_paths, [".codex/hooks.json"]);
+    let opencode = registration_for(AgentKind::OpenCode);
+    assert!(
+        opencode.hook_installable,
+        "opencode: AG-19 HookProvider landed"
+    );
+    assert!(opencode.capabilities.hooks);
+    assert_eq!(opencode.config_paths, [".opencode/plugin/libra-hooks.js"]);
 
     // Non-first-batch agents must never be exposed as installable or
     // launchable (E9 quarantine/unsupported rule).

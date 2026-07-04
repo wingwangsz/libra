@@ -10,10 +10,7 @@ use clap::{Args, Subcommand};
 
 use crate::{
     internal::ai::{
-        hooks::{
-            provider::{HookProvider, ProviderInstallOptions},
-            providers::find_provider,
-        },
+        hooks::provider::{HookProvider, ProviderInstallOptions},
         observed_agents::{AgentKind, agent_for, registration_for, supported_slugs},
     },
     utils::{
@@ -316,9 +313,16 @@ fn install_or_uninstall(agents: &[String], output: &OutputConfig, install: bool)
             // channel for formerly-supported agents (gemini). Agents that
             // never had a HookProvider have nothing to remove — that is a
             // no-op, not an error, so repeated removes stay idempotent.
-            let provider = agent_for(kind)
-                .as_hooks()
-                .or_else(|| find_provider(provider_name_for(kind)));
+            //
+            // AG-19: dispatch is AgentKind -> registry adapter ->
+            // `as_hooks()`. Gemini's provider is deliberately NOT exposed
+            // through `as_hooks()` (E9 forbids advertising its
+            // capabilities), so its uninstall-only channel references the
+            // typed singleton directly — no name-string registry.
+            let provider = agent_for(kind).as_hooks().or_else(|| {
+                (kind == AgentKind::Gemini)
+                    .then(crate::internal::ai::hooks::providers::gemini_provider)
+            });
             let Some(provider) = provider else {
                 if !output.quiet {
                     println!(
@@ -364,22 +368,6 @@ fn unsupported_for_install(slug: &str) -> CliError {
             "agent '{slug}' is not in the supported roster ({roster}); \
              it cannot be enabled or install hooks"
         ))
-    }
-}
-
-/// `agent.as_cli_slug()` returns hyphens (`claude-code`); the existing
-/// `HookProvider` registry keys on shorter names (`claude`, `gemini`). This
-/// helper bridges the two.
-fn provider_name_for(kind: AgentKind) -> &'static str {
-    match kind {
-        AgentKind::ClaudeCode => "claude",
-        AgentKind::Gemini => "gemini",
-        // Preview adapters don't have a registered HookProvider in Phase 1.
-        AgentKind::Cursor => "cursor",
-        AgentKind::Codex => "codex",
-        AgentKind::OpenCode => "opencode",
-        AgentKind::Copilot => "copilot",
-        AgentKind::FactoryAi => "factory-ai",
     }
 }
 
@@ -479,9 +467,20 @@ mod tests {
         );
     }
 
+    /// AG-19: hook dispatch goes AgentKind -> `agent_for` -> `as_hooks()`;
+    /// gemini's uninstall-only channel is the sole typed exception. Pin
+    /// that shape so a name-string bridge cannot quietly reappear.
     #[test]
-    fn provider_name_for_maps_stable() {
-        assert_eq!(provider_name_for(AgentKind::ClaudeCode), "claude");
-        assert_eq!(provider_name_for(AgentKind::Gemini), "gemini");
+    fn hook_dispatch_has_no_string_bridge() {
+        use crate::internal::ai::observed_agents::agent_for;
+        assert!(
+            agent_for(AgentKind::ClaudeCode).as_hooks().is_some(),
+            "claude-code dispatches through as_hooks()"
+        );
+        assert!(
+            agent_for(AgentKind::Gemini).as_hooks().is_none(),
+            "gemini stays unexposed via as_hooks() (E9); its uninstall \
+             channel references the typed singleton directly"
+        );
     }
 }

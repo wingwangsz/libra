@@ -11,7 +11,8 @@ sub-commands.
 
 ```
 libra hooks claude   {session-start|prompt|tool-use|model-update|compaction|stop|session-end}
-libra hooks gemini   {session-start|prompt|tool-use|model-update|compaction|stop|session-end}
+libra hooks codex    {session-start|prompt|tool-use|model-update|compaction|stop|session-end|subagent-start|subagent-end}
+libra hooks gemini   <event>   # rejected with a hint: gemini is uninstall-only (AG-17)
 ```
 
 ## Description
@@ -35,9 +36,19 @@ The command is hidden because:
   surface for inspecting captured sessions is the `agent` sub-command
   ([agent.md](agent.md)), not `hooks`.
 
-To enable capture, run `libra agent enable --agent claude` (or
-`--agent gemini`); this installs the provider hook config that
-references `libra hooks claude ...` (or `libra hooks gemini ...`).
+`libra hooks codex <verb>` (AG-19) is the stable surface written into
+`$CODEX_HOME/hooks.json` by `libra agent enable --agent codex`; unlike
+the historical claude routing above it records into the AgentTraces
+capture store (`refs/libra/traces`). Codex additionally emits native
+sub-agent boundaries (`subagent-start` / `subagent-end`).
+
+`libra hooks gemini <verb>` no longer ingests: gemini is uninstall-only
+(AG-17), so stale hook configs installed before the demotion get an
+actionable error pointing at `libra agent remove gemini` instead of
+silently capturing data.
+
+To enable capture, run `libra agent enable --agent <name>` for a
+supported roster agent; this installs the provider hook config.
 To disable capture, run `libra agent disable --agent <name>`.
 
 ## Providers and Events

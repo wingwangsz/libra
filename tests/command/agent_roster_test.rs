@@ -4,7 +4,7 @@
 //! uninstall-only channel.
 
 use libra::{
-    internal::ai::hooks::{provider::ProviderInstallOptions, providers::find_provider},
+    internal::ai::hooks::{provider::ProviderInstallOptions, providers::gemini_provider},
     utils::test::ChangeDirGuard,
 };
 use serial_test::serial;
@@ -134,9 +134,11 @@ fn agent_list_json_contains_capability_fields() {
     assert_eq!(codex["registered"], true);
     assert_eq!(codex["stability"], "stable");
     assert_eq!(codex["transcript_readable"], true);
-    assert_eq!(codex["hook_installable"], false);
+    // AG-19: the Codex HookProvider landed — the row advertises hook
+    // installation (config target: user-level $CODEX_HOME/hooks.json).
+    assert_eq!(codex["hook_installable"], true);
     assert_eq!(codex["installed"], false);
-    assert_eq!(codex["capabilities"]["hooks"], false);
+    assert_eq!(codex["capabilities"]["hooks"], true);
 
     let gemini = agents
         .iter()
@@ -177,18 +179,10 @@ fn agent_add_non_hook_installable_returns_actionable_unsupported() {
         "gemini add must not write hooks"
     );
 
-    // Supported but HookProvider not landed: skip with explanation, exit 0.
-    let codex = run_libra_command(&["agent", "add", "codex"], &repo);
-    assert!(
-        codex.status.success(),
-        "supported-not-installable is a skip"
-    );
-    let codex_err = String::from_utf8_lossy(&codex.stderr);
-    assert!(codex_err.contains("HookProvider not landed"));
-    assert!(
-        !repo.join(".codex").exists(),
-        "codex add must not write hooks before AG-19"
-    );
+    // AG-19: codex/opencode are installable now; their install/uninstall
+    // behavior (canonical binary path, trust entries, marker-gated
+    // removal) is pinned end-to-end in tests/agent_enable_install_path_test.rs.
+    // This test keeps only the never-supported / demoted refusals.
 
     // A batch containing an unsupported slug fails closed before any install.
     let batch = run_libra_command(&["agent", "add", "claude-code", "cursor"], &repo);
@@ -245,7 +239,7 @@ fn agent_remove_gemini_uninstalls_legacy_hooks_idempotent() {
     // provider resolves the repo root from the current directory). Install
     // with the same binary the CLI tests spawn so the spawned binary's
     // `hooks_are_installed` check recognises the entries as its own.
-    let provider = find_provider("gemini").expect("gemini provider exists");
+    let provider = gemini_provider();
     {
         let _guard = ChangeDirGuard::new(&repo);
         provider
@@ -315,7 +309,7 @@ fn agent_remove_preserves_user_hook_entries() {
     )
     .expect("write user settings");
 
-    let provider = find_provider("gemini").expect("gemini provider exists");
+    let provider = gemini_provider();
     {
         let _guard = ChangeDirGuard::new(&repo);
         provider
