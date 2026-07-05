@@ -55,7 +55,7 @@ Command Groups:
     ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
-  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth
+  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
