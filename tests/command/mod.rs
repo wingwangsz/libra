@@ -271,6 +271,7 @@ mod add_json_test;
 mod add_test;
 mod agent_checkpoint_test;
 mod agent_clean_test;
+mod agent_erasure_test;
 mod agent_help_test;
 mod agent_push_test;
 mod agent_roster_test;
