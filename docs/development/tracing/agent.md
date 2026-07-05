@@ -899,6 +899,7 @@ entire 当前是 1 stable（`claude-code`）+ 7 preview（`codex`、`copilot-cli
 | `ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION` | `LBR-AGENT-011` | untrusted seed 请求进入 mutating workflow | AG-22/AG-23 |
 | `ERR_AGENT_RPC_TRANSPORT_FAILED` | `LBR-AGENT-012`（A3 实现切片补分配） | rpc invoke timeout、broken pipe/子进程提前退出、malformed JSON-RPC frame（IO hard-cap 超限仍归 `007`） | AG-18 |
 | `ERR_AGENT_TRACES_PUSH_DIVERGED` | 未分配（A5 方案 (b) 时在其 slice 分配） | prune/rewrite 后 `agent push` 遇 `refs/libra/traces` 非快进发散（仅当 plan.md A5 选定方案 (b) 稳定错误码 + 重推出口时启用；方案 (a) force-with-lease 等价语义无需新码） | AG-20 |
+| `ERR_AGENT_RAW_ACCESS_DENIED` | `LBR-AGENT-013`（A8.5 实现切片分配） | `checkpoint export --raw`（或等价 raw 未脱敏访问）未带 `--allow-raw` → fail-closed 拒绝；redacted `--detail`/`--transcript` 路径无需授权门；拒绝与授权均写 `agent_audit_log`（granted 0/1） | AG-24a |
 
 真实 `LBR-*` 编号以 `docs/error-codes.md` 为准；新增/重命名须同步 `compat_error_codes_doc_sync`，并补同码不得映射多个 variant 的唯一性守卫。
 
