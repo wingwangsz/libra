@@ -70,6 +70,33 @@ struct WhoamiResponse {
     expires_at: String,
 }
 
+/// Redacted public view of a stored login for `--json`/`--machine` output.
+/// Deliberately omits `session_token` (the bearer credential) so it can
+/// never be captured from stdout/logs — this is the stable JSON contract
+/// for `libra login`.
+#[derive(Debug, Serialize)]
+struct LoginJsonView<'a> {
+    host: &'a str,
+    username: &'a str,
+    user_id: &'a str,
+    github_id: &'a str,
+    issued_at: &'a str,
+    expires_at: &'a str,
+}
+
+impl<'a> From<&'a account::AccountSession> for LoginJsonView<'a> {
+    fn from(s: &'a account::AccountSession) -> Self {
+        Self {
+            host: &s.host,
+            username: &s.username,
+            user_id: &s.user_id,
+            github_id: &s.github_id,
+            issued_at: &s.issued_at,
+            expires_at: &s.expires_at,
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorResponse {
     error: String,
@@ -353,7 +380,10 @@ pub async fn login(args: LoginArgs, output: &OutputConfig) -> CliResult<()> {
         .await
         .map_err(|e| CliError::fatal(format!("failed to store account session: {e}")))?;
     if output.is_json() {
-        return emit_json_data("login", &session, output);
+        // SECURITY: never emit the bearer `session_token` on stdout — a
+        // `--json`/`--machine` login is likely captured in logs/CI. Emit a
+        // redacted public view that omits the token.
+        return emit_json_data("login", &LoginJsonView::from(&session), output);
     }
     if !output.quiet {
         println!("Logged in to {} as {}", session.host, session.username);
@@ -495,5 +525,36 @@ mod tests {
                 .bytes()
                 .all(|byte| { byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_' })
         );
+    }
+}
+
+#[cfg(test)]
+mod login_json_redaction_tests {
+    use super::*;
+
+    /// `libra login --json` must never emit the bearer `session_token`.
+    #[test]
+    fn login_json_view_omits_session_token() {
+        let session = account::AccountSession {
+            host: "https://libra.tools".to_string(),
+            username: "alice".to_string(),
+            user_id: "u1".to_string(),
+            github_id: "g1".to_string(),
+            session_token: "SECRET-BEARER-TOKEN".to_string(),
+            issued_at: "2026-07-06T00:00:00Z".to_string(),
+            expires_at: "2026-08-06T00:00:00Z".to_string(),
+        };
+        let view = LoginJsonView::from(&session);
+        let json = serde_json::to_string(&view).unwrap();
+        assert!(
+            !json.contains("SECRET-BEARER-TOKEN"),
+            "login --json must not leak the session token: {json}"
+        );
+        assert!(
+            !json.contains("session_token"),
+            "no token field at all: {json}"
+        );
+        // The non-sensitive identity fields are still present.
+        assert!(json.contains("alice") && json.contains("libra.tools"));
     }
 }
