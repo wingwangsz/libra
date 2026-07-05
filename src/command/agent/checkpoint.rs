@@ -21,7 +21,7 @@ use crate::{
     internal::{ai::history::parse_content_hash, db::get_db_conn_instance},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
-        object::read_git_object,
+        object::read_git_object_bounded,
         object_ext::TreeExt,
         output::{OutputConfig, emit_json_data},
         util,
@@ -972,8 +972,17 @@ fn summarize_e4_libra(
 ) -> Result<CheckpointLayoutSummary, String> {
     let manifest_hash = ObjectHash::from_str(manifest_oid)
         .map_err(|e| format!("invalid manifest.json oid '{manifest_oid}': {e}"))?;
-    let manifest_bytes = read_git_object(storage, &manifest_hash)
-        .map_err(|e| format!("manifest.json blob {manifest_oid} is not readable locally: {e}"))?;
+    let (manifest_bytes, manifest_truncated) =
+        read_git_object_bounded(storage, &manifest_hash, CHECKPOINT_METADATA_READ_MAX_BYTES)
+            .map_err(|e| {
+                format!("manifest.json blob {manifest_oid} is not readable locally: {e}")
+            })?;
+    if manifest_truncated {
+        return Err(format!(
+            "manifest.json blob {manifest_oid} exceeds the metadata size cap; \
+             refusing (corrupt or hostile checkpoint)"
+        ));
+    }
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| format!("manifest.json blob {manifest_oid} is not valid JSON: {e}"))?;
 
@@ -1051,8 +1060,17 @@ fn summarize_e4_libra(
     // content_hash.txt is a derived, fixed-size artifact — reading it is
     // part of the metadata surface, not transcript IO.
     let content_hash = tree_entry(inner, "content_hash.txt").map(|item| {
-        match read_git_object(storage, &item.id) {
-            Ok(bytes) => {
+        match read_git_object_bounded(storage, &item.id, CHECKPOINT_METADATA_READ_MAX_BYTES) {
+            // A truncated (oversized) content_hash.txt is treated as
+            // unreadable — never report a `format_valid` digest parsed from
+            // a partial object (a valid prefix + huge padding would
+            // otherwise pass `parse_content_hash`).
+            Ok((_, true)) => ContentHashSummary {
+                value: "(unreadable: exceeds metadata size cap)".to_string(),
+                format_valid: false,
+                digest: None,
+            },
+            Ok((bytes, false)) => {
                 let text = String::from_utf8_lossy(&bytes);
                 let digest = parse_content_hash(&text);
                 ContentHashSummary {
@@ -1178,15 +1196,31 @@ fn transcript_availability(storage: &Path, parts: &[TranscriptPartSummary]) -> &
     }
 }
 
+/// Upper bound on the inflated size of checkpoint metadata objects (trees
+/// and `manifest.json`). Real checkpoint trees/manifests are KB-scale; this
+/// generous cap never trips on legitimate data but stops a corrupt/hostile
+/// object from forcing an unbounded decompression + allocation on the
+/// show/export paths (AG-24a; codex review R2).
+const CHECKPOINT_METADATA_READ_MAX_BYTES: u64 = 16 * 1024 * 1024;
+
 fn read_tree_object(storage: &Path, oid_str: &str) -> Result<Tree, String> {
     let oid = ObjectHash::from_str(oid_str)
         .map_err(|e| format!("invalid tree oid '{oid_str}' in the checkpoint catalog: {e}"))?;
-    let body = read_git_object(storage, &oid).map_err(|e| {
-        format!(
-            "checkpoint tree {oid_str} is not readable from the local object \
-             store ({e}); layout unknown — metadata-first summary only"
-        )
-    })?;
+    let (body, truncated) =
+        read_git_object_bounded(storage, &oid, CHECKPOINT_METADATA_READ_MAX_BYTES).map_err(
+            |e| {
+                format!(
+                    "checkpoint tree {oid_str} is not readable from the local object \
+                     store ({e}); layout unknown — metadata-first summary only"
+                )
+            },
+        )?;
+    if truncated {
+        return Err(format!(
+            "checkpoint tree {oid_str} exceeds the {CHECKPOINT_METADATA_READ_MAX_BYTES}-byte \
+             metadata cap; refusing to load (corrupt or hostile object)"
+        ));
+    }
     Tree::from_bytes(&body, oid)
         .map_err(|e| format!("object {oid_str} did not parse as a tree: {e:?}"))
 }
@@ -1213,11 +1247,13 @@ async fn export(args: super::CheckpointExportArgs, output: &OutputConfig) -> Cli
 
     let conn = get_db_conn_instance().await;
     let backend = conn.get_database_backend();
-    let row = load_checkpoint_row(&conn, &args.checkpoint_id).await?;
 
-    let wants_raw = args.raw || args.allow_raw;
-    // Fail-closed gate: raw requested without --allow-raw. Audit the
-    // refusal, then reject with LBR-AGENT-013.
+    // Fail-closed gate FIRST — before any checkpoint lookup. A raw request
+    // without --allow-raw is refused, audited (granted=0), and returns
+    // LBR-AGENT-013 regardless of whether the checkpoint exists. Gating
+    // before the row load keeps the refusal fail-closed and avoids a
+    // checkpoint-existence oracle (the error must not depend on whether
+    // the id resolves).
     if args.raw && !args.allow_raw {
         write_export_audit(
             &conn,
@@ -1234,6 +1270,14 @@ async fn export(args: super::CheckpointExportArgs, output: &OutputConfig) -> Cli
         .with_hint("re-run with --allow-raw --raw to authorize (the access is audited)")
         .with_hint("or omit --raw to export the redacted transcript (no authorization needed)"));
     }
+
+    let row = load_checkpoint_row(&conn, &args.checkpoint_id).await?;
+
+    // Raw export only when BOTH the request (--raw) and authorization
+    // (--allow-raw) are present. `--allow-raw` alone does NOT force a raw
+    // export — it falls through to the redacted path — matching the
+    // documented `--allow-raw --raw` contract.
+    let wants_raw = args.raw && args.allow_raw;
 
     let cap = max_transcript_read_bytes()
         .await
@@ -1349,8 +1393,20 @@ fn load_checkpoint_transcript_bytes(
             "checkpoint has no manifest.json (legacy layout not exportable)".to_string(),
         )
     })?;
-    let manifest_bytes = read_git_object(&storage, &manifest_item.id)
-        .map_err(|e| CliError::fatal(format!("read manifest.json: {e}")))?;
+    // Bounded read: manifest.json is small JSON; refuse an oversized
+    // (corrupt/hostile) one rather than inflate it unbounded.
+    let (manifest_bytes, manifest_truncated) = read_git_object_bounded(
+        &storage,
+        &manifest_item.id,
+        CHECKPOINT_METADATA_READ_MAX_BYTES,
+    )
+    .map_err(|e| CliError::fatal(format!("read manifest.json: {e}")))?;
+    if manifest_truncated {
+        return Err(CliError::fatal(
+            "manifest.json exceeds the metadata size cap; refusing (corrupt or hostile checkpoint)"
+                .to_string(),
+        ));
+    }
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| CliError::fatal(format!("manifest.json invalid JSON: {e}")))?;
     let transcript = manifest
@@ -1387,17 +1443,23 @@ fn load_checkpoint_transcript_bytes(
     let mut bytes: Vec<u8> = Vec::new();
     let mut truncated = false;
     for oid in oids {
-        let hash = ObjectHash::from_str(&oid)
-            .map_err(|e| CliError::fatal(format!("invalid transcript oid '{oid}': {e}")))?;
-        let part = read_git_object(&storage, &hash)
-            .map_err(|e| CliError::fatal(format!("read transcript blob {oid}: {e}")))?;
-        let remaining = (cap as usize).saturating_sub(bytes.len());
-        if part.len() > remaining {
-            bytes.extend_from_slice(&part[..remaining]);
+        let remaining = cap.saturating_sub(bytes.len() as u64);
+        if remaining == 0 {
             truncated = true;
             break;
         }
+        let hash = ObjectHash::from_str(&oid)
+            .map_err(|e| CliError::fatal(format!("invalid transcript oid '{oid}': {e}")))?;
+        // Bounded read: never decompress more than `remaining` content
+        // bytes into memory, so a hostile/corrupt blob whose inflated size
+        // dwarfs the cap cannot force an unbounded allocation.
+        let (part, part_truncated) = read_git_object_bounded(&storage, &hash, remaining)
+            .map_err(|e| CliError::fatal(format!("read transcript blob {oid}: {e}")))?;
         bytes.extend_from_slice(&part);
+        if part_truncated {
+            truncated = true;
+            break;
+        }
     }
     Ok((bytes, truncated))
 }
@@ -1446,11 +1508,19 @@ fn load_metadata_blob(oid: &str) -> Result<String, CliError> {
         .map_err(|e| CliError::fatal(format!("invalid metadata_blob_oid '{oid}': {e}")))?;
     let storage = util::try_get_storage_path(None)
         .map_err(|e| CliError::fatal(format!("not in a libra repository: {e}")))?;
-    let raw = read_git_object(&storage, &hash).map_err(|e| {
-        CliError::fatal(format!(
-            "failed to read metadata blob {oid} from object store: {e}"
-        ))
-    })?;
+    let (raw, truncated) =
+        read_git_object_bounded(&storage, &hash, CHECKPOINT_METADATA_READ_MAX_BYTES).map_err(
+            |e| {
+                CliError::fatal(format!(
+                    "failed to read metadata blob {oid} from object store: {e}"
+                ))
+            },
+        )?;
+    if truncated {
+        return Err(CliError::fatal(format!(
+            "metadata blob {oid} exceeds the metadata size cap; refusing (corrupt or hostile checkpoint)"
+        )));
+    }
     String::from_utf8(raw)
         .map_err(|e| CliError::fatal(format!("metadata blob {oid} is not UTF-8: {e}")))
 }
