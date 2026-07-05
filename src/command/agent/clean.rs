@@ -10,6 +10,15 @@
 //! `refs/libra/traces` so pruned temporary checkpoints stop being
 //! reachable. Older DB-only fixtures with an empty ref still get the catalog
 //! cleanup without a rewrite.
+//!
+//! AG-20 prune safety: the underlying
+//! [`HistoryManager::prune_checkpoint_commits`] fails closed while a
+//! checkpoint write is in flight (live in-flight marker, window A/B) or when
+//! `refs/libra/traces` reaches commits missing from the checkpoint catalog
+//! (window-B residue — `libra agent doctor --repair` territory). It also
+//! emits the `agent.clean.prune` span (deleted_objects / deleted_sessions /
+//! window_guard / duration_ms) and drops `object_index` rows for OIDs the
+//! prune made unreachable.
 
 use std::sync::Arc;
 
@@ -18,7 +27,11 @@ use serde::Serialize;
 
 use super::CleanArgs;
 use crate::{
-    internal::{ai::history::HistoryManager, branch::TRACES_BRANCH, db::get_db_conn_instance},
+    internal::{
+        ai::history::{CheckpointPruneGuardError, HistoryManager},
+        branch::TRACES_BRANCH,
+        db::get_db_conn_instance,
+    },
     utils::{
         client_storage::ClientStorage,
         error::{CliError, CliResult},
@@ -33,6 +46,11 @@ struct CleanReport {
     temporary_checkpoints_dropped: u64,
     retained_checkpoints_rewritten: usize,
     traces_ref_rewritten: bool,
+    /// Which AG-20 window-guard path the prune took (`noop` /
+    /// `markers_and_catalog_verified`).
+    window_guard: &'static str,
+    /// `object_index` rows dropped for OIDs the prune made unreachable.
+    object_index_rows_dropped: u64,
     note: &'static str,
 }
 
@@ -47,6 +65,8 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
                 temporary_checkpoints_dropped: 0,
                 retained_checkpoints_rewritten: 0,
                 traces_ref_rewritten: false,
+                window_guard: "noop",
+                object_index_rows_dropped: 0,
                 note: "agent_checkpoint table not present (run `libra init`?)",
             },
             output,
@@ -71,7 +91,7 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
     let prune = history
         .prune_checkpoint_commits(&checkpoint_ids)
         .await
-        .map_err(|e| CliError::fatal(format!("failed to prune traces checkpoints: {e}")))?;
+        .map_err(map_prune_error)?;
 
     emit_report(
         &CleanReport {
@@ -79,11 +99,35 @@ pub async fn execute_safe(args: CleanArgs, output: &OutputConfig) -> CliResult<(
             temporary_checkpoints_dropped: prune.removed_checkpoints,
             retained_checkpoints_rewritten: prune.rewritten_checkpoints,
             traces_ref_rewritten: prune.ref_rewritten,
+            window_guard: prune.window_guard,
+            object_index_rows_dropped: prune.deleted_object_index_rows,
             note: "temporary checkpoint rows were dropped; reachable traces history was \
                    rewritten when checkpoint commits existed",
         },
         output,
     )
+}
+
+/// Map a prune failure to an actionable CLI error, keeping the AG-20
+/// window-guard refusals distinguishable (they are deterministic and
+/// user-resolvable, not storage corruption).
+fn map_prune_error(err: anyhow::Error) -> CliError {
+    match err.downcast_ref::<CheckpointPruneGuardError>() {
+        Some(CheckpointPruneGuardError::LiveWriterMarker { .. }) => {
+            CliError::conflict(format!("{err}"))
+                .with_hint("an external-agent checkpoint write is still in flight")
+                .with_hint(
+                    "retry once the write completes; a crashed writer's marker expires \
+                     automatically after its TTL",
+                )
+        }
+        Some(CheckpointPruneGuardError::RefCatalogOrphans { .. }) => {
+            CliError::conflict(format!("{err}"))
+                .with_hint("run 'libra agent doctor --repair' to backfill the checkpoint catalog")
+                .with_hint("then re-run 'libra agent clean'")
+        }
+        None => CliError::fatal(format!("failed to prune traces checkpoints: {err:#}")),
+    }
 }
 
 fn session_scope_sql(all: bool) -> &'static str {
@@ -110,6 +154,10 @@ fn emit_report(report: &CleanReport, output: &OutputConfig) -> CliResult<()> {
     println!(
         "Temporary checkpoints dropped : {}",
         report.temporary_checkpoints_dropped
+    );
+    println!(
+        "Object index rows dropped     : {}",
+        report.object_index_rows_dropped
     );
     println!("Note                          : {}", report.note);
     Ok(())

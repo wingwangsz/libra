@@ -98,11 +98,17 @@ impl HookRepo {
     }
 
     fn sessions(&self) -> Vec<Value> {
-        json_data_array(&self.run(&["agent", "session", "list", "--json"], None, &[]))
+        json_data_rows(
+            &self.run(&["agent", "session", "list", "--json"], None, &[]),
+            "sessions",
+        )
     }
 
     fn checkpoints(&self) -> Vec<Value> {
-        json_data_array(&self.run(&["agent", "checkpoint", "list", "--json"], None, &[]))
+        json_data_rows(
+            &self.run(&["agent", "checkpoint", "list", "--json"], None, &[]),
+            "checkpoints",
+        )
     }
 
     fn envelope(&self, hook_event_name: &str, session_id: &str, extra: Value) -> String {
@@ -129,15 +135,17 @@ fn describe(out: &Output) -> String {
     )
 }
 
-fn json_data_array(out: &Output) -> Vec<Value> {
+/// AG-20 paged list payload: rows live under `data.<rows_key>`
+/// (`sessions` / `checkpoints`) next to `next_cursor`.
+fn json_data_rows(out: &Output, rows_key: &str) -> Vec<Value> {
     assert!(out.status.success(), "CLI query failed: {}", describe(out));
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: Value = serde_json::from_str(stdout.trim())
         .unwrap_or_else(|err| panic!("stdout is not JSON ({err}): {stdout}"));
     assert_eq!(parsed["ok"], json!(true), "envelope not ok: {parsed}");
-    parsed["data"]
+    parsed["data"][rows_key]
         .as_array()
-        .unwrap_or_else(|| panic!("data is not an array: {parsed}"))
+        .unwrap_or_else(|| panic!("data.{rows_key} is not an array: {parsed}"))
         .clone()
 }
 

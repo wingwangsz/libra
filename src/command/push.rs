@@ -208,6 +208,23 @@ impl PushArgs {
             no_progress: false,
         }
     }
+
+    /// Like [`Self::for_refspecs`] but with a `--force-with-lease=<spec>`
+    /// lease attached (`<refname>` or `<refname>:<expect>` forms). Used by
+    /// `libra agent push --force-rewrite`, whose Libra-managed
+    /// `refs/libra/traces` ref is rewritten wholesale by `agent clean`
+    /// prunes: the lease permits the non-fast-forward update while still
+    /// failing closed when the remote moved past the expected tip.
+    pub(crate) fn for_refspecs_with_lease(
+        repository: String,
+        refspecs: Vec<String>,
+        force_with_lease: String,
+    ) -> Self {
+        Self {
+            force_with_lease: Some(Some(force_with_lease)),
+            ..Self::for_refspecs(repository, refspecs)
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

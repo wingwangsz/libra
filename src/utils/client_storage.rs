@@ -38,7 +38,10 @@ use git_internal::{
 };
 use once_cell::sync::Lazy;
 use regex::Regex;
-use sea_orm::{ColumnTrait, DatabaseConnection, EntityTrait, QueryFilter};
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DatabaseConnection, DbErr, EntityTrait, QueryFilter, Statement,
+    Value,
+};
 use tokio::{
     runtime::Runtime,
     sync::mpsc::{Sender, channel, error::TrySendError},
@@ -1042,6 +1045,88 @@ pub(crate) fn enqueue_agent_blob_object_index_update(
             tracing::warn!("Failed to queue agent blob object index update: channel closed");
         }
     }
+}
+
+/// Delete `object_index` rows for the given OIDs in the current repo
+/// (AG-20 prune-side counterpart of
+/// [`enqueue_agent_blob_object_index_update`]).
+///
+/// Functional scope:
+/// - Resolves the repo id the same way the indexing writer does
+///   (`libra.repoid` config, falling back to `unknown-repo`) so the delete
+///   predicate matches the rows the writer created.
+/// - Deletes in bounded `IN (...)` chunks and returns the total number of
+///   rows removed. Idempotent: OIDs without a row simply delete nothing.
+///
+/// Boundary conditions:
+/// - Returns `Ok(0)` without touching anything when `oids` is empty or the
+///   `object_index` table does not exist (minimal test databases).
+/// - `pub(crate)` — callers must already have proven the OIDs unreachable
+///   (only `HistoryManager::commit_checkpoint_prune` today); there is no
+///   reachability validation here.
+pub(crate) async fn remove_object_index_rows_with_conn<C: ConnectionTrait>(
+    conn: &C,
+    oids: &[String],
+) -> Result<u64, DbErr> {
+    if oids.is_empty() {
+        return Ok(0);
+    }
+    let backend = conn.get_database_backend();
+    let table_exists = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'object_index' LIMIT 1"
+                .to_string(),
+        ))
+        .await?
+        .is_some();
+    if !table_exists {
+        return Ok(0);
+    }
+
+    // Resolve the repo id exactly like the indexing writer
+    // (`resolve_repo_id_for_index`): `libra.repoid` config with an
+    // `unknown-repo` fallback — including on lookup failure, mirroring the
+    // writer's tolerance so the delete predicate matches the rows it wrote
+    // (a wrong fallback merely deletes nothing, which is safe).
+    let repo_id = match conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT value FROM config_kv WHERE key = 'libra.repoid' ORDER BY id DESC LIMIT 1"
+                .to_string(),
+        ))
+        .await
+    {
+        Ok(Some(row)) => match row.try_get_by::<String, _>("value") {
+            Ok(value) if !value.trim().is_empty() => value,
+            _ => "unknown-repo".to_string(),
+        },
+        Ok(None) => "unknown-repo".to_string(),
+        Err(err) => {
+            tracing::debug!(
+                "failed to resolve repo id for object index cleanup, using fallback: {err}"
+            );
+            "unknown-repo".to_string()
+        }
+    };
+
+    // SQLite's default host-parameter limit is generous (32k), but keep the
+    // chunks small so a huge prune cannot produce pathological statements.
+    const DELETE_CHUNK: usize = 200;
+    let mut deleted = 0_u64;
+    for chunk in oids.chunks(DELETE_CHUNK) {
+        let placeholders = vec!["?"; chunk.len()].join(", ");
+        let sql =
+            format!("DELETE FROM object_index WHERE repo_id = ? AND o_id IN ({placeholders})");
+        let mut values: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+        values.push(Value::from(repo_id.clone()));
+        values.extend(chunk.iter().map(|oid| Value::from(oid.clone())));
+        let result = conn
+            .execute(Statement::from_sql_and_values(backend, sql, values))
+            .await?;
+        deleted += result.rows_affected();
+    }
+    Ok(deleted)
 }
 
 #[async_trait]

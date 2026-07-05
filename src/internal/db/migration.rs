@@ -728,6 +728,16 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070801_worktree_isolation.sql"),
             include_str!("../../../sql/migrations/2026070801_worktree_isolation_down.sql"),
         ),
+        // AG-20 (plan.md Task A5): `agent_checkpoint.traces_commit` probe
+        // index (deliberately NON-unique — see the .sql header for the
+        // brick-avoidance rationale) plus keyset pagination indexes for
+        // `agent session list` / `agent checkpoint list`.
+        sql_migration(
+            2026070802,
+            "agent_checkpoint_paging",
+            include_str!("../../../sql/migrations/2026070802_agent_checkpoint_paging.sql"),
+            include_str!("../../../sql/migrations/2026070802_agent_checkpoint_paging_down.sql"),
+        ),
     ]
 }
 
@@ -856,9 +866,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 21);
+        assert_eq!(runner.len(), 22);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070801));
+        assert_eq!(runner.max_registered_version(), Some(2026070802));
     }
 
     #[test]

@@ -134,9 +134,9 @@ async fn agent_capture_rollback_drops_tables_and_indexes_only() {
     assert_eq!(
         rolled_back,
         vec![
-            2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202,
-            2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101,
-            2026052301, 2026050801, 2026050601, 2026050501, 2026050303
+            2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301,
+            2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201,
+            2026053101, 2026052301, 2026050801, 2026050601, 2026050501, 2026050303
         ]
     );
 
@@ -175,6 +175,80 @@ async fn agent_capture_up_down_up_round_trip() {
     assert!(applied_again.contains(&2026050501));
     assert!(table_exists(&conn, "agent_session").await);
     assert!(table_exists(&conn, "agent_checkpoint").await);
+}
+
+/// AG-20 (plan.md Task A5): the `2026070802_agent_checkpoint_paging`
+/// migration survives an up → down → up round-trip. Forward creates the
+/// (deliberately non-unique) `traces_commit` probe index plus the two
+/// keyset-pagination indexes; the paired down drops exactly those three
+/// and nothing else; a second up re-creates them without collision.
+#[tokio::test]
+async fn agent_checkpoint_paging_up_down_up_round_trip() {
+    let (_dir, url) = fresh_db_url();
+    let conn = connect(&url).await;
+    let runner = registered_runner();
+
+    let paging_indexes = [
+        "idx_agent_checkpoint_traces_commit",
+        "idx_agent_session_started_paging",
+        "idx_agent_checkpoint_created_paging",
+    ];
+
+    // Up: full registry applied → all three indexes exist.
+    let applied = runner.run_pending(&conn).await.expect("up #1");
+    assert!(applied.contains(&2026070802));
+    for index in paging_indexes {
+        assert!(index_exists(&conn, index).await, "missing {index} after up");
+    }
+
+    // The traces_commit index must be NON-unique (brick-avoidance decision
+    // documented in the migration): duplicate traces_commit rows in a
+    // legacy DB must not fail the automatic upgrade.
+    let backend = conn.get_database_backend();
+    let unique_row = conn
+        .query_one(Statement::from_string(
+            backend,
+            "SELECT COUNT(*) AS n FROM sqlite_master WHERE type = 'index' \
+             AND name = 'idx_agent_checkpoint_traces_commit' \
+             AND sql LIKE '%UNIQUE%'"
+                .to_string(),
+        ))
+        .await
+        .expect("query index uniqueness")
+        .expect("count row");
+    let unique_count: i64 = unique_row.try_get_by("n").expect("decode count");
+    assert_eq!(
+        unique_count, 0,
+        "idx_agent_checkpoint_traces_commit must be a plain (non-UNIQUE) index"
+    );
+
+    // Down: roll only this migration off; the indexes disappear while the
+    // underlying tables stay.
+    let rolled = runner
+        .rollback_to(&conn, 2026070801)
+        .await
+        .expect("rollback_to(2026070801)");
+    assert_eq!(rolled, vec![2026070802]);
+    for index in paging_indexes {
+        assert!(
+            !index_exists(&conn, index).await,
+            "{index} must be dropped by the down migration"
+        );
+    }
+    assert!(table_exists(&conn, "agent_session").await);
+    assert!(table_exists(&conn, "agent_checkpoint").await);
+    // Pre-existing agent_capture indexes are untouched by the down.
+    assert!(index_exists(&conn, "idx_agent_checkpoint_session").await);
+
+    // Up again: re-creates the indexes with no `IF NOT EXISTS` collision.
+    let reapplied = runner.run_pending(&conn).await.expect("up #2");
+    assert_eq!(reapplied, vec![2026070802]);
+    for index in paging_indexes {
+        assert!(
+            index_exists(&conn, index).await,
+            "{index} must exist after re-applying"
+        );
+    }
 }
 
 /// CEX-EntireIO Phase 2 follow-up: `agent_checkpoint.parent_commit` must be

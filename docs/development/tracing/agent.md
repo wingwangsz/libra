@@ -824,6 +824,8 @@ provider hook/RPC stdin
 - `events/lifecycle.jsonl`：E3-JSONL canonical event；**不**写 `prompt.txt`/`context.md` 为独立 sidecar。
 - `transcript/<agent_kind>.jsonl`：redacted transcript bytes；非 JSONL 源格式可写 `.bin`，manifest 声明 `media_type`/`format`。
 - `redaction_report.json`：规则命中统计，不含原文。
+- `content_hash.txt`（AG-20 冻结定义，writer 实现 `history::checkpoint_content_hash`）：`sha256:<64-lowercase-hex>`、无换行；对 manifest `content_hash.coverage` 声明顺序（`metadata`、`lifecycle_events`、`transcript`、`redaction_report`）下各 entry 字节的**串联**做 sha256。transcript 取逻辑（分片重组后）字节流，因此 hash 对 E5 分片不变；`manifest.json`（在 hash 之后写入、声明包括 content_hash 在内的全部 entry）与 `content_hash.txt` 自身不在覆盖内（自引用不可能）。reader 兼容 legacy 裸 hex（与 E4-entire 表同口径，helper `history::parse_content_hash`）。
+- `metadata.json` external schema v2（AG-20，additive）：v1 全字段保留，新增 `model`（取触发 lifecycle event 的 model，缺失时写 `"unknown"`，镜像 E4-entire 容忍）。
 - 仍保留 `refs/libra/traces`、SQLite `agent_*` catalog 与 Libra object 存储。
 - import/reader：须能读 E4-entire fixture 并映射到 Libra canonical layout；export 默认输出 E4-libra。
 

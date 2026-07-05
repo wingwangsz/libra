@@ -14,8 +14,8 @@ libra agent remove [<name>...]
 libra agent session <subcommand>
 libra agent checkpoint <subcommand>
 libra agent clean [--all]
-libra agent doctor
-libra agent push [--remote <name>]
+libra agent doctor [--repair]
+libra agent push [--remote <name>] [--force-rewrite]
 libra agent rpc <subcommand>
 ```
 
@@ -44,9 +44,9 @@ libra agent rpc <subcommand>
 | `checkpoint list` | 列出已捕获 checkpoint |
 | `checkpoint show <id>` | 显示 checkpoint 元数据 |
 | `checkpoint rewind <id>` | 检查或应用某个 checkpoint 的工作树回退 |
-| `clean` | 清理已停止会话的临时 checkpoint |
-| `doctor` | 诊断 hook 安装和捕获状态 |
-| `push` | 将 `refs/libra/traces` 推送到远程 |
+| `clean` | 清理已停止会话的临时 checkpoint（prune 遇到进行中的 checkpoint 写入或 traces 引用可达但无 catalog 行的提交时 fail-closed 拒绝；同时删除因此不可达的 `object_index` 行） |
+| `doctor` | 诊断 hook 安装和捕获状态；检测（`--repair` 时修复）checkpoint 存储不一致 |
+| `push` | 将 `refs/libra/traces` 推送到远程（`clean` prune 重写后的非快进推送用 `--force-rewrite`，采用 force-with-lease 语义） |
 | `rpc list` | 列出 `PATH` 上发现的 `libra-agent-*` 二进制（含 trusted/quarantined 状态）；需先开启 external-agents 开关 |
 | `rpc trust <slug>` | 信任一个已发现的二进制——记录 path + sha256 + device/inode/mtime 来源（所在目录 world-writable 时拒绝） |
 | `rpc untrust <slug>` | 撤销信任；二进制回到隔离状态（始终可用，不受开关限制） |
@@ -57,9 +57,13 @@ libra agent rpc <subcommand>
 | 标志 | 子命令 | 说明 |
 |------|------------|-------------|
 | `--agent <name>` | `enable`, `disable` | 选择代理名称；省略时针对支持 roster（`add`/`remove` 以位置参数接收名称） |
+| `--limit <n>` | `session list`, `checkpoint list` | 每页最大行数（默认 50，硬上限 500——超过时钳制并在 stderr 提示；`0` 按 `1` 处理） |
+| `--cursor <cursor>` | `session list`, `checkpoint list` | 上一页 `next_cursor` 返回的不透明 keyset 游标；不要手工构造 |
 | `--extract-transcript <path>` | `session show` | 将会话元数据中的已捕获 transcript 路径复制到本地文件 |
 | `--all` | `clean` | 清理所有已停止会话的 checkpoint，而不只是最近一个 |
+| `--repair` | `doctor` | 修复检测到的 checkpoint 存储不一致（从 `refs/libra/traces` 重建过期/缺失的 catalog 行，补插缺失的 `object_index` 行）；省略时仅检测 |
 | `--remote <name>` | `push` | 选择用于推送代理 trace 引用的远程 |
+| `--force-rewrite` | `push` | 允许本地 `clean` prune 之后的非快进推送（traces 引用由 Libra 托管，prune 即整链重写）；采用针对本仓库最近一次推送记录的 force-with-lease 语义——绝非无条件 force——远程被别处重写时仍 fail-closed 拒绝 |
 | `--dry-run` | `checkpoint rewind` | 显示影响而不修改文件；这是默认值 |
 | `--apply` | `checkpoint rewind` | 恢复所选 checkpoint 的工作树 |
 
@@ -75,6 +79,10 @@ libra --json agent rpc list
 ```
 
 `agent list --json` 携带稳定的 `schema_version` 与每个已知代理一行（`slug`、`agent_kind`、`stability`、`supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`installed`、`launchable_review`、`launchable_investigate`、`external_binary`、`config_paths`、`protected_dirs`、`capabilities`）。行结构是面向自动化的冻结契约。
+
+`agent session list --json` 与 `agent checkpoint list --json` 每次返回一页：`data` 携带 `schema_version`、位于 `sessions` / `checkpoints` 下的行（单行结构不变），以及 `next_cursor`——传回 `--cursor` 的不透明游标，列表耗尽时为 `null`。页序为最新在前（`started_at` / `created_at` 降序，行 id 作为并列时的次序键）。
+
+`agent checkpoint show --json` 额外报告 `layout` 摘要（`e4-libra`、`legacy-v1` 表示 AG-20 之前的存量 checkpoint、`unknown` 表示 checkpoint tree 本地不可读），包含 manifest 角色、按 manifest 顺序列出的 transcript 分片、`content_hash` 格式校验，以及 transcript `availability` 标志（`present`/`missing`/`unknown`）——全程不读取 transcript blob 内容。
 
 ## 示例
 
@@ -118,6 +126,10 @@ libra agent session resume <session-id>
 # 列出已捕获 checkpoint
 libra agent checkpoint list
 
+# 分页浏览 checkpoint（默认每页 50；JSON 携带 next_cursor）
+libra agent checkpoint list --limit 100
+libra agent checkpoint list --cursor <next_cursor>
+
 # 按 id 显示单个 checkpoint
 libra agent checkpoint show <id>
 
@@ -139,6 +151,9 @@ libra agent push
 # 将 refs/libra/traces 推送到具名远程
 libra agent push --remote origin
 
+# `libra agent clean` 重写 traces 链后重新推送（force-with-lease）
+libra agent push --force-rewrite
+
 # 发现 PATH 上的 libra-agent-<name> RPC 二进制文件
 libra agent rpc list
 
@@ -158,3 +173,22 @@ libra agent --json status
 - 顶层 `agent hooks` 入口是隐藏的，面向由 `libra agent enable` 安装的 hook 配置；用户通常不会直接调用它。
 - `checkpoint rewind --apply` 只恢复工作树文件；代理自身的 transcript 文件不会被重写。
 - Hook 和捕获诊断采用 best-effort 方式，设计目标是报告可操作的安装状态，而不是静默忽略缺失的提供商。
+
+### Doctor checkpoint 存储修复（`--repair`）
+
+`libra agent doctor` 按 AG-20 修复矩阵扫描 checkpoint 存储的三类不一致；不带 `--repair` 时严格只读，仅报告 `--repair` 将执行的动作：
+
+| `inconsistency_type` | 含义 | `--repair` 动作 |
+|----------------------|------|----------------|
+| `stale_catalog_row` | `agent_checkpoint` 行的 `traces_commit`/`tree_oid`/`metadata_blob_oid` 与仍可从 `refs/libra/traces` 到达的 checkpoint 不一致 | 从 ref 重建该行的 OID 列（幂等 UPDATE） |
+| `missing_objects` | checkpoint 对象在对象库中真正缺失（且无法从 ref 重建）——检查覆盖完整 E4 树：`manifest.json`、`events/lifecycle.jsonl`、`transcript/<agent_kind>.jsonl`（含分片）、`redaction_report.json`、`content_hash.txt`、中间 tree，以及 manifest 声明的全部 blob | 无——标记 `manual_required`；doctor 绝不执行破坏性动作（可尝试 `libra fsck --heal` 或从云端/备份恢复） |
+| `missing_catalog_row` | ref 可达的 checkpoint 没有 catalog 行（崩溃窗口 B 残留） | 通过 writer 同款「先探测再插入」的幂等路径重插该行，字段从 commit 的 `metadata.json` 重建（v1 与 v2 两种 shape 均可解析） |
+| `missing_object_index` | checkpoint 对象在 `object_index` 中缺行（`libra cloud sync` 看不到）——覆盖 traces commit 加完整 E4 对象集 | 按 writer 行语义幂等补插（tree 记 `tree`，transcript blob 记 `agent_transcript`，sidecar 记 `blob`） |
+
+补充规则：
+
+- **legacy-v1 checkpoint**（升级前布局，无 `manifest.json`）计入 `legacy_v1_checkpoints`，永不进入三类不一致，也永不被 `--repair` 改写。
+- 被**存活的 traces in-flight marker** 覆盖的 checkpoint 是写入中的 writer，不算不一致，会被跳过。
+- **没有 checkpoint 的 session 是合法中间态**（active session 尚未产生首个 stop），绝不被标记；只有 checkpoint-without-session 才算 orphan。
+- 已捕获的 **gemini 行保持可读**且绝不被标记；残留的 gemini hook **配置**会得到指向仅卸载通道（`libra agent remove gemini`）的提示。
+- 所有修复均幂等——连续两次运行 `doctor --repair`，第二次不会做任何事。带 `--repair` 时，每次修复尝试发出一个 `agent.doctor.repair` tracing span（`inconsistency_type`、`repaired`、`manual_required`），transcript 内容绝不进入日志。

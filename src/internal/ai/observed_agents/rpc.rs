@@ -286,12 +286,32 @@ impl RpcAgent {
         if let Some(root) = repo_root {
             command.env("LIBRA_REPO_ROOT", root);
         }
-        let child = command.spawn().with_context(|| {
-            format!(
-                "spawn libra-agent binary at {}",
-                binary.binary_path.display()
-            )
-        })?;
+        // Retry briefly on ETXTBSY (os error 26): when another thread in
+        // this process forks while a just-written executable still has a
+        // write fd open (inherited across the fork), the first exec can
+        // transiently fail with "Text file busy". Seen under parallel
+        // test load; a bounded retry is the standard mitigation and is
+        // harmless for real spawns.
+        let child = {
+            let mut attempt = 0u8;
+            loop {
+                match command.spawn() {
+                    Ok(child) => break child,
+                    Err(err) if err.raw_os_error() == Some(26 /* ETXTBSY */) && attempt < 5 => {
+                        attempt += 1;
+                        std::thread::sleep(Duration::from_millis(20));
+                    }
+                    Err(err) => {
+                        return Err(err).with_context(|| {
+                            format!(
+                                "spawn libra-agent binary at {}",
+                                binary.binary_path.display()
+                            )
+                        });
+                    }
+                }
+            }
+        };
 
         // RAII guard: if anything below `?`s out, drop kills+reaps
         // the child so we never leak a running process. On the

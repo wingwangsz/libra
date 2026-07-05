@@ -622,6 +622,109 @@ fn extract_model(payload: &Map<String, Value>) -> Option<Value> {
         .cloned()
 }
 
+/// Schema version stamped on every canonical lifecycle JSONL line
+/// (`events/lifecycle.jsonl` inside an E4-libra checkpoint tree and the
+/// session-level append-only log share this schema — E3-JSONL in
+/// `docs/development/tracing/agent.md`). Bump only additively.
+pub const LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION: u32 = 1;
+
+/// Identity fields shared by every canonical lifecycle JSONL line for one
+/// (session, ingest) context. Split out so multi-event batches serialise
+/// with one context instead of repeating four arguments per event.
+#[derive(Debug, Clone)]
+pub struct CanonicalEventContext<'a> {
+    /// `agent_session.agent_kind` snake_case tag (`AgentKind::as_db_str`).
+    pub agent_kind: &'a str,
+    /// Libra's namespaced session id (`<provider>__<provider_session_id>`).
+    pub session_id: &'a str,
+    /// The provider's native session id, preserved verbatim.
+    pub provider_session_id: &'a str,
+    /// Free-form provenance object (e.g. `{"channel":"hook",
+    /// "hook_event_name":"Stop"}`). Never carries raw envelope payload.
+    pub provenance: Value,
+}
+
+/// Serialise one **already-redacted** [`LifecycleEvent`] into the canonical
+/// E3-JSONL object (`schema_version`, `event_id`, `kind`, `agent_kind`,
+/// `session_id`, `provider_session_id`, `timestamp`, `source`, `partial`,
+/// `provenance` + per-kind optional fields).
+///
+/// The caller owns redaction: this function performs none, so it must only
+/// ever see events that already passed the ingest redaction pass.
+pub fn lifecycle_event_canonical_json(
+    event: &LifecycleEvent,
+    ctx: &CanonicalEventContext,
+) -> Value {
+    let mut obj = Map::new();
+    obj.insert(
+        "schema_version".to_string(),
+        json!(LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION),
+    );
+    obj.insert("event_id".to_string(), json!(event.event_id().to_string()));
+    obj.insert("kind".to_string(), json!(event.event_kind()));
+    obj.insert("agent_kind".to_string(), json!(ctx.agent_kind));
+    obj.insert("session_id".to_string(), json!(ctx.session_id));
+    obj.insert(
+        "provider_session_id".to_string(),
+        json!(ctx.provider_session_id),
+    );
+    obj.insert("timestamp".to_string(), json!(event.timestamp.to_rfc3339()));
+    obj.insert(
+        "source".to_string(),
+        event.source.clone().unwrap_or(Value::Null),
+    );
+    // Only fully-validated events reach persistence; partially-parsed ones
+    // are skipped-and-logged upstream and never serialised.
+    obj.insert("partial".to_string(), json!(false));
+    obj.insert("provenance".to_string(), ctx.provenance.clone());
+
+    // Per-kind optional fields, present only when the event carries them.
+    if let Some(prompt) = &event.prompt {
+        obj.insert("prompt".to_string(), json!(prompt));
+    }
+    if let Some(model) = &event.model {
+        obj.insert("model".to_string(), model.clone());
+    }
+    if let Some(tool_name) = &event.tool_name {
+        obj.insert("tool_name".to_string(), json!(tool_name));
+    }
+    if let Some(tool_input) = &event.tool_input {
+        obj.insert("tool_input".to_string(), tool_input.clone());
+    }
+    if let Some(tool_response) = &event.tool_response {
+        obj.insert("tool_response".to_string(), tool_response.clone());
+    }
+    if let Some(message) = &event.assistant_message {
+        obj.insert("assistant_message".to_string(), json!(message));
+    }
+    if let Some(session_ref) = &event.session_ref {
+        obj.insert("session_ref".to_string(), json!(session_ref));
+    }
+    Value::Object(obj)
+}
+
+/// Serialise a batch of already-redacted lifecycle events as canonical
+/// JSONL bytes — one [`lifecycle_event_canonical_json`] object per line,
+/// each line newline-terminated. This is the byte stream the E4-libra
+/// checkpoint writer lands at `events/lifecycle.jsonl`; today's writer
+/// passes the single triggering event, but the slice signature keeps
+/// multi-event batches (e.g. buffered turn replays) source-compatible.
+pub fn lifecycle_events_to_canonical_jsonl(
+    events: &[&LifecycleEvent],
+    ctx: &CanonicalEventContext,
+) -> Vec<u8> {
+    let mut out = Vec::new();
+    for event in events {
+        let line = lifecycle_event_canonical_json(event, ctx);
+        // A `serde_json::Value` never fails to serialise; fall back to an
+        // empty object rather than propagating an impossible error.
+        let serialized = serde_json::to_vec(&line).unwrap_or_else(|_| b"{}".to_vec());
+        out.extend_from_slice(&serialized);
+        out.push(b'\n');
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -800,5 +903,89 @@ mod tests {
             extra: Map::new(),
         };
         assert!(validate_session_hook_envelope(&envelope, 4096).is_err());
+    }
+
+    // -------------------------------------------------------------------
+    // AG-20: canonical E3-JSONL serialisation for events/lifecycle.jsonl
+    // -------------------------------------------------------------------
+
+    fn canonical_test_event(kind: LifecycleEventKind) -> LifecycleEvent {
+        LifecycleEvent {
+            kind,
+            session_id: "provider-sess-1".to_string(),
+            session_ref: Some("/home/u/.claude/t.jsonl".to_string()),
+            prompt: Some("redacted prompt".to_string()),
+            model: Some(json!("claude-sonnet-4-5")),
+            source: Some(json!("startup")),
+            tool_name: None,
+            tool_input: None,
+            tool_response: None,
+            assistant_message: None,
+            timestamp: DateTime::parse_from_rfc3339("2026-07-05T01:02:03Z")
+                .unwrap()
+                .with_timezone(&Utc),
+        }
+    }
+
+    fn canonical_test_ctx() -> CanonicalEventContext<'static> {
+        CanonicalEventContext {
+            agent_kind: "claude_code",
+            session_id: "claude__provider-sess-1",
+            provider_session_id: "provider-sess-1",
+            provenance: json!({"channel": "hook", "hook_event_name": "Stop"}),
+        }
+    }
+
+    /// Every canonical line carries the E3-JSONL required keys with the
+    /// pinned wire spellings, plus the per-kind optional fields present on
+    /// the event.
+    #[test]
+    fn canonical_event_json_carries_required_e3_fields() {
+        let event = canonical_test_event(LifecycleEventKind::TurnEnd);
+        let line = lifecycle_event_canonical_json(&event, &canonical_test_ctx());
+
+        assert_eq!(
+            line["schema_version"],
+            json!(LIFECYCLE_EVENT_JSONL_SCHEMA_VERSION)
+        );
+        assert_eq!(line["kind"], json!("turn_end"));
+        assert_eq!(line["agent_kind"], json!("claude_code"));
+        assert_eq!(line["session_id"], json!("claude__provider-sess-1"));
+        assert_eq!(line["provider_session_id"], json!("provider-sess-1"));
+        assert_eq!(line["partial"], json!(false));
+        assert_eq!(line["provenance"]["channel"], json!("hook"));
+        assert_eq!(line["source"], json!("startup"));
+        assert_eq!(line["prompt"], json!("redacted prompt"));
+        assert_eq!(line["model"], json!("claude-sonnet-4-5"));
+        // event_id is the deterministic v5 UUID from the event identity.
+        assert_eq!(
+            line["event_id"],
+            json!(event.event_id().to_string()),
+            "event_id must match the Event-trait derivation"
+        );
+        // RFC3339 timestamp.
+        let ts = line["timestamp"].as_str().unwrap();
+        chrono::DateTime::parse_from_rfc3339(ts).expect("timestamp must be RFC3339");
+        // Absent optional fields stay absent (no null noise).
+        assert!(line.get("tool_name").is_none());
+        assert!(line.get("assistant_message").is_none());
+    }
+
+    /// Batch serialisation writes exactly one newline-terminated JSON
+    /// object per event, in order.
+    #[test]
+    fn canonical_jsonl_is_one_line_per_event_in_order() {
+        let start = canonical_test_event(LifecycleEventKind::SessionStart);
+        let end = canonical_test_event(LifecycleEventKind::SessionEnd);
+        let ctx = canonical_test_ctx();
+        let bytes = lifecycle_events_to_canonical_jsonl(&[&start, &end], &ctx);
+        let text = String::from_utf8(bytes).unwrap();
+        assert!(text.ends_with('\n'), "JSONL must be newline-terminated");
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2);
+        let first: Value = serde_json::from_str(lines[0]).unwrap();
+        let second: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(first["kind"], json!("session_start"));
+        assert_eq!(second["kind"], json!("session_end"));
     }
 }

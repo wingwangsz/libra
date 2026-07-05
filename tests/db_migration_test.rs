@@ -49,7 +49,8 @@ fn builtin_migrations_register_current_schema_migrations() {
         vec![
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
-            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801
+            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
+            2026070802
         ]
     );
     assert_eq!(
@@ -76,13 +77,14 @@ fn builtin_migrations_register_current_schema_migrations() {
             "object_obliteration",
             "sparse_view",
             "worktree_isolation",
+            "agent_checkpoint_paging",
         ]
     );
 
     let runner = builtin_runner().expect("builtin registry must build clean");
     assert!(!runner.is_empty());
-    assert_eq!(runner.len(), 21);
-    assert_eq!(runner.max_registered_version(), Some(2026070801));
+    assert_eq!(runner.len(), 22);
+    assert_eq!(runner.max_registered_version(), Some(2026070802));
 }
 
 // ---------------------------------------------------------------------------
@@ -1059,10 +1061,16 @@ async fn run_builtin_migrations_applies_current_builtin_registry() {
         vec![
             2026050301, 2026050302, 2026050303, 2026050501, 2026050601, 2026050801, 2026052301,
             2026053101, 2026060201, 2026060401, 2026060801, 2026061401, 2026062301, 2026070201,
-            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801
+            2026070202, 2026070301, 2026070401, 2026070501, 2026070601, 2026070701, 2026070801,
+            2026070802
         ]
     );
     assert!(table_exists(&conn, "schema_versions").await);
+    // AG-20 agent_checkpoint_paging: traces_commit probe index (non-unique
+    // by design) + keyset pagination indexes.
+    assert!(index_exists(&conn, "idx_agent_checkpoint_traces_commit").await);
+    assert!(index_exists(&conn, "idx_agent_session_started_paging").await);
+    assert!(index_exists(&conn, "idx_agent_checkpoint_created_paging").await);
     assert!(column_exists(&conn, "reference", "worktree_id").await);
     assert!(column_exists(&conn, "reflog", "worktree_id").await);
     assert!(table_exists(&conn, "sparse_view").await);
@@ -1123,9 +1131,9 @@ async fn approved_permission_up_down_up_round_trip() {
     assert_eq!(
         rolled,
         vec![
-            2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301, 2026070202,
-            2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201, 2026053101,
-            2026052301, 2026050801, 2026050601
+            2026070802, 2026070801, 2026070701, 2026070601, 2026070501, 2026070401, 2026070301,
+            2026070202, 2026070201, 2026062301, 2026061401, 2026060801, 2026060401, 2026060201,
+            2026053101, 2026052301, 2026050801, 2026050601
         ]
     );
     assert!(
@@ -1151,7 +1159,7 @@ async fn approved_permission_up_down_up_round_trip() {
         vec![
             2026050601, 2026050801, 2026052301, 2026053101, 2026060201, 2026060401, 2026060801,
             2026061401, 2026062301, 2026070201, 2026070202, 2026070301, 2026070401, 2026070501,
-            2026070601, 2026070701, 2026070801
+            2026070601, 2026070701, 2026070801, 2026070802
         ]
     );
     assert!(table_exists(&conn, "approved_permission").await);

@@ -125,6 +125,7 @@ helpers in `db.rs`. Subsequent CEXes have populated this directory.
 | `2026070601`  | `object_obliteration` | `2026070601_object_obliteration{,_down}.sql` (lore.md 2.5: intentional-absence tombstone registry; owner `internal::obliteration`) |
 | `2026070701`  | `sparse_view` | `2026070701_sparse_view{,_down}.sql` (lore.md 2.2: read-only sparse view include patterns; owner `internal::sparse`) |
 | `2026070801`  | `worktree_isolation` | `2026070801_worktree_isolation{,_down}.sql` (lore.md 2.1: per-worktree HEAD/index/HEAD-reflog isolation — adds `worktree_id` to `reference` + `reflog`) |
+| `2026070802`  | `agent_checkpoint_paging` | `2026070802_agent_checkpoint_paging{,_down}.sql` (AG-20: `agent_checkpoint(traces_commit)` probe index — deliberately NON-unique so legacy DBs with duplicate rows cannot brick the auto-upgrade; writer idempotency lives in code (probe-first + `ON CONFLICT(checkpoint_id) DO NOTHING`) — plus keyset pagination indexes `agent_session(started_at DESC, session_id)` and `agent_checkpoint(created_at DESC, checkpoint_id)`) |
 
 All registered migrations are loaded via `include_str!`. New migrations must
 follow the same pattern — inline SQL strings in `builtin_migrations()` are no

@@ -12,7 +12,10 @@ use git_internal::{
 use libra::{
     internal::{
         ai::{
-            history::{CheckpointCommitParams, CheckpointScope, HistoryManager},
+            history::{
+                AGENT_TRACES_INFLIGHT_TTL_MS, CheckpointCommitParams, CheckpointScope,
+                HistoryManager, TracesInflightMarker, write_traces_inflight_marker,
+            },
             observed_agents::Redactor,
         },
         branch::TRACES_BRANCH,
@@ -21,7 +24,7 @@ use libra::{
 };
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement, Value};
 
-use super::{assert_cli_success, init_repo_via_cli, run_libra_command};
+use super::{assert_cli_success, init_repo_via_cli, parse_json_stdout, run_libra_command};
 
 async fn connect_repo_db(repo: &Path) -> DatabaseConnection {
     let db_path = repo.join(".libra").join("libra.db");
@@ -123,8 +126,8 @@ async fn seed_checkpoint_commit(
             tool_use_id: None,
             metadata_json: metadata.as_bytes(),
             transcript_redacted: &redacted,
-            provider_name: "claude_code",
-            events_jsonl: None,
+            lifecycle_events_jsonl: b"{}\n",
+            redaction_report_json: b"{}",
         })
         .await
         .expect("append checkpoint commit");
@@ -282,6 +285,269 @@ async fn agent_clean_default_only_drops_most_recent_stopped_session() {
         checkpoint_exists(&conn, "cp-active-temp").await,
         "default clean must not drop temporary checkpoints for active sessions"
     );
+}
+
+/// AG-20 window A/B guard: ANY live in-flight writer marker — even for a
+/// session unrelated to the ones being pruned — blocks the prune
+/// fail-closed (the prune is a whole-chain rewrite, so the granularity is
+/// deliberately global). An expired marker stops blocking.
+#[tokio::test]
+async fn agent_clean_refuses_while_traces_write_marker_is_live() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+
+    let conn = connect_repo_db(repo.path()).await;
+    seed_session(&conn, "stopped-session", "stopped", 10, 20, 30).await;
+    seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "cc000000-0000-4000-8000-000000000001",
+        "stopped-session",
+        CheckpointScope::Temporary,
+        400,
+    )
+    .await;
+
+    // Live marker for an UNRELATED session: still blocks (global guard).
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let marker = TracesInflightMarker::new("unrelated-active-session", "attempt-live-1", now_ms);
+    write_traces_inflight_marker(&conn, &marker)
+        .await
+        .expect("write live in-flight marker");
+    conn.close().await.expect("close seed connection");
+
+    let output = run_libra_command(&["--quiet", "agent", "clean", "--all"], repo.path());
+    assert!(
+        !output.status.success(),
+        "clean must fail closed while a live in-flight marker exists"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("checkpoint write is in flight"),
+        "refusal must explain the in-flight write, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("unrelated-active-session") && stderr.contains("attempt-live-1"),
+        "refusal must name the blocking marker's session and attempt, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains(&AGENT_TRACES_INFLIGHT_TTL_MS.to_string()),
+        "refusal must state the marker TTL, stderr: {stderr}"
+    );
+
+    let conn = connect_repo_db(repo.path()).await;
+    assert!(
+        checkpoint_exists(&conn, "cc000000-0000-4000-8000-000000000001").await,
+        "a refused prune must not delete any checkpoint rows"
+    );
+
+    // Replace the marker with an expired one (upsert): the guard unblocks.
+    let expired = TracesInflightMarker::new(
+        "unrelated-active-session",
+        "attempt-live-1",
+        now_ms - AGENT_TRACES_INFLIGHT_TTL_MS - 60_000,
+    );
+    write_traces_inflight_marker(&conn, &expired)
+        .await
+        .expect("write expired in-flight marker");
+    conn.close().await.expect("close reseed connection");
+
+    let output = run_libra_command(&["--quiet", "agent", "clean", "--all"], repo.path());
+    assert_cli_success(&output, "clean succeeds once the marker expired");
+
+    let conn = connect_repo_db(repo.path()).await;
+    assert!(
+        !checkpoint_exists(&conn, "cc000000-0000-4000-8000-000000000001").await,
+        "the temporary checkpoint should be pruned once no live marker remains"
+    );
+}
+
+/// AG-20 window-B residue guard: when `refs/libra/traces` reaches commits
+/// with no `agent_checkpoint` catalog row (a crashed writer between ref CAS
+/// and catalog INSERT), the catalog-driven rebuild would drop them — the
+/// prune must refuse deterministically and defer to doctor.
+#[tokio::test]
+async fn agent_clean_refuses_when_traces_ref_reaches_uncataloged_commits() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+
+    let conn = connect_repo_db(repo.path()).await;
+    seed_session(&conn, "stopped-session", "stopped", 10, 20, 30).await;
+    seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "dd000000-0000-4000-8000-000000000001",
+        "stopped-session",
+        CheckpointScope::Temporary,
+        500,
+    )
+    .await;
+    seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "ee000000-0000-4000-8000-000000000002",
+        "stopped-session",
+        CheckpointScope::Committed,
+        501,
+    )
+    .await;
+    // Simulate window-B residue: the committed checkpoint's commit stays
+    // reachable from the ref, but its catalog row vanishes.
+    conn.execute(Statement::from_sql_and_values(
+        conn.get_database_backend(),
+        "DELETE FROM agent_checkpoint WHERE checkpoint_id = ?",
+        [Value::from("ee000000-0000-4000-8000-000000000002")],
+    ))
+    .await
+    .expect("drop catalog row to fabricate window-B residue");
+    let head_before = agent_traces_head(&conn).await;
+    conn.close().await.expect("close seed connection");
+
+    let output = run_libra_command(&["--quiet", "agent", "clean", "--all"], repo.path());
+    assert!(
+        !output.status.success(),
+        "clean must refuse while the ref reaches uncataloged commits"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("no agent_checkpoint catalog row"),
+        "refusal must explain the ref-vs-catalog mismatch, stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("libra agent doctor --repair"),
+        "refusal must point at doctor --repair, stderr: {stderr}"
+    );
+
+    let conn = connect_repo_db(repo.path()).await;
+    assert!(
+        checkpoint_exists(&conn, "dd000000-0000-4000-8000-000000000001").await,
+        "a refused prune must not delete the targeted temporary checkpoint"
+    );
+    assert_eq!(
+        agent_traces_head(&conn).await,
+        head_before,
+        "a refused prune must not move refs/libra/traces"
+    );
+}
+
+async fn object_index_row_count(conn: &DatabaseConnection, oids: &[String]) -> i64 {
+    let placeholders = vec!["?"; oids.len()].join(", ");
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            format!("SELECT COUNT(*) AS n FROM object_index WHERE o_id IN ({placeholders})"),
+            oids.iter().map(|oid| Value::from(oid.clone())),
+        ))
+        .await
+        .expect("query object_index")
+        .expect("count row");
+    row.try_get_by("n").expect("decode count")
+}
+
+async fn checkpoint_catalog_oids(conn: &DatabaseConnection, checkpoint_id: &str) -> Vec<String> {
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT traces_commit, tree_oid, metadata_blob_oid FROM agent_checkpoint \
+             WHERE checkpoint_id = ? LIMIT 1",
+            [Value::from(checkpoint_id)],
+        ))
+        .await
+        .expect("query checkpoint oids")
+        .expect("checkpoint row");
+    ["traces_commit", "tree_oid", "metadata_blob_oid"]
+        .into_iter()
+        .map(|column| row.try_get_by::<String, _>(column).expect("decode oid"))
+        .collect()
+}
+
+/// AG-20 object_index cleanup: pruning drops the index rows for OIDs the
+/// prune made unreachable — conservatively only the removed checkpoints'
+/// own commit/root-tree/metadata-blob OIDs — while retained checkpoints'
+/// rows survive. Re-running is an idempotent no-op.
+#[tokio::test]
+async fn agent_clean_drops_object_index_rows_only_for_removed_checkpoints() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+
+    let conn = connect_repo_db(repo.path()).await;
+    seed_session(&conn, "stopped-session", "stopped", 10, 20, 30).await;
+    seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "aa110000-0000-4000-8000-000000000001",
+        "stopped-session",
+        CheckpointScope::Temporary,
+        600,
+    )
+    .await;
+    seed_checkpoint_commit(
+        &conn,
+        repo.path(),
+        "bb110000-0000-4000-8000-000000000002",
+        "stopped-session",
+        CheckpointScope::Committed,
+        601,
+    )
+    .await;
+
+    let removed_oids = checkpoint_catalog_oids(&conn, "aa110000-0000-4000-8000-000000000001").await;
+    let retained_old_oids =
+        checkpoint_catalog_oids(&conn, "bb110000-0000-4000-8000-000000000002").await;
+
+    // The writer enqueues object_index rows on a background channel; wait
+    // for the seeded checkpoints' rows to land so the delete has real rows
+    // to act on.
+    let mut all_oids = removed_oids.clone();
+    all_oids.extend(retained_old_oids.iter().cloned());
+    all_oids.sort();
+    all_oids.dedup();
+    let expected = all_oids.len() as i64;
+    for _ in 0..200 {
+        if object_index_row_count(&conn, &all_oids).await >= expected {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert_eq!(
+        object_index_row_count(&conn, &all_oids).await,
+        expected,
+        "seeded checkpoint OIDs must be indexed before the prune"
+    );
+    conn.close().await.expect("close seed connection");
+
+    let output = run_libra_command(&["--json", "agent", "clean", "--all"], repo.path());
+    assert_cli_success(&output, "libra agent clean --all (object_index cleanup)");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["command"], "agent_clean");
+    assert_eq!(
+        json["data"]["window_guard"], "markers_and_catalog_verified",
+        "both prune guards must have run and passed"
+    );
+    assert_eq!(
+        json["data"]["object_index_rows_dropped"], 3,
+        "exactly the removed checkpoint's commit/tree/metadata rows are dropped"
+    );
+
+    let conn = connect_repo_db(repo.path()).await;
+    assert_eq!(
+        object_index_row_count(&conn, &removed_oids).await,
+        0,
+        "removed checkpoint OIDs must leave object_index"
+    );
+    assert_eq!(
+        object_index_row_count(&conn, &retained_old_oids).await,
+        retained_old_oids.len() as i64,
+        "retained checkpoint rows are conservatively kept (shared-OID safety)"
+    );
+    conn.close().await.expect("close verify connection");
+
+    // Idempotent: nothing left to prune, nothing further deleted.
+    let output = run_libra_command(&["--json", "agent", "clean", "--all"], repo.path());
+    assert_cli_success(&output, "second clean run is a no-op");
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["window_guard"], "noop");
+    assert_eq!(json["data"]["object_index_rows_dropped"], 0);
 }
 
 #[tokio::test]

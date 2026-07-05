@@ -48,15 +48,25 @@ pub const MAX_VALUE_LEN: usize = 1024 * 1024;
 /// The metadata scope. v1 supports `Branch`; the `scope` column is TEXT so
 /// future scopes (worktree, …; revision/file metadata use trailers/side-trees
 /// per lore.md 1.10, not this table) need no table rebuild.
+///
+/// `AgentTracesInflight` (AG-20) holds the external-agent checkpoint
+/// writer's in-progress markers: `target` = the Libra agent session id,
+/// `key` = the write attempt's checkpoint UUID, `value` = a JSON
+/// [`crate::internal::ai::history::TracesInflightMarker`]. The markers close
+/// the prune windows A/B described in
+/// `docs/development/tracing/agent.md` (write-sequence matrix): prune must
+/// treat OIDs/commits named by a live (non-expired) marker as reachable.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MetadataScope {
     Branch,
+    AgentTracesInflight,
 }
 
 impl MetadataScope {
     pub fn as_str(self) -> &'static str {
         match self {
             MetadataScope::Branch => "branch",
+            MetadataScope::AgentTracesInflight => "agent_traces_inflight",
         }
     }
 }
@@ -332,6 +342,25 @@ impl MetadataKv {
     ) -> Result<Vec<MetadataEntry>> {
         let db = get_db_conn_instance().await;
         Self::list_with_conn(&db, scope, target, key_prefix).await
+    }
+
+    /// List EVERY entry in a scope across all targets, ordered by
+    /// `(target, key)`. Needed by scopes whose consumers scan the whole
+    /// namespace rather than one target (e.g. the prune side of
+    /// [`MetadataScope::AgentTracesInflight`], which must see the in-flight
+    /// markers of every session).
+    pub async fn list_scope_with_conn<C: ConnectionTrait>(
+        db: &C,
+        scope: MetadataScope,
+    ) -> Result<Vec<MetadataEntry>> {
+        let rows = metadata_kv::Entity::find()
+            .filter(metadata_kv::Column::Scope.eq(scope.as_str()))
+            .order_by_asc(metadata_kv::Column::Target)
+            .order_by_asc(metadata_kv::Column::Key)
+            .all(db)
+            .await
+            .context("failed to list metadata_kv scope entries")?;
+        Ok(rows.iter().map(MetadataEntry::from_model).collect())
     }
 
     /// Delete every entry for a target (branch-delete cascade). Returns the

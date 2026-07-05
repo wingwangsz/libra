@@ -14,8 +14,8 @@ libra agent remove [<name>...]
 libra agent session <subcommand>
 libra agent checkpoint <subcommand>
 libra agent clean [--all]
-libra agent doctor
-libra agent push [--remote <name>]
+libra agent doctor [--repair]
+libra agent push [--remote <name>] [--force-rewrite]
 libra agent rpc <subcommand>
 ```
 
@@ -56,9 +56,9 @@ for any other non-roster agent — return an actionable unsupported error.
 | `checkpoint list` | List captured checkpoints |
 | `checkpoint show <id>` | Show checkpoint metadata |
 | `checkpoint rewind <id>` | Inspect or apply a working-tree rewind for one checkpoint |
-| `clean` | Clean up temporary checkpoints from stopped sessions |
-| `doctor` | Diagnose hook installation and capture state |
-| `push` | Push `refs/libra/traces` to a remote |
+| `clean` | Clean up temporary checkpoints from stopped sessions (prune fails closed while a checkpoint write is in flight or the traces ref reaches uncataloged commits; also drops `object_index` rows made unreachable) |
+| `doctor` | Diagnose hook installation and capture state; detect (and with `--repair` fix) checkpoint-store inconsistencies |
+| `push` | Push `refs/libra/traces` to a remote (`--force-rewrite` for the non-fast-forward push after a `clean` prune, using force-with-lease) |
 | `rpc list` | List discovered `libra-agent-*` binaries on `PATH` (with trusted/quarantined state); requires the external-agents opt-in |
 | `rpc trust <slug>` | Trust a discovered binary — records path + sha256 + device/inode/mtime provenance (refused when its directory is world-writable) |
 | `rpc untrust <slug>` | Revoke trust; the binary returns to quarantine (always available, even while external agents are disabled) |
@@ -69,9 +69,13 @@ for any other non-roster agent — return an actionable unsupported error.
 | Flag | Subcommand | Description |
 |------|------------|-------------|
 | `--agent <name>` | `enable`, `disable` | Select agent names; omit to target the supported roster (`add`/`remove` take the names positionally) |
+| `--limit <n>` | `session list`, `checkpoint list` | Maximum rows per page (default 50, hard cap 500 — larger values clamp with a stderr note; `0` is treated as `1`) |
+| `--cursor <cursor>` | `session list`, `checkpoint list` | Opaque keyset cursor from the previous page's `next_cursor`; do not construct by hand |
 | `--extract-transcript <path>` | `session show` | Copy the captured transcript path from session metadata to a local file |
 | `--all` | `clean` | Clean all stopped-session checkpoints instead of only the most recent |
+| `--repair` | `doctor` | Repair detected checkpoint-store inconsistencies (rebuild stale/missing catalog rows from `refs/libra/traces`, re-enqueue missing `object_index` rows); detection-only when omitted |
 | `--remote <name>` | `push` | Select the remote used for pushing agent trace refs |
+| `--force-rewrite` | `push` | Allow the non-fast-forward push that follows a local `clean` prune (the traces ref is Libra-managed and rewritten as a whole chain); uses force-with-lease against the last tip this repository pushed — never an unconditional force — so a remote rewritten elsewhere still fails closed |
 | `--dry-run` | `checkpoint rewind` | Show the impact without modifying files; this is the default |
 | `--apply` | `checkpoint rewind` | Restore the working tree for the selected checkpoint |
 
@@ -93,6 +97,20 @@ agent (`slug`, `agent_kind`, `stability`, `supported`, `support_wave`,
 `launchable_review`, `launchable_investigate`, `external_binary`,
 `config_paths`, `protected_dirs`, `capabilities`). The row shape is a frozen
 contract for automation.
+
+`agent session list --json` and `agent checkpoint list --json` return one
+page per call: `data` carries a `schema_version`, the rows under `sessions`
+/ `checkpoints` (per-row shape unchanged), and `next_cursor` — an opaque
+token to pass back via `--cursor`, `null` once the listing is exhausted.
+Pages are ordered newest-first (`started_at` / `created_at` descending,
+with the row id as tiebreaker).
+
+`agent checkpoint show --json` additionally reports a `layout` summary
+(`e4-libra`, `legacy-v1` for pre-AG-20 checkpoints, or `unknown` when the
+checkpoint tree is not locally readable) with the manifest roles, the
+transcript parts in manifest order, a `content_hash` format check, and a
+transcript `availability` flag (`present`/`missing`/`unknown`) — derived
+without reading transcript blob bodies.
 
 ## Examples
 
@@ -136,6 +154,10 @@ libra agent session resume <session-id>
 # List captured checkpoints
 libra agent checkpoint list
 
+# Page through checkpoints (default 50 per page; JSON carries next_cursor)
+libra agent checkpoint list --limit 100
+libra agent checkpoint list --cursor <next_cursor>
+
 # Show a single checkpoint by id
 libra agent checkpoint show <id>
 
@@ -156,6 +178,9 @@ libra agent push
 
 # Push refs/libra/traces to a named remote
 libra agent push --remote origin
+
+# Re-push after `libra agent clean` rewrote the traces chain (force-with-lease)
+libra agent push --force-rewrite
 
 # Discover libra-agent-<name> RPC binaries on PATH
 libra agent rpc list
@@ -192,3 +217,34 @@ CLI surface stay in sync (cross-cutting `--help` EXAMPLES rollout, see
   transcript file is not rewritten.
 - Hook and capture diagnostics are best-effort and are designed to report
   actionable installation state rather than silently ignoring missing providers.
+
+### Doctor checkpoint-store repair (`--repair`)
+
+`libra agent doctor` scans the checkpoint store for three inconsistency
+classes (AG-20 repair matrix); without `--repair` it is strictly read-only
+and reports what `--repair` would do:
+
+| `inconsistency_type` | Meaning | `--repair` action |
+|----------------------|---------|-------------------|
+| `stale_catalog_row` | An `agent_checkpoint` row's `traces_commit`/`tree_oid`/`metadata_blob_oid` disagree with the checkpoint still reachable from `refs/libra/traces` | Rebuild the row's OID columns from the ref (idempotent UPDATE) |
+| `missing_objects` | Checkpoint objects genuinely missing from the store (and the ref cannot rebuild them) — the check covers the full E4 tree: `manifest.json`, `events/lifecycle.jsonl`, `transcript/<agent_kind>.jsonl` incl. chunks, `redaction_report.json`, `content_hash.txt`, the intermediate trees, and every manifest-declared blob | None — reported `manual_required`; doctor never takes destructive action (try `libra fsck --heal` or a cloud/backup restore) |
+| `missing_catalog_row` | A checkpoint reachable from `refs/libra/traces` has no catalog row (crash window B) | Re-INSERT the row via the writer's probe-first idempotent path, reconstructed from the commit's `metadata.json` (v1 and v2 shapes) |
+| `missing_object_index` | Checkpoint objects missing from `object_index` (invisible to `libra cloud sync`) — covers the traces commit plus the full E4 object set | Idempotent re-insert with the writer's row semantics (trees as `tree`, transcript blobs as `agent_transcript`, sidecars as `blob`) |
+
+Additional rules:
+
+- **Legacy-v1 checkpoints** (pre-AG-20 layout without `manifest.json`) are
+  counted in `legacy_v1_checkpoints`, never enter the three classes, and are
+  never rewritten by `--repair`.
+- Checkpoints named by a **live traces in-flight marker** are writers
+  mid-flight, not inconsistencies, and are skipped.
+- A **session without checkpoints is legal** (an active session before its
+  first stop) and is never flagged; only checkpoint-without-session counts
+  as an orphan.
+- Captured **gemini rows stay readable** and are never flagged; leftover
+  gemini hook *configuration* produces a hint pointing at the
+  uninstall-only channel (`libra agent remove gemini`).
+- All repairs are idempotent — running `doctor --repair` twice performs no
+  work the second time. With `--repair`, one `agent.doctor.repair` tracing
+  span is emitted per repair attempt (`inconsistency_type`, `repaired`,
+  `manual_required`); transcript content never reaches the log.

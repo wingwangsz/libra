@@ -162,13 +162,27 @@ pub struct CleanArgs {
 }
 
 #[derive(Args, Debug)]
-pub struct DoctorArgs {}
+pub struct DoctorArgs {
+    /// AG-20: repair detected checkpoint-store inconsistencies (rebuild
+    /// missing catalog rows from `refs/libra/traces`, re-enqueue missing
+    /// `object_index` rows). Detection-only without this flag; rows whose
+    /// objects are unrecoverable are reported for manual action.
+    #[arg(long)]
+    pub repair: bool,
+}
 
 #[derive(Args, Debug)]
 pub struct PushArgs {
     /// Remote name to push refs/libra/traces to (default: origin)
     #[arg(long, value_name = "NAME")]
     pub remote: Option<String>,
+    /// AG-20: allow the non-fast-forward push that follows a local
+    /// `libra agent clean` prune (the traces ref is Libra-managed and
+    /// rewritten as a whole chain). Uses force-with-lease semantics
+    /// against the remote-tracking ref — never an unconditional force —
+    /// so a rewrite from another machine still fails closed.
+    #[arg(long)]
+    pub force_rewrite: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -193,6 +207,14 @@ pub struct CheckpointListArgs {
     /// Filter checkpoints to those belonging to a single session id
     #[arg(long, value_name = "ID")]
     pub session: Option<String>,
+    /// Maximum rows to return (default 50, capped at 500) — AG-20
+    /// metadata-first pagination.
+    #[arg(long, value_name = "N")]
+    pub limit: Option<u64>,
+    /// Keyset cursor from the previous page's `next_cursor` (opaque;
+    /// AG-20). Do not construct by hand.
+    #[arg(long, value_name = "CURSOR")]
+    pub cursor: Option<String>,
 }
 
 #[derive(Args, Debug)]

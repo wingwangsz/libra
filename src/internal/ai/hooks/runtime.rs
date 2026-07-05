@@ -795,7 +795,7 @@ pub async fn ingest_agent_traces_payload(
             &session_id,
             &envelope,
             agent_kind,
-            event.prompt.as_deref(),
+            &event,
             &redaction_report_json,
             &all_matches,
             now,
@@ -882,10 +882,24 @@ async fn session_concurrent_active(
 }
 
 /// Write a `committed` checkpoint (for a `TurnEnd` or `SessionEnd` event):
-/// materialise the redacted transcript + metadata blobs, append a commit on
+/// materialise the E4-libra tree (metadata.json, manifest.json,
+/// events/lifecycle.jsonl, transcript/<agent_kind>.jsonl,
+/// redaction_report.json, content_hash.txt), append a commit on
 /// `refs/libra/traces`, and insert the corresponding `agent_checkpoint`
 /// row. Errors are surfaced verbatim — a failure here means the ingest cannot
 /// acknowledge the checkpoint to the caller.
+///
+/// `event` is the (already-redacted) triggering lifecycle event; it feeds
+/// both the canonical `events/lifecycle.jsonl` line and metadata.json's
+/// `model` field, and its redacted prompt is the transcript fallback when
+/// the adapter advertises no readable transcript.
+///
+/// Write sequence + crash windows (AG-20, see the write-sequence matrix in
+/// `docs/development/tracing/agent.md`): an in-flight marker is (best-effort)
+/// persisted BEFORE stage (a) and cleared AFTER stage (d); between ref CAS
+/// (c) and catalog INSERT (d) the catalog is probed by `traces_commit` so a
+/// retry — or a doctor repair that already backfilled the row — never
+/// double-inserts.
 #[allow(clippy::too_many_arguments)]
 async fn write_committed_checkpoint(
     conn: &sea_orm::DatabaseConnection,
@@ -893,17 +907,17 @@ async fn write_committed_checkpoint(
     libra_session_id: &str,
     envelope: &SessionHookEnvelope,
     agent_kind: &str,
-    redacted_prompt: Option<&str>,
+    event: &LifecycleEvent,
     redaction_report_json: &str,
     redaction_matches: &[crate::internal::ai::observed_agents::RedactionMatch],
     now: i64,
 ) -> Result<()> {
-    use sea_orm::{ConnectionTrait, Statement};
-
     use crate::internal::ai::{
-        history::{CheckpointCommitParams, CheckpointScope, HistoryManager},
+        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
         observed_agents::{AgentKind, AgentSessionCtx, RedactedBytes, Redactor, agent_for},
     };
+
+    let redacted_prompt = event.prompt.as_deref();
 
     // Capture the agent's full on-disk transcript for the checkpoint blob.
     // The prompt-only stopgap is replaced by the adapter's `read_transcript`:
@@ -964,20 +978,27 @@ async fn write_committed_checkpoint(
         None => prompt_fallback(),
     };
 
-    // Build a minimal metadata.json. Phase 2 keeps the schema small; later
-    // phases extend with model_info, tool_use_id, subagent links, etc.
+    // Build metadata.json (external schema v2 — v1 fields plus `model`;
+    // strictly additive so v1 readers keep working). `model` mirrors the
+    // E4-entire tolerance: taken from the triggering lifecycle event when
+    // present, else the literal "unknown".
+    let redaction_report_value = report_value.clone();
     let metadata = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": history::CHECKPOINT_METADATA_SCHEMA_VERSION,
         "checkpoint_id": null, // filled in below once we have the UUID
         "session_id": libra_session_id,
         "agent_kind": agent_kind,
         "scope": "committed",
         "provider_session_id": envelope.session_id,
         "working_dir": envelope.cwd,
+        "model": checkpoint_model_field(event.model.as_ref()),
         "redaction_report": report_value,
         "created_at": now,
     });
 
+    // Fresh id per write attempt — it names both the catalog row and the
+    // tree path, so it must exist before any blob/tree is built. Retry
+    // dedup happens later at the traces_commit probe, not here.
     let checkpoint_id = uuid::Uuid::new_v4().to_string();
     let mut metadata = metadata;
     if let Some(obj) = metadata.as_object_mut() {
@@ -989,7 +1010,53 @@ async fn write_committed_checkpoint(
     let metadata_bytes =
         serde_json::to_vec_pretty(&metadata).context("serialize checkpoint metadata")?;
 
-    let provider_name = envelope_provider_slug(agent_kind);
+    // Canonical E3-JSONL evidence line(s) for events/lifecycle.jsonl —
+    // exactly the redacted triggering event today; the slice API keeps
+    // multi-event batches source-compatible.
+    let canonical_ctx = super::lifecycle::CanonicalEventContext {
+        agent_kind,
+        session_id: libra_session_id,
+        provider_session_id: &envelope.session_id,
+        provenance: serde_json::json!({
+            "channel": "hook",
+            "hook_event_name": envelope.hook_event_name,
+        }),
+    };
+    let lifecycle_events_jsonl =
+        super::lifecycle::lifecycle_events_to_canonical_jsonl(&[event], &canonical_ctx);
+    let redaction_report_bytes = serde_json::to_vec_pretty(&redaction_report_value)
+        .context("serialize checkpoint redaction_report.json")?;
+
+    // AG-20 observability (`agent.md` §6): one span per checkpoint write.
+    // Required fields: checkpoint_id, session_id, stage (progression),
+    // cas_retries, object_count. The transcript body is deliberately never
+    // recorded.
+    let write_span = tracing::info_span!(
+        "agent.checkpoint.write",
+        checkpoint_id = %checkpoint_id,
+        session_id = %libra_session_id,
+        stage = tracing::field::Empty,
+        cas_retries = tracing::field::Empty,
+        object_count = tracing::field::Empty,
+    );
+    write_span.record("stage", "marker");
+
+    // Window A/B guard: persist the in-flight marker BEFORE stage (a).
+    // Best-effort — a marker failure warns and continues (the checkpoint
+    // must not be lost over its advisory guard), but when the call
+    // succeeds the marker IS durably in SQLite before any blob exists.
+    let marker = history::TracesInflightMarker::new(
+        libra_session_id,
+        &checkpoint_id,
+        Utc::now().timestamp_millis(),
+    );
+    if let Err(err) = history::write_traces_inflight_marker(conn, &marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to persist traces in-flight marker; continuing without window guard"
+        );
+    }
 
     let objects_dir = repo_path.join("objects");
     std::fs::create_dir_all(&objects_dir).context("create objects dir for checkpoint commit")?;
@@ -1033,6 +1100,8 @@ async fn write_committed_checkpoint(
             }
         };
 
+    // Stages (a)–(c): blobs, trees, commit, ref CAS.
+    write_span.record("stage", "append");
     let written = manager
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id: &checkpoint_id,
@@ -1043,36 +1112,152 @@ async fn write_committed_checkpoint(
             tool_use_id: None,
             metadata_json: &metadata_bytes,
             transcript_redacted: &transcript_redacted,
-            provider_name,
-            events_jsonl: None,
+            lifecycle_events_jsonl: &lifecycle_events_jsonl,
+            redaction_report_json: &redaction_report_bytes,
         })
         .await
         .context("failed to append checkpoint commit on traces")?;
+    write_span.record("cas_retries", written.cas_retries);
+    write_span.record("object_count", written.object_count);
+    write_span.record("stage", "ref_cas_done");
 
-    let parent_commit_value: sea_orm::Value = parent_commit.clone().into();
-    conn.execute(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "INSERT INTO agent_checkpoint (
-            checkpoint_id, session_id, scope, parent_commit, tree_oid,
-            metadata_blob_oid, traces_commit, created_at
-         ) VALUES (?, ?, 'committed', ?, ?, ?, ?, ?)",
-        [
-            checkpoint_id.into(),
-            libra_session_id.into(),
-            parent_commit_value,
-            written.tree_oid.to_string().into(),
-            written.metadata_blob_oid.to_string().into(),
-            written.commit_hash.to_string().into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .context("failed to insert agent_checkpoint row")?;
+    // Extend the marker with the CAS'd commit + top OIDs (best-effort) so
+    // a window-B prune can protect the exact commit until stage (d) lands.
+    let mut committed_marker = marker.clone();
+    committed_marker.commit = Some(written.commit_hash.to_string());
+    committed_marker.oids = vec![
+        written.tree_oid.to_string(),
+        written.metadata_blob_oid.to_string(),
+    ];
+    if let Err(err) = history::write_traces_inflight_marker(conn, &committed_marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to refresh traces in-flight marker after ref CAS"
+        );
+    }
+
+    // Stage (d), idempotent.
+    write_span.record("stage", "catalog");
+    let inserted = insert_agent_checkpoint_row_idempotent(
+        conn,
+        &AgentCheckpointRow {
+            checkpoint_id: &checkpoint_id,
+            session_id: libra_session_id,
+            parent_commit: parent_commit.as_deref(),
+            tree_oid: &written.tree_oid.to_string(),
+            metadata_blob_oid: &written.metadata_blob_oid.to_string(),
+            traces_commit: &written.commit_hash.to_string(),
+            created_at: now,
+        },
+    )
+    .await?;
+    if !inserted {
+        write_span.record("stage", "catalog_deduped");
+    }
+
+    // Stage (d) complete — release the window guard (best-effort; an
+    // orphaned marker expires via its TTL).
+    if let Err(err) =
+        history::clear_traces_inflight_marker(conn, libra_session_id, &checkpoint_id).await
+    {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to clear traces in-flight marker after catalog insert"
+        );
+    }
+    write_span.record("stage", "done");
 
     // Suppress the unused-warning for redaction_matches; reserved for a
     // Phase 3 enhancement that adds per-rule counters to metadata.
     let _ = redaction_matches;
     Ok(())
+}
+
+/// Column values for one `agent_checkpoint` row (scope is always
+/// `committed` on this path).
+#[derive(Debug)]
+pub struct AgentCheckpointRow<'a> {
+    pub checkpoint_id: &'a str,
+    pub session_id: &'a str,
+    pub parent_commit: Option<&'a str>,
+    pub tree_oid: &'a str,
+    pub metadata_blob_oid: &'a str,
+    /// `CheckpointCommit.commit_hash` — lands in the `traces_commit` column.
+    pub traces_commit: &'a str,
+    pub created_at: i64,
+}
+
+/// Stage (d) of the checkpoint write sequence, made idempotent (AG-20):
+/// probe the catalog by `traces_commit` first — a crash-retry of the
+/// ingest, or a doctor repair that already backfilled the row from the
+/// ref, must not insert a second row for the same commit — then INSERT
+/// with an `ON CONFLICT(checkpoint_id) DO NOTHING` backstop covering a
+/// racer inserting the same checkpoint id between probe and INSERT.
+///
+/// Returns `true` when this call inserted the row, `false` when an
+/// existing row (either match) made it a no-op. `pub` for the AG-20
+/// crash-retry integration tests (`tests/agent_checkpoint_export_test.rs`)
+/// — NOT a stable API.
+pub async fn insert_agent_checkpoint_row_idempotent(
+    conn: &sea_orm::DatabaseConnection,
+    row: &AgentCheckpointRow<'_>,
+) -> Result<bool> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    use crate::internal::ai::history;
+
+    if let Some(existing_id) =
+        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+    {
+        tracing::info!(
+            checkpoint_id = %row.checkpoint_id,
+            existing_checkpoint_id = %existing_id,
+            "agent_checkpoint row already present for traces commit; skipping INSERT"
+        );
+        return Ok(false);
+    }
+    let parent_commit_value: sea_orm::Value = row.parent_commit.map(str::to_string).into();
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, scope, parent_commit, tree_oid,
+                metadata_blob_oid, traces_commit, created_at
+             ) VALUES (?, ?, 'committed', ?, ?, ?, ?, ?)
+             ON CONFLICT(checkpoint_id) DO NOTHING",
+            [
+                row.checkpoint_id.into(),
+                row.session_id.into(),
+                parent_commit_value,
+                row.tree_oid.into(),
+                row.metadata_blob_oid.into(),
+                row.traces_commit.into(),
+                row.created_at.into(),
+            ],
+        ))
+        .await
+        .context("failed to insert agent_checkpoint row")?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Extract metadata.json's `model` field from a lifecycle event's `model`
+/// value, mirroring the E4-entire missing-`model` tolerance: absent or
+/// unrecognisable shapes become the literal `"unknown"` rather than an
+/// error. Providers emit either a plain string or an object carrying an
+/// id/name-ish key.
+fn checkpoint_model_field(model: Option<&serde_json::Value>) -> String {
+    match model {
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => name.clone(),
+        Some(serde_json::Value::Object(obj)) => ["id", "model", "name", "display_name"]
+            .iter()
+            .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_str))
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Merge a [`RedactionReport`](crate::internal::ai::observed_agents::RedactionReport)
@@ -1146,14 +1331,6 @@ fn merge_redaction_report_into(
             .unwrap_or(0);
         obj.insert(key.to_string(), serde_json::json!(current + added as u64));
     }
-}
-
-/// Map `agent_session.agent_kind` (the closed enum stored in the database)
-/// onto the file-name component used inside the checkpoint tree
-/// (`transcript/<provider>` and `events/<provider>.jsonl`). For Phase 1's
-/// stable agents (claude_code, gemini) the slug equals the kind string.
-fn envelope_provider_slug(agent_kind: &str) -> &str {
-    agent_kind
 }
 
 ///
