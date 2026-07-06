@@ -8,11 +8,13 @@
 //! Also exercises the [`compliance::write_audit_record`] append helper and
 //! the retention-setting defaults/validation.
 
-use libra::internal::ai::observed_agents::compliance::{
-    self, AuditRecord, AuditScope, DEFAULT_RETENTION_STDERR_DAYS, DEFAULT_RETENTION_TRANSCRIPT_DAYS,
-    write_audit_record,
+use libra::internal::{
+    ai::observed_agents::compliance::{
+        self, AuditRecord, AuditScope, DEFAULT_RETENTION_STDERR_DAYS,
+        DEFAULT_RETENTION_TRANSCRIPT_DAYS, write_audit_record,
+    },
+    db::migration::run_builtin_migrations,
 };
-use libra::internal::db::migration::run_builtin_migrations;
 use sea_orm::{ConnectOptions, ConnectionTrait, Database, DatabaseConnection, Statement};
 
 async fn migrated_db() -> (tempfile::TempDir, DatabaseConnection) {
@@ -77,7 +79,10 @@ async fn audit_log_rejects_update_and_delete_but_allows_insert_select() {
                 .to_string(),
         ))
         .await;
-    assert!(update.is_err(), "UPDATE on agent_audit_log must be rejected");
+    assert!(
+        update.is_err(),
+        "UPDATE on agent_audit_log must be rejected"
+    );
     assert!(
         format!("{:?}", update.unwrap_err()).contains("append-only"),
         "rejection message names the append-only invariant"
@@ -90,10 +95,17 @@ async fn audit_log_rejects_update_and_delete_but_allows_insert_select() {
             "DELETE FROM agent_audit_log WHERE audit_id = 'a1'".to_string(),
         ))
         .await;
-    assert!(delete.is_err(), "DELETE on agent_audit_log must be rejected");
+    assert!(
+        delete.is_err(),
+        "DELETE on agent_audit_log must be rejected"
+    );
 
     // The rejected statements changed nothing.
-    assert_eq!(count_rows(&conn).await, 2, "row set intact after rejections");
+    assert_eq!(
+        count_rows(&conn).await,
+        2,
+        "row set intact after rejections"
+    );
 
     // SELECT still works and returns the untampered value.
     let row = conn

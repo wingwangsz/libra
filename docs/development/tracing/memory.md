@@ -1,5 +1,7 @@
 # Memory：为 Libra Agent 提供持久化、可版本化的知识
 
+> **Out-of-scope of `tracing/plan.md`**（§0 范围声明）：AI-agent persistent memory 设计面（agent knowledge store）不属于 AG-16~AG-24 外部捕获改进计划。已知冲突（plan.md §0 记录）：(1) 本文档断言 `LifecycleEventKind` 共 11 变体、"无需新增 hook 事件"，与 A4 新增 `SubagentStart`/`SubagentEnd`（现 13 变体）冲突——枚举描述待文档 owner 更新；(2) 本文档以 `libra mcp --stdio`（其链接的 docs/development/mcp.md 当前不存在）为前提，与 C6 固定的 `libra code --stdio` 冲突，待 C6 落地对齐。
+
 > Status: draft
 > Last updated: 2026-06-23
 > Scope: 规范 Memory 子系统——agent 跨 run / thread / branch 的持久化知识存储，及其在 Libra 三层对象模型（快照/事件/投影）、运行时生命周期与 MCP 边界上的落地约定。

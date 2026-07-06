@@ -1,5 +1,7 @@
 # Libra Web API 设计
 
+> **Out-of-scope of `tracing/plan.md`**（§0 范围声明）：Web/HTTP API 设计面不属于 AG-16~AG-24 外部捕获改进计划。已知冲突（plan.md §0 记录）：本文档的 `/api/v1` 变更型契约与 C4 的 `/api/code/*` observe-only 契约冲突——本计划执行期间 web 契约唯一事实源是 C4（路由注册在 `src/internal/ai/web/mod.rs` 的 code_router，状态/读模型在 `code_ui.rs`），`/api/v1` 提案留待独立仲裁。次要交叠：`libra login/logout/whoami` 的 host-scoped token 面与本文档相关，其兼容矩阵登记已由 A9 closeout 完成。
+
 > **状态**：草稿 / 接口规范
 > **负责人**：Web 团队、Agent runtime 团队
 > **读者**：Rust 后端实现者、web 客户端工程师

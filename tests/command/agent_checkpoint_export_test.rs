@@ -180,3 +180,63 @@ async fn allow_raw_gate() {
     assert_eq!(rows.len(), 2, "the grant is audited too");
     assert_eq!(rows[1], (checkpoint_id, 1), "grant recorded granted=1");
 }
+
+/// The raw gate is fail-closed BEFORE the checkpoint lookup: `export
+/// <missing-id> --raw` returns LBR-AGENT-013 (not a "no checkpoint" error
+/// that would leak an existence oracle) and audits the refusal.
+#[tokio::test]
+async fn raw_denial_precedes_lookup_no_existence_oracle() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    // Deliberately do NOT seed the checkpoint.
+    let out = run_libra_command(
+        &[
+            "agent",
+            "checkpoint",
+            "export",
+            "deadbeefdeadbeefdeadbeefdeadbeef",
+            "--raw",
+        ],
+        repo.path(),
+    );
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-013"),
+        "denial fires before lookup, not a 'no checkpoint' error: {stderr}"
+    );
+    assert!(
+        !stderr.contains("no checkpoint matches"),
+        "must not reveal whether the id exists: {stderr}"
+    );
+    let rows = audit_rows(repo.path()).await;
+    assert_eq!(rows.len(), 1, "the pre-lookup refusal is still audited");
+    assert_eq!(rows[0].1, 0, "recorded as a denial");
+}
+
+/// `--allow-raw` on its own (without `--raw`) is NOT a raw export: it
+/// falls through to the redacted path and writes no audit row.
+#[tokio::test]
+async fn allow_raw_without_raw_is_redacted_no_audit() {
+    let repo = tempfile::tempdir().expect("repo tempdir");
+    init_repo_via_cli(repo.path());
+    let checkpoint_id = seed_checkpoint_with_secret(repo.path()).await;
+    let out = run_libra_command(
+        &[
+            "agent",
+            "checkpoint",
+            "export",
+            &checkpoint_id,
+            "--allow-raw",
+        ],
+        repo.path(),
+    );
+    assert!(
+        out.status.success(),
+        "--allow-raw alone must succeed (redacted)"
+    );
+    assert!(
+        audit_rows(repo.path()).await.is_empty(),
+        "--allow-raw without --raw takes the redacted path and writes no audit"
+    );
+}

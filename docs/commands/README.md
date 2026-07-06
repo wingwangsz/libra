@@ -105,6 +105,9 @@ Every Libra command accepts the following global flags:
 | `libra open` | | Open the repository's remote URL in the system browser | [open.md](open.md) |
 | `libra lfs` | | Manage Large File Storage: track, lock, unlock, list LFS files | [lfs.md](lfs.md) |
 | `libra credential` | | Vault-backed Git credential helper (fill/store/erase) | [credential.md](credential.md) |
+| `libra login` | | Authenticate to a Libra host (`/api/cli/*`) and store a host-scoped session token | [login.md](login.md) |
+| `libra logout` | | Clear stored Libra host session tokens (`--all` / `--local-only`) | [logout.md](logout.md) |
+| `libra whoami` | | Report the identity for a stored Libra host session token | [whoami.md](whoami.md) |
 
 ### Cloud & Storage
 
