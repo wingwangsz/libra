@@ -1020,6 +1020,12 @@ async fn write_committed_checkpoint(
     }
     let metadata_bytes =
         serde_json::to_vec_pretty(&metadata).context("serialize checkpoint metadata")?;
+    // AG-19 / G4 redaction-before-persist: every blob entering the traces
+    // writer is a `RedactedBytes`, so no `&[u8]` can reach the checkpoint
+    // sink. The pass is idempotent defense-in-depth — these buffers are
+    // already built from redacted extraction outputs / rule-hit statistics,
+    // and the redactor skips existing `<REDACTED:…>` spans.
+    let (metadata_redacted, _) = Redactor::new_default().redact(&metadata_bytes);
 
     // Canonical E3-JSONL evidence line(s) for events/lifecycle.jsonl —
     // exactly the redacted triggering event today; the slice API keeps
@@ -1035,8 +1041,10 @@ async fn write_committed_checkpoint(
     };
     let lifecycle_events_jsonl =
         super::lifecycle::lifecycle_events_to_canonical_jsonl(&[event], &canonical_ctx);
+    let (lifecycle_events_redacted, _) = Redactor::new_default().redact(&lifecycle_events_jsonl);
     let redaction_report_bytes = serde_json::to_vec_pretty(&redaction_report_value)
         .context("serialize checkpoint redaction_report.json")?;
+    let (redaction_report_redacted, _) = Redactor::new_default().redact(&redaction_report_bytes);
 
     // AG-20 observability (`agent.md` §6): one span per checkpoint write.
     // Required fields: checkpoint_id, session_id, stage (progression),
@@ -1121,10 +1129,10 @@ async fn write_committed_checkpoint(
             parent_commit: parent_commit.as_deref(),
             scope: CheckpointScope::Committed,
             tool_use_id: None,
-            metadata_json: &metadata_bytes,
+            metadata_json: &metadata_redacted,
             transcript_redacted: &transcript_redacted,
-            lifecycle_events_jsonl: &lifecycle_events_jsonl,
-            redaction_report_json: &redaction_report_bytes,
+            lifecycle_events_jsonl: &lifecycle_events_redacted,
+            redaction_report_json: &redaction_report_redacted,
         })
         .await
         .context("failed to append checkpoint commit on traces")?;
