@@ -226,6 +226,12 @@ CLI surface stay in sync (cross-cutting `--help` EXAMPLES rollout, see
 
 - The top-level `agent hooks` entry is hidden and intended for hook configs
   installed by `libra agent enable`; users normally do not call it directly.
+  A hook envelope that fails size / UTF-8 / JSON / schema / transcript-path
+  validation is rejected fail-closed with `LBR-AGENT-008` (exit 128) — raw
+  stdin is never echoed. A checkpoint operation (e.g. `checkpoint rewind`) on
+  an inconsistent store — a catalog row whose `parent_commit` is malformed or
+  points at a missing traces object — fails with `LBR-AGENT-009` (exit 128);
+  run `libra agent doctor` to inspect the store.
 - `checkpoint rewind --apply` restores working-tree files only; the agent's own
   transcript file is not rewritten.
 - Hook and capture diagnostics are best-effort and are designed to report

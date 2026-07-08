@@ -892,8 +892,8 @@ entire 当前是 1 stable（`claude-code`）+ 7 preview（`codex`、`copilot-cli
 | `ERR_AGENT_PROVENANCE_REJECTED` | `LBR-AGENT-005` | provenance 拒绝或 hash 变化 | AG-18 |
 | `ERR_AGENT_BUILTIN_SLUG_IMPERSONATION` | `LBR-AGENT-006` | built-in slug impersonation | AG-18 |
 | `ERR_AGENT_IO_REDACTION_SECURITY_FAILURE` | `LBR-AGENT-007` | env/stderr/redaction 安全失败 | AG-18/AG-19 |
-| `ERR_AGENT_HOOK_ENVELOPE_INVALID` | `LBR-AGENT-008` | hook envelope UTF-8/JSON/schema/path 校验失败 ⚠️ **目录已声明+pin，当前尚无 runtime emit**：`command/agent/hooks.rs` envelope 失败仍坍缩为裸 `CliError::fatal`（wiring 延后，见「还未实现的功能」） | AG-19 |
-| `ERR_AGENT_CHECKPOINT_STORE_INCONSISTENT` | `LBR-AGENT-009` | checkpoint ref/DB/object/object_index 写入或恢复失败 ⚠️ **目录已声明+pin，当前尚无 runtime emit**（checkpoint/doctor 失败路径尚未返回该码，wiring 延后，见「还未实现的功能」） | AG-20 |
+| `ERR_AGENT_HOOK_ENVELOPE_INVALID` | `LBR-AGENT-008` | hook envelope size/UTF-8/JSON/schema/path 校验失败 **（A0-03 已 emit）**：`runtime.rs` 的 envelope 校验点统一携带 `HookEnvelopeInvalid` marker，`command/agent/hooks.rs::map_ingest_error` 据此附加该码（exit 128，`--json` 带 `error_code`）；DB/存储/redaction 等运行时失败保持裸 fatal 以免误标 | AG-19 |
+| `ERR_AGENT_CHECKPOINT_STORE_INCONSISTENT` | `LBR-AGENT-009` | checkpoint ref/DB/object 恢复/操作失败 **（A0-03 已 emit）**：`command/agent/checkpoint.rs` 的 rewind 在 `parent_commit` OID 非法或其 commit/tree 对象缺失时附加该码（exit 128）。`doctor` 保持「报告 + exit 0」诊断契约（把错误 envelope 混入报告会破坏 `--json` 消费者），store 不一致由 checkpoint 操作侧 fail-closed 暴露 | AG-20 |
 | `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE` | `LBR-AGENT-010` | review/investigate `--fix` bridge 未就绪 | AG-22/AG-23 |
 | `ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION` | `LBR-AGENT-011` | untrusted seed 请求进入 mutating workflow（⚠️ 当前**不可达**：`review/investigate --fix` 一律先返 `LBR-AGENT-010`（fix bridge 未就绪），故 011 门要待 fix bridge 落地后才实际触发；helper 已实现但 `#[allow(dead_code)]`） | AG-22/AG-23 |
 | `ERR_AGENT_RPC_TRANSPORT_FAILED` | `LBR-AGENT-012`（A3 实现切片补分配） | rpc invoke timeout、broken pipe/子进程提前退出、malformed JSON-RPC frame（IO hard-cap 超限仍归 `007`） | AG-18 |
@@ -1834,7 +1834,7 @@ rg -n "claudecode|claude-code|libra-agent-|agent list|agent add|agent remove|Lif
 
 ## 还未实现的功能
 
-> **2026-07-08 A0-01 现状复核**：对下表逐项做了源码核对（10 路并行调查，回指 `file:line` 锚点），确认本表**据实、无超前声明**。复核结论的任务状态表（哪些是 `继续实现`、哪些是 `文档守卫`）记录在 [`docs/development/plan/plan-20260708.md`](../plan/plan-20260708.md) 的「A0-01 现状复核结果」小节：真实实现项为 A0-02/03/04/06/07/08/09，文档守卫项为 A0-05/10/11。任一表项状态变化时，两处必须同步刷新。进度：**A0-02 已实现**（subagent 边界物化独立 `scope='subagent'` checkpoint）。
+> **2026-07-08 A0-01 现状复核**：对下表逐项做了源码核对（10 路并行调查，回指 `file:line` 锚点），确认本表**据实、无超前声明**。复核结论的任务状态表（哪些是 `继续实现`、哪些是 `文档守卫`）记录在 [`docs/development/plan/plan-20260708.md`](../plan/plan-20260708.md) 的「A0-01 现状复核结果」小节：真实实现项为 A0-02/03/04/06/07/08/09，文档守卫项为 A0-05/10/11。任一表项状态变化时，两处必须同步刷新。进度：**A0-02 已实现**（subagent 边界物化独立 `scope='subagent'` checkpoint）；**A0-03 已实现**（`LBR-AGENT-008` hook envelope 校验 + `LBR-AGENT-009` checkpoint store 不一致 runtime emit）。
 
 | 类别 | 未完成项 | 当前处理 | 参考来源 / 卡 |
 |---|---|---|---|
@@ -1854,7 +1854,6 @@ rg -n "claudecode|claude-code|libra-agent-|agent list|agent add|agent remove|Lif
 | 测试装配 | 无当前 AG target 孤儿 | `tests/command/agent_checkpoint_test.rs` 已接入 `command_test`，AG-19/20/22/23/24a top-level targets 已在 `tests/INDEX.md` 登记。 | 漂移修正 / AG-20 |
 | 数据模型 | cloud mirror tombstone propagation for agent capture data | 本地 erasure 已重写 `refs/libra/traces` 并删除 DB/object_index；当前未启用 D1/R2 agent capture mirror，不声明 cloud tombstone 已覆盖。 | AG-24a / future cloud mirror |
 | 资源预算 | run-level 并发/队列上限（`agent.max_concurrent_runs`=2、队列上限 10）未强制 | 仅 `max_reviewers_per_run`（单 run 内 reviewer 并发）已生效；run-level 并发/队列 settings 已定义但当前无代码强制（§12 预算表 / settings 表已据实标注）。 | 强制补强项 §12 / future enforcement |
-| 稳定错误码 | `LBR-AGENT-008`(HookEnvelopeInvalid) / `LBR-AGENT-009`(CheckpointStoreInconsistent) 尚无 runtime emit | 两码已在 `src/utils/error.rs` 声明、`docs/error-codes.md` 记录并 pin；但 `command/agent/hooks.rs` envelope 失败仍返裸 `CliError::fatal`，checkpoint/doctor 失败路径亦未返 009——emit wiring 延后（E10 表已据实标注）。 | E10 / AG-19·AG-20 future wiring |
 | 多 Agent | review `manual_attach` 命令面、`findings_oid` 对象持久化、`--checkpoint <id>` scoped review | read-only review workflow 已落地；`manual_attach` 目前恒空（无填充命令面）、`findings_oid` 恒 null（findings.md 落盘但未写对象指针）、`--checkpoint <id>` scoped review fail-closed 返回 unimplemented。 | E8-libra / future parity |
 | 外部插件安全 | `agent.external_agents.trusted_dirs` / `env_allowlist_extra` / `libra agent rpc trust --dir <path>` | AG-18 provenance（sha256/device/inode/mtime）+ world-writable 父目录拒绝已落地；受信目录 allowlist、额外 env 透传 settings 与 `--dir` flag 尚未实现（trust 接受任意父目录非 world-writable 的 on-PATH 二进制）。 | 落地执行补充规格 §2 / future |
 | 合规实现 | review/investigate findings-GC（`agent.retention.findings_days`） | `retention_findings_days()` 已定义但当前无 GC 消费者（`clean --gc` 仅处理 transcript/stderr 保留期）；findings run-state GC 待 run-state retention 策略新增删除命令后落地。 | AG-24a / future GC |

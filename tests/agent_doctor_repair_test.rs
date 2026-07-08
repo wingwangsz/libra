@@ -1610,3 +1610,115 @@ async fn subagent_checkpoint_sidecar_omits_transcript_path() {
         "the subagent sidecar event must not carry session_ref:\n{content}"
     );
 }
+
+/// A0-03: a checkpoint operation on an inconsistent store (a catalog row whose
+/// `parent_commit` points at an object missing from the store) fails closed
+/// with the stable `LBR-AGENT-009` (`AgentCheckpointStoreInconsistent`) code,
+/// not a bare fatal.
+#[tokio::test]
+async fn checkpoint_store_inconsistent_emits_lbr_agent_009() {
+    let repo = DoctorRepo::init();
+
+    // A user commit so the checkpoint records a real parent_commit.
+    std::fs::write(repo.repo.join("seed.txt"), "seed\n").expect("write seed file");
+    assert!(repo.run(&["add", "seed.txt"], None).status.success());
+    assert!(repo.run(&["commit", "-m", "seed"], None).status.success());
+
+    repo.ingest_checkpoint("sess-inconsistent", TRANSCRIPT);
+    let cp = repo.checkpoint_rows().await.remove(0);
+
+    // Corrupt the catalog: point parent_commit at a non-existent object.
+    let bogus = "b".repeat(40);
+    repo.exec_sql(
+        "UPDATE agent_checkpoint SET parent_commit = ? WHERE checkpoint_id = ?",
+        vec![bogus.into(), cp.checkpoint_id.clone().into()],
+    )
+    .await;
+
+    let out = repo.run(
+        &[
+            "agent",
+            "checkpoint",
+            "rewind",
+            &cp.checkpoint_id,
+            "--dry-run",
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "rewind on a corrupted store must fail: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-009"),
+        "an inconsistent store must carry LBR-AGENT-009: {stderr}"
+    );
+}
+
+/// A0-03 (Codex re-review): a rewind whose parent tree's ROOT is present but a
+/// nested subtree object is missing must fail closed with `LBR-AGENT-009`, not
+/// panic through `Tree::load`. Regression for the recursive tree-walk path.
+#[tokio::test]
+async fn checkpoint_store_missing_nested_tree_emits_lbr_agent_009() {
+    let repo = DoctorRepo::init();
+
+    // A commit whose tree contains a subdirectory (a nested subtree object).
+    std::fs::create_dir_all(repo.repo.join("nested")).expect("mkdir nested");
+    std::fs::write(repo.repo.join("nested").join("f.txt"), "x\n").expect("write nested file");
+    assert!(repo.run(&["add", "nested/f.txt"], None).status.success());
+    assert!(repo.run(&["commit", "-m", "nested"], None).status.success());
+
+    repo.ingest_checkpoint("sess-nested", TRANSCRIPT);
+    let cp = repo.checkpoint_rows().await.remove(0);
+    let parent_commit = cp
+        .parent_commit
+        .clone()
+        .expect("checkpoint records a parent_commit");
+
+    // Resolve the root tree from the commit object, find the "nested" subtree,
+    // and delete that object — leaving the root tree readable.
+    let (_, commit_body) = read_loose(&repo, &parent_commit);
+    let commit_text = String::from_utf8_lossy(&commit_body);
+    let root_tree = commit_text
+        .lines()
+        .next()
+        .and_then(|l| l.strip_prefix("tree "))
+        .expect("commit starts with a tree line")
+        .trim()
+        .to_string();
+    let subtree_oid = subagent_entry_oid(&tree_entries(&repo, &root_tree), "nested");
+    let obj = repo
+        .repo
+        .join(".libra")
+        .join("objects")
+        .join(&subtree_oid[..2])
+        .join(&subtree_oid[2..]);
+    std::fs::remove_file(&obj).expect("delete nested subtree object");
+
+    let out = repo.run(
+        &[
+            "agent",
+            "checkpoint",
+            "rewind",
+            &cp.checkpoint_id,
+            "--dry-run",
+        ],
+        None,
+    );
+    assert!(
+        !out.status.success(),
+        "rewind with a missing nested tree must fail: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-009"),
+        "a missing nested tree must carry LBR-AGENT-009: {stderr}"
+    );
+    assert!(
+        !stderr.contains("panicked"),
+        "rewind must not panic on a missing subtree: {stderr}"
+    );
+}

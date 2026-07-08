@@ -640,3 +640,41 @@ fn subagent_end_materializes_distinct_subagent_scope_checkpoint() {
         "the committed turn checkpoint must remain distinguishable, got {scopes:?}"
     );
 }
+
+/// A0-03: a malformed (non-JSON) or schema-invalid hook envelope is rejected
+/// with the stable `LBR-AGENT-008` (`AgentHookEnvelopeInvalid`) code and a
+/// non-zero exit — not a bare fatal — so automation can distinguish an
+/// envelope reject from a genuine runtime failure.
+#[test]
+fn hook_envelope_invalid_emits_lbr_agent_008() {
+    let repo = HookRepo::init();
+
+    // Malformed JSON: fails at the JSON parse gate.
+    let out = repo.hook("codex", "session-start", "{ this is not valid json");
+    assert!(
+        !out.status.success(),
+        "a malformed envelope must fail: {}",
+        describe(&out)
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "an envelope reject exits 128: {}",
+        describe(&out)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-008"),
+        "malformed envelope must carry LBR-AGENT-008: {stderr}"
+    );
+
+    // Well-formed JSON but schema-invalid (missing required fields) also maps
+    // to LBR-AGENT-008.
+    let out = repo.hook("codex", "session-start", "{}");
+    assert!(!out.status.success(), "schema-invalid envelope must fail");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("LBR-AGENT-008"),
+        "schema-invalid envelope must carry LBR-AGENT-008: {stderr}"
+    );
+}

@@ -162,6 +162,16 @@ pub async fn process_hook_event_from_stdin(
     process_hook_event_with_target(command, expected_kind, provider, HookTarget::AiIntent).await
 }
 
+/// Marker error for hook-envelope validation failures (size / UTF-8 / empty
+/// / JSON / schema / transcript-path). A0-03: the command layer
+/// (`command/agent/hooks.rs`) maps any ingest error whose chain carries this
+/// to the stable `LBR-AGENT-008` (`AgentHookEnvelopeInvalid`) code; genuine
+/// runtime failures (DB open, storage resolution, redaction) stay generic
+/// fatals so an envelope reject never masquerades as an internal error.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct HookEnvelopeInvalid(pub String);
+
 /// Parametric form of [`process_hook_event_from_stdin`] that selects the
 /// writer destination via [`HookTarget`].
 ///
@@ -428,7 +438,10 @@ async fn ingest_agent_traces(
         .read_to_end(&mut stdin_bytes)
         .context("failed to read stdin")?;
     if stdin_bytes.len() > MAX_STDIN_BYTES {
-        bail!("hook input exceeds {MAX_STDIN_BYTES} bytes");
+        // A0-03: envelope-size reject → LBR-AGENT-008 at the command layer.
+        return Err(
+            HookEnvelopeInvalid(format!("hook input exceeds {MAX_STDIN_BYTES} bytes")).into(),
+        );
     }
 
     // Resolve storage and pin hash kind, exactly as the AiIntent flow does,
@@ -495,21 +508,27 @@ pub async fn ingest_agent_traces_payload(
         partial = tracing::field::Empty,
     );
 
+    // A0-03: every envelope-content validation failure carries
+    // [`HookEnvelopeInvalid`] so the command layer maps it to
+    // `LBR-AGENT-008`, distinct from downstream store/runtime failures.
     if payload.len() > MAX_STDIN_BYTES {
         ingest_span.record("validated", false);
-        bail!("hook input exceeds {MAX_STDIN_BYTES} bytes");
+        return Err(
+            HookEnvelopeInvalid(format!("hook input exceeds {MAX_STDIN_BYTES} bytes")).into(),
+        );
     }
-    let stdin = std::str::from_utf8(payload).context("hook input is not valid UTF-8")?;
+    let stdin = std::str::from_utf8(payload)
+        .map_err(|err| HookEnvelopeInvalid(format!("hook input is not valid UTF-8: {err}")))?;
     if stdin.trim().is_empty() {
         ingest_span.record("validated", false);
-        bail!("hook input is empty");
+        return Err(HookEnvelopeInvalid("hook input is empty".to_string()).into());
     }
 
-    let envelope: SessionHookEnvelope =
-        serde_json::from_str(stdin).map_err(|err| anyhow!("invalid hook JSON payload: {err}"))?;
+    let envelope: SessionHookEnvelope = serde_json::from_str(stdin)
+        .map_err(|err| HookEnvelopeInvalid(format!("invalid hook JSON payload: {err}")))?;
     if let Err(err) = validate_session_hook_envelope(&envelope, MAX_TRANSCRIPT_PATH_BYTES) {
         ingest_span.record("validated", false);
-        return Err(err);
+        return Err(HookEnvelopeInvalid(format!("{err}")).into());
     }
     ingest_span.record("validated", true);
 
