@@ -828,9 +828,13 @@ async fn execute_web_only(args: &CodeArgs) -> CliResult<()> {
             let session_store = Arc::new(SessionStore::from_storage_path(&storage_root));
             let session_state =
                 load_or_create_headless_web_session_state(args, &working_dir, &session_store)?;
-            // Phase 3 v0 routes the supported providers through the new
-            // headless runtime. Anything not yet hooked up keeps the read-only
-            // placeholder so we fail closed rather than panicking on attach.
+            // All accepted non-Codex web-only providers now route through the
+            // headless runtime (C2 relaxed the web-only provider gate).
+            // Construction errors propagate via `?`; the read-only placeholder
+            // below is only the `Ok(None)` (not-wired) fallback — reached when
+            // the builder declines a provider (today only `Codex`, which is
+            // routed away before this branch), so it is defensive fail-closed
+            // code rather than a live path.
             match build_non_codex_headless_runtime(
                 args,
                 &working_dir,
@@ -2278,7 +2282,7 @@ async fn build_placeholder_web_code_ui_runtime(
         kind: CodeUiTranscriptEntryKind::InfoNote,
         title: Some("Web Control Unavailable".to_string()),
         content: Some(
-            "Interactive browser control is fully implemented for `--provider codex`. For other providers, launch `libra code` without `--web-only` to observe the live terminal session in the browser."
+            "The interactive web runtime for this provider could not be started; showing a read-only view. Retry, or launch `libra code` without `--web-only` to drive the live terminal session directly."
                 .to_string(),
         ),
         status: Some("completed".to_string()),
@@ -4663,11 +4667,10 @@ mod tests {
         let cwd = tempfile::tempdir().expect("cwd tempdir");
         let thread_id = "22222222-2222-4222-8222-222222222222";
         let hint = format_graph_handoff_hint(thread_id, &session_dir, Some(cwd.path()));
-        let canonical = std::fs::canonicalize(&session_dir).unwrap_or(session_dir);
         assert!(
             hint.ends_with(&format!(
                 "--repo {}",
-                shell_quote_for_display(&canonical.display().to_string())
+                shell_quote_for_display(&session_dir.display().to_string())
             )),
             "spaced repo path must be quoted in the hint: {hint}"
         );
