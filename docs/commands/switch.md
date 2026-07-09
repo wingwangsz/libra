@@ -55,6 +55,8 @@ libra switch -C feature-x              # Reset feature-x to HEAD and switch
 libra switch -C fix-123 abc1234        # Reset fix-123 to specific commit
 ```
 
+After `-c` or `-C` succeeds, `HEAD` remains a symbolic reference to the created/reset branch (`refs/heads/<name>`), including when a start-point was provided.
+
 **`--orphan <name>`**: Creates a new branch with no parent history and an empty root tree, then switches to it. The working tree is restored to the empty tree state. If the branch already exists it is deleted first (except when it is the current branch).
 
 ```bash
@@ -220,7 +222,7 @@ Track and switch to a remote branch:
 - `branch` is `null` when HEAD is now detached (`--detach`)
 - `already_on` is `true` when the target branch equals the current branch (no-op)
 - `tracking` is present with `--track` or a successful guess, containing `remote` and `remote_branch`
-- `created` is `true` when `--create`, `--track`, or a guess created a new local branch
+- `created` is `true` when `--create`, `--force-create`, `--track`, or a guess created or reset a local branch
 
 ## Design Rationale
 

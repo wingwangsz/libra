@@ -13,6 +13,7 @@ libra switch -C <name> [<start-point>]
 libra switch --orphan <name>
 libra switch -d <commit|tag|branch>
 libra switch --track <remote/branch>
+libra switch [--guess | --no-guess] <branch>
 ```
 
 ## 说明
@@ -33,6 +34,8 @@ libra switch --track <remote/branch>
 | | `--orphan` | `<name>` | 创建无父提交的新分支并切换到它 |
 | `-d` | `--detach` | | 在给定提交、标签或分支上 detach HEAD |
 | | `--track` | | 创建跟踪给定远程分支的本地分支，并切换到它 |
+| | `--guess` | | 当 `<branch>` 唯一匹配某个远程跟踪分支时自动创建 tracking 分支（默认；DWIM） |
+| | `--no-guess` | | 禁用远程跟踪猜测；要求本地分支或显式 `--track` |
 | | `--no-progress` | | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 switch 从不渲染进度条。 |
 
 ### 标志细节
@@ -51,6 +54,8 @@ libra switch -c release-2.0 main       # 从另一个分支创建新分支
 libra switch -C feature-x              # 将 feature-x 重置到 HEAD 并切换
 libra switch -C fix-123 abc1234        # 从特定提交重置分支
 ```
+
+`-c` 或 `-C` 成功后，`HEAD` 会保持为指向创建/重置分支的 symbolic ref（`refs/heads/<name>`），即使提供了 start-point 也是如此。
 
 **`--orphan <name>`**：创建没有父提交历史的新分支，并把工作树恢复到空树状态。如果分支已存在，会先删除重建（当前分支除外）。
 
@@ -72,6 +77,13 @@ libra switch --track origin/main       # 跟踪并切换到远程分支
 libra switch --track feature            # 假设 origin/feature
 ```
 
+**`--guess` / `--no-guess`**：当 `<branch>` 不是已有本地分支，但恰好只有一个远程有同名 tracking 分支时，`--guess`（默认）会创建同名本地分支、设置 upstream，并切换到它；这与 `--track <remote>/<branch>` 的单步行为一致。猜测默认开启，生效优先级为 `--no-guess` > `--guess` > `checkout.guess`（默认 `true`）。多个远程同名时会以歧义错误失败（退出码 128），除非 `checkout.defaultRemote` 指定一个远程。显式 `remote/branch` 形式（例如 `libra switch origin/main`）不受 guess 影响，仍会提示使用 `--track`。
+
+```bash
+libra switch feature                   # 如果只有 origin 有 feature，则自动 tracking
+libra switch --no-guess feature        # 禁止远程分支猜测
+```
+
 ## 常用命令
 
 ```bash
@@ -82,6 +94,8 @@ libra switch -C feature-x              # 重置分支到 HEAD 并切换
 libra switch --orphan fresh-start      # 创建无历史的新分支
 libra switch --detach v1.0             # 在标签上 detach HEAD
 libra switch --track origin/main       # 跟踪并切换到远程分支
+libra switch feature                   # 从唯一远程自动创建 tracking 分支（guess）
+libra switch --no-guess feature        # 禁用远程分支猜测
 libra switch --json main               # 面向代理的结构化 JSON 输出
 ```
 
@@ -207,8 +221,8 @@ Already on 'main'
 - `previous_branch` 在切换前 HEAD detached 时为 `null`
 - `branch` 在 HEAD 当前 detached（`--detach`）时为 `null`
 - `already_on` 在目标分支等于当前分支（no-op）时为 `true`
-- `tracking` 仅在 `--track` 时存在，包含 `remote` 和 `remote_branch`
-- `created` 在 `--create` 或 `--track` 创建新本地分支时为 `true`
+- `tracking` 在 `--track` 或成功 guess 时存在，包含 `remote` 和 `remote_branch`
+- `created` 在 `--create`、`--force-create`、`--track` 或 guess 创建/重置本地分支时为 `true`
 
 ## 设计理由
 

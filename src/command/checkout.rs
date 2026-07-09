@@ -3,12 +3,12 @@
 use std::str::FromStr;
 
 use clap::Parser;
-use git_internal::hash::ObjectHash;
+use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
 use serde::Serialize;
 
 use crate::{
     command::{
-        branch, pull,
+        branch, load_object, pull,
         restore::{self, RestoreArgs},
         switch,
     },
@@ -163,8 +163,8 @@ enum CheckoutError {
     #[error("'{0}' is not a valid object name for checkout")]
     InvalidObjectName(String),
 
-    #[error("failed to delete existing branch '{branch}': {detail}")]
-    BranchDelete { branch: String, detail: String },
+    #[error("failed to create branch '{branch}': {detail}")]
+    BranchCreate { branch: String, detail: String },
 
     #[error("checkout remote branch left HEAD without a commit")]
     RemoteHeadMissing,
@@ -241,10 +241,10 @@ impl From<CheckoutError> for CliError {
             ))
             .with_stable_code(StableErrorCode::CliInvalidTarget)
             .with_hint("check the branch name, commit hash, or tag and try again."),
-            CheckoutError::BranchDelete { branch, detail } => CliError::fatal(format!(
-                "failed to delete existing branch '{branch}': {detail}"
-            ))
-            .with_stable_code(StableErrorCode::IoWriteFailed),
+            CheckoutError::BranchCreate { branch, detail } => {
+                CliError::fatal(format!("failed to create branch '{branch}': {detail}"))
+                    .with_stable_code(StableErrorCode::IoWriteFailed)
+            }
             CheckoutError::RemoteHeadMissing => {
                 CliError::fatal("checkout remote branch left HEAD without a commit")
                     .with_stable_code(StableErrorCode::RepoStateInvalid)
@@ -328,6 +328,8 @@ async fn run_checkout(
     if let Some(ref target_branch) = args.branch
         && previous_branch.as_ref() == Some(target_branch)
         && !args.detach
+        && args.new_branch.is_none()
+        && args.force_new_branch.is_none()
     {
         return Ok(CheckoutOutput {
             action: "already-on".to_string(),
@@ -340,6 +342,71 @@ async fn run_checkout(
             created: false,
             pulled: false,
             already_on: true,
+            detached: false,
+            tracking: None,
+            restore: None,
+        });
+    }
+
+    if let Some(new_branch) = args.new_branch {
+        let start_point = args.branch;
+        let target_commit = resolve_checkout_create_startpoint(start_point.as_deref()).await?;
+        let clean_status = if args.force {
+            switch::ensure_no_untracked_overwrite(target_commit)
+        } else {
+            switch::ensure_clean_status_for_commit(target_commit, output).await
+        };
+        map_switch_preflight(clean_status)?;
+
+        let child_output = silent_child_output(output);
+        let commit = create_and_switch_new_branch(&new_branch, start_point, &child_output).await?;
+        let commit = commit.to_string();
+        return Ok(CheckoutOutput {
+            action: "create".to_string(),
+            previous_branch,
+            previous_commit,
+            branch: Some(new_branch),
+            short_commit: Some(short_oid(&commit)),
+            commit: Some(commit),
+            switched: true,
+            created: true,
+            pulled: false,
+            already_on: false,
+            detached: false,
+            tracking: None,
+            restore: None,
+        });
+    }
+
+    if let Some(new_branch) = args.force_new_branch {
+        let start_point = args.branch;
+        let target_commit = resolve_checkout_create_startpoint(start_point.as_deref()).await?;
+        let clean_status = if args.force {
+            switch::ensure_no_untracked_overwrite(target_commit)
+        } else {
+            switch::ensure_clean_status_for_commit(target_commit, output).await
+        };
+        map_switch_preflight(clean_status)?;
+
+        let previous = get_current_branch().await;
+        if let Some(prev) = previous.as_deref()
+            && prev == new_branch
+        {
+            return Err(CheckoutError::CreatingBranchBlocked(new_branch));
+        }
+        reset_and_switch_branch(&new_branch, target_commit, &silent_child_output(output)).await?;
+        let commit = target_commit.to_string();
+        return Ok(CheckoutOutput {
+            action: "create".to_string(),
+            previous_branch,
+            previous_commit,
+            branch: Some(new_branch),
+            short_commit: Some(short_oid(&commit)),
+            commit: Some(commit),
+            switched: true,
+            created: true,
+            pulled: false,
+            already_on: false,
             detached: false,
             tracking: None,
             restore: None,
@@ -395,16 +462,15 @@ async fn run_checkout(
         Err(err) => return Err(CheckoutError::DelegatedCli(CliError::from(err))),
     }
 
-    let detach = args.detach;
-    match (args.branch, args.new_branch, args.force_new_branch) {
-        (Some(target_branch), _, _) => {
+    match args.branch {
+        Some(target_branch) => {
             let is_branch = Branch::find_branch_result(&target_branch, None)
                 .await
                 .map_err(|error| map_checkout_branch_store_error("resolve checkout target", error))?
                 .is_some();
             match target_commit {
                 // `--detach` forces the detach path even for a branch name.
-                Some(commit_id) if !is_branch || detach => {
+                Some(commit_id) if !is_branch || args.detach => {
                     checkout_detached(
                         target_branch,
                         commit_id,
@@ -427,69 +493,7 @@ async fn run_checkout(
                 }
             }
         }
-        (None, Some(new_branch), _) => {
-            let child_output = silent_child_output(output);
-            let commit = create_and_switch_new_branch(&new_branch, &child_output).await?;
-            let commit = commit.to_string();
-            Ok(CheckoutOutput {
-                action: "create".to_string(),
-                previous_branch,
-                previous_commit,
-                branch: Some(new_branch),
-                short_commit: Some(short_oid(&commit)),
-                commit: Some(commit),
-                switched: true,
-                created: true,
-                pulled: false,
-                already_on: false,
-                detached: false,
-                tracking: None,
-                restore: None,
-            })
-        }
-        (None, None, Some(new_branch)) => {
-            let child_output = silent_child_output(output);
-            let previous = get_current_branch().await;
-            if let Some(prev) = previous.as_deref()
-                && prev == new_branch
-            {
-                return Err(CheckoutError::CreatingBranchBlocked(new_branch));
-            }
-            if let Some(existing) = Branch::find_branch_result(&new_branch, None)
-                .await
-                .map_err(|error| {
-                    map_checkout_branch_store_error("resolve force-create target", error)
-                })?
-            {
-                if Some(existing.name.as_str()) == previous.as_deref() {
-                    return Err(CheckoutError::CreatingBranchBlocked(new_branch));
-                }
-                Branch::delete_branch_result(&new_branch, None)
-                    .await
-                    .map_err(|e| CheckoutError::BranchDelete {
-                        branch: new_branch.clone(),
-                        detail: e.to_string(),
-                    })?;
-            }
-            let commit = create_and_switch_new_branch(&new_branch, &child_output).await?;
-            let commit = commit.to_string();
-            Ok(CheckoutOutput {
-                action: "create".to_string(),
-                previous_branch,
-                previous_commit,
-                branch: Some(new_branch),
-                short_commit: Some(short_oid(&commit)),
-                commit: Some(commit),
-                switched: true,
-                created: true,
-                pulled: false,
-                already_on: false,
-                detached: false,
-                tracking: None,
-                restore: None,
-            })
-        }
-        (None, None, None) => show_current_branch(previous_branch, previous_commit).await,
+        None => show_current_branch(previous_branch, previous_commit).await,
     }
 }
 
@@ -555,6 +559,18 @@ fn map_checkout_branch_store_error(context: &str, error: BranchStoreError) -> Ch
     }
 }
 
+fn map_switch_preflight(result: Result<(), switch::SwitchError>) -> Result<(), CheckoutError> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(switch::SwitchError::DirtyUnstaged) => Err(CheckoutError::DirtyUnstaged),
+        Err(switch::SwitchError::DirtyUncommitted) => Err(CheckoutError::DirtyUncommitted),
+        Err(switch::SwitchError::UntrackedOverwrite(path)) => {
+            Err(CheckoutError::UntrackedOverwrite(path))
+        }
+        Err(err) => Err(CheckoutError::DelegatedCli(CliError::from(err))),
+    }
+}
+
 pub async fn get_current_branch() -> Option<String> {
     match Head::current().await {
         Head::Detached(_) => None,
@@ -617,20 +633,78 @@ async fn switch_branch_with_output(
 
 async fn create_and_switch_new_branch(
     new_branch: &str,
+    start_point: Option<String>,
     output: &OutputConfig,
 ) -> Result<ObjectHash, CheckoutError> {
-    branch::create_branch_safe(new_branch.to_string(), get_current_branch().await)
+    branch::create_branch_safe(new_branch.to_string(), start_point)
         .await
         .map_err(CheckoutError::DelegatedCli)?;
     // A freshly created branch cannot be checked out elsewhere.
     switch_branch_with_output(new_branch, output, true).await
 }
 
+async fn resolve_checkout_create_startpoint(
+    start_point: Option<&str>,
+) -> Result<ObjectHash, CheckoutError> {
+    let commit_id = match start_point {
+        Some(spec) => get_commit_base(spec)
+            .await
+            .ok()
+            .or_else(|| ObjectHash::from_str(spec).ok())
+            .ok_or_else(|| CheckoutError::InvalidObjectName(spec.to_string()))?,
+        None => match Head::current_commit_result().await.map_err(|error| {
+            CheckoutError::BranchStoreCorrupt {
+                context: "resolve HEAD commit".to_string(),
+                detail: error.to_string(),
+            }
+        })? {
+            Some(commit_id) => commit_id,
+            None => {
+                let current = match Head::current().await {
+                    Head::Branch(name) => name,
+                    Head::Detached(commit_hash) => commit_hash.to_string(),
+                };
+                return Err(CheckoutError::InvalidObjectName(current));
+            }
+        },
+    };
+    let display = start_point
+        .map(str::to_string)
+        .unwrap_or_else(|| commit_id.to_string());
+    load_object::<Commit>(&commit_id).map_err(|_| CheckoutError::InvalidObjectName(display))?;
+    Ok(commit_id)
+}
+
+async fn reset_and_switch_branch(
+    branch_name: &str,
+    target_commit: ObjectHash,
+    output: &OutputConfig,
+) -> Result<ObjectHash, CheckoutError> {
+    if !branch::is_valid_git_branch_name(branch_name) {
+        return Err(CheckoutError::DelegatedCli(
+            CliError::fatal(format!("'{branch_name}' is not a valid branch name"))
+                .with_stable_code(StableErrorCode::CliInvalidTarget),
+        ));
+    }
+    if is_ai_managed_branch(branch_name) {
+        return Err(CheckoutError::CreatingBranchBlocked(
+            branch_name.to_string(),
+        ));
+    }
+    Branch::update_branch(branch_name, &target_commit.to_string(), None)
+        .await
+        .map_err(|error| CheckoutError::BranchCreate {
+            branch: branch_name.to_string(),
+            detail: error.to_string(),
+        })?;
+    switch_branch_with_output(branch_name, output, true).await
+}
+
 async fn get_remote(branch_name: &str, output: &OutputConfig) -> Result<ObjectHash, CheckoutError> {
     let remote_branch_name: String = format!("origin/{branch_name}");
     let child_output = silent_child_output(output);
 
-    create_and_switch_new_branch(branch_name, &child_output)
+    create_and_switch_new_branch(branch_name, None, &child_output)
         .await
         .map_err(|err| wrap_remote_proxy_error("create local tracking branch", err))?;
     // Set branch upstream

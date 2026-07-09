@@ -7,14 +7,14 @@ Compatible with `git checkout` for common branch operations and explicit path re
 
 ```
 libra checkout [<branch>]
-libra checkout -b <name>
-libra checkout -B <name>
+libra checkout -b <name> [<start-point>]
+libra checkout -B <name> [<start-point>]
 libra checkout [<tree-ish>] -- <pathspec>...
 ```
 
 ## Description
 
-`libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, creating a new branch with `-b`, force-creating or resetting a branch with `-B`, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
+`libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, creating a new branch with `-b` from HEAD or an explicit start-point, force-creating or resetting a branch with `-B` from HEAD or an explicit start-point, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
 
 This command exists so that developers migrating from Git can use familiar muscle memory. For new workflows, prefer `libra switch` (for branch operations) and `libra restore` (for file operations), which provide richer error messages, structured JSON output, and clearer semantics.
 
@@ -27,11 +27,12 @@ Path restoration is only enabled by an explicit `--` separator. Without `--`, `l
 | Flag | Long | Value | Description |
 |------|------|-------|-------------|
 | | `<branch>` | positional (optional) | Target branch to switch to. Omit to show current branch. |
-| `-b` | | `<name>` | Create a new branch from the current HEAD and switch to it |
-| `-B` | | `<name>` | Force-create a branch from the current HEAD and switch to it; resets an existing branch to the current HEAD |
+| `-b` | | `<name>` | Create a new branch from `[<start-point>]` or the current HEAD and switch to it |
+| `-B` | | `<name>` | Force-create a branch from `[<start-point>]` or the current HEAD and switch to it; resets an existing branch to that commit |
+| | `[<start-point>]` | positional | Optional commit, tag, or branch used with `-b` / `-B` as the new branch tip |
 | `-d` | `--detach` | | Detach HEAD at the named commit even when it is a branch (instead of switching to the branch) |
 | `-t` | `--track` | | Set up upstream tracking when checking out a remote-tracking branch. Accepted as a no-op: Libra always configures tracking for a remote-tracking checkout (DWIM), so this requests behavior Libra already performs; no effect for a non-remote target. Use `libra switch --track` for explicit, standalone tracking. |
-| | `--ignore-other-worktrees` | | Check out a branch even if it is already checked out in another worktree. Accepted as a no-op: Libra worktrees share one `HEAD`/refs store, so a branch is never locked to one worktree and there is no other-worktree restriction to override. |
+| | `--ignore-other-worktrees` | | Check out a branch even if another linked worktree has that shared branch checked out; bypasses Libra's other-worktree safety guard. |
 | | `--no-progress` | | Do not show a progress meter. Accepted as a no-op: Libra's checkout never renders a progress meter. |
 | | `--no-overlay` | | Do not check out paths in overlay mode (paths missing from the source are still removed). Accepted as a no-op: Libra's checkout is never in overlay mode, matching the Git default. (Git's `--overlay` is not implemented.) |
 | | `[<tree-ish>] -- <pathspec>...` | positional | Restore paths. Without `<tree-ish>`, restores the worktree from the index. With `<tree-ish>`, restores both index and worktree from that source. |
@@ -47,9 +48,11 @@ libra checkout main
 
 # Create and switch to a new branch
 libra checkout -b feature-x
+libra checkout -b fix-123 abc1234
 
-# Force-create (or reset) and switch to a branch at the current HEAD
+# Force-create (or reset) and switch to a branch at the current HEAD or start-point
 libra checkout -B feature-x
+libra checkout -B feature-x main
 
 # Auto-track a remote branch (creates local, sets upstream, pulls)
 libra checkout feature
@@ -68,7 +71,9 @@ libra checkout                         # Show the current branch
 libra checkout main                    # Switch to an existing local branch
 libra checkout feature-x               # Switch to another branch
 libra checkout -b feature-x            # Create and switch to a new branch
+libra checkout -b fix-123 abc1234      # Create and switch from a start-point
 libra checkout -B feature-x            # Force-create or reset and switch to a branch
+libra checkout -B feature-x main       # Reset branch to a start-point and switch
 libra checkout -- file.txt             # Restore file from index to worktree
 libra checkout HEAD -- file.txt        # Restore file from HEAD to index + worktree
 libra --json checkout main             # Structured compatibility output
@@ -102,6 +107,8 @@ Create and switch to a new branch:
 ```text
 Switched to a new branch 'feature-x'
 ```
+
+When `-b` or `-B` is used with a start-point, the created/reset branch becomes the active symbolic `HEAD` (`refs/heads/<branch>`); Libra does not leave the repository detached after the operation.
 
 Auto-track a remote branch:
 
@@ -160,7 +167,7 @@ Example for switching to an existing local branch:
 | `show-current` | `libra checkout` with no branch |
 | `already-on` | Target branch is already checked out |
 | `switch` | Existing local branch checkout |
-| `create` | `checkout -b <branch>` |
+| `create` | `checkout -b <branch> [<start-point>]` or `checkout -B <branch> [<start-point>]` |
 | `track` | Local branch is created from `origin/<branch>` and pull is attempted |
 | `restore-paths` | Explicit `checkout [<tree-ish>] -- <pathspec>...` path restoration |
 
@@ -226,6 +233,8 @@ When `libra checkout feature` finds `origin/feature` but no local `feature` bran
 | Show current branch | `git branch --show-current` | `libra checkout` (no args) | `jj log -r @` |
 | Switch branch | `git checkout main` | `libra checkout main` | `jj edit <rev>` |
 | Create and switch | `git checkout -b feature` | `libra checkout -b feature` | `jj new` + `jj branch create` |
+| Create from commit | `git checkout -b fix abc1234` | `libra checkout -b fix abc1234` | `jj new abc1234` + `jj branch create fix` |
+| Force-create / reset branch | `git checkout -B feature main` | `libra checkout -B feature main` | N/A |
 | Auto-track remote | `git checkout feature` (creates tracking) | `libra checkout feature` (creates tracking + pulls) | N/A |
 | Restore files | `git checkout -- file` | `libra checkout -- file` (prefer `libra restore file`) | `jj restore` |
 | Restore files from revision | `git checkout HEAD -- file` | `libra checkout HEAD -- file` (prefer `libra restore --source HEAD -S -W file`) | `jj restore --from <revision>` |
@@ -243,7 +252,7 @@ When `libra checkout feature` finds `origin/feature` but no local `feature` bran
 | Untracked file would be overwritten | `LBR-CONFLICT-002` | "local changes would be overwritten by checkout" | 128 |
 | Internal branch blocked | `LBR-CLI-003` | "checking out '{name}' branch is not allowed" | 128 |
 | Create internal branch blocked | `LBR-CLI-003` | "creating/switching to '{name}' branch is not allowed" | 128 |
-| Branch not found (no remote match) | `LBR-CLI-003` | "path specification '{name}' did not match any files known to libra" | 128 |
+| Branch or start-point not found (no remote match) | `LBR-CLI-003` | "path specification '{name}' did not match any files known to libra" | 129 |
 | Pathspec not matched in path mode | `LBR-CLI-003` | "pathspec '{path}' did not match any files" | 128 |
 | `-b` combined with path mode | `LBR-CLI-002` | "checkout path mode cannot be combined with -b" | 128 |
 | Current branch (no-op) | N/A | Prints "Already on {branch}" and succeeds | 0 |
