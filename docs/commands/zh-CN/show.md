@@ -23,7 +23,7 @@ libra show [OPTIONS] [OBJECT] [-- <PATHS>...]
 | `<OBJECT>` | | 对象名（提交、标签、树、blob）或 `<object>:<path>`。默认为 `HEAD`。 |
 | `--no-patch` | `-s` | 跳过 patch 输出，只显示对象元数据。 |
 | `--oneline` | | `--pretty=oneline` 的简写，在一行中打印哈希和主题。 |
-| `--pretty <FORMAT>` | | 以预设（`oneline`）或 `%` 占位符模板（`format:`/`tformat:`/裸模板）格式化 commit header。 |
+| `--pretty <FORMAT>` | | 以预设（`oneline`、`short`、`full`、`fuller`、`reference`、`raw`）或 `%` 占位符模板（`format:`/`tformat:`/裸模板）格式化 commit header。复用 `libra log --format` 的同一组自定义占位符，包括 `%b`、`%B`、`%n`、ASCII/control `%xNN`、`%%`、`%aI`、`%cI`、`%at`、`%ct`、`%D`、`%m` 和颜色占位符。 |
 | `--format <FORMAT>` | | `--pretty=<FORMAT>` 的别名（Git 的 `--format`）。与 `--pretty` 互斥。 |
 | `--abbrev-commit` | | 把默认 header 的 commit 对象名缩写为 7 位前缀。 |
 | `--no-abbrev-commit` | | 显示完整（未缩写）commit 对象名，撤销先前的 `--abbrev-commit`（最后出现者生效）。完整哈希是默认，故单独使用时为 no-op。 |

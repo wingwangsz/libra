@@ -31,7 +31,7 @@ printing panic/backtrace or `Broken pipe` diagnostics.
 | `<OBJECT>` | | Object name (commit, tag, tree, blob) or `<object>:<path>`. Defaults to `HEAD`. |
 | `--no-patch` | `-s` | Skip patch output and only show object metadata. |
 | `--oneline` | | Shorthand for `--pretty=oneline` -- prints hash and subject on one line. |
-| `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`) or a `%`-placeholder template (`format:`/`tformat:`/bare). |
+| `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`, `short`, `full`, `fuller`, `reference`, `raw`) or a `%`-placeholder template (`format:`/`tformat:`/bare). Uses the same custom placeholders as `libra log --format`, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%aI`, `%cI`, `%at`, `%ct`, `%D`, `%m`, and color placeholders. |
 | `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). Mutually exclusive with `--pretty`. |
 | `--abbrev-commit` | | Abbreviate the commit object name in the default header to a 7-character prefix. |
 | `--no-abbrev-commit` | | Show the full (unabbreviated) commit object name, countermanding an earlier `--abbrev-commit` (last one wins). The full hash is the default, so on its own this is a no-op. |

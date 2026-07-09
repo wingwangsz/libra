@@ -45,6 +45,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已从 `src/command/mod.rs` 导出。
 - 用户文档：`docs/commands/for-each-ref.md`，记录公开 CLI 合约。
 - 公开参数/子命令包括：`--heads`、`--tags`、`--remotes`、`--all`、`--format`、`--sort`、`--count`、`--points-at <object>`、`--contains <commit>`、`--no-contains <commit>`、`--merged <commit>`、`--no-merged <commit>`、`--exclude <pattern>`、`<pattern>...`。`--exclude`（可重复）在位置 include 模式过滤之后，丢弃 refname 匹配任一 exclude 模式的 ref（复用 `matches_ref_pattern`）。
+- P1-04 核对结论：`for-each-ref --format` 是 Git 的 `%(atom)` ref 模板语言，已在本页 atom 表中单独维护；它不消费 `log`/`show`/`shortlog` 的 `%` pretty-format placeholder，因此本切片不把 `CommitFormatter` 接入 `for-each-ref`。
 - `--contains <commit>` / `--no-contains <commit>`：仅保留（或排除）其提交以 `<commit>` 为祖先的 ref（即 ref 的提交“包含”该 commit）。复用 `log::get_reachable_commits` 对每个 ref 的 peeled commit 做一次可达性遍历。
 - `--merged <commit>` / `--no-merged <commit>`：仅保留（或排除）其提交可从 `<commit>` 到达的 ref（即 ref 已合并入 `<commit>`），方向与 `--contains` 相反。复用 `log::get_reachable_commits` 对 `<commit>` 计算一次可达集合后逐 ref 判定，避免逐 ref 重复遍历。
 

@@ -20,7 +20,8 @@ libra for-each-ref [--heads] [--tags] [--remotes] [--all] [--format=<format>] [-
 
 当 stdout 被管道连接且下游命令提前退出时，`libra for-each-ref` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
 
-`--format` 选项接受一个简单 atom 语言。支持的 atoms：
+`--format` 选项接受 Git 的 `%(atom)` ref 模板语言；它不同于
+`log`/`show`/`shortlog` 的 `%` pretty-format 占位符。支持的 atoms：
 
 | Atom | 值 |
 |---|---|

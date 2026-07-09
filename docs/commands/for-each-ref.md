@@ -21,7 +21,9 @@ Use `--points-at <object>` to keep refs that point at the resolved object. Annot
 When stdout is piped and the downstream command exits early, `libra for-each-ref` exits quietly
 without printing panic/backtrace or `Broken pipe` diagnostics.
 
-The `--format` option accepts a simple atom language. Supported atoms:
+The `--format` option accepts Git's `%(atom)` language for refs. This is
+separate from `log`/`show`/`shortlog`'s `%` pretty-format placeholders.
+Supported atoms:
 
 | Atom | Value |
 |---|---|
