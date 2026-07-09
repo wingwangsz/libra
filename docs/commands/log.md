@@ -87,6 +87,11 @@ subject/body blank line is collapsed), so they match Git's preset *structure*
 rather than being byte-identical. `libra show --pretty=<preset>` uses the same
 formats.
 
+Custom templates support `%H` / `%h` (full / abbreviated commit hash), `%P` /
+`%p` (full / abbreviated parent hashes), `%s` / `%f` (subject / sanitized
+subject), `%an` / `%ae` / `%ad` (author), `%cn` / `%ce` / `%cd` (committer),
+and `%d` (decorations).
+
 ```bash
 libra log --pretty=short
 libra log --pretty=fuller
@@ -217,12 +222,14 @@ libra log --until 2026-03-01
 
 ### `--pretty <FORMAT>`
 
-Custom pretty-print format string. Supports placeholders like `%h` (short hash), `%s`
-(subject), `%an` (author name), `%ae` (author email), `%ad` (author date), etc.
+Custom pretty-print format string. Supports placeholders like `%H` (full hash), `%h`
+(short hash), `%P` (full parent hashes), `%p` (short parent hashes), `%s` (subject),
+`%an` (author name), `%ae` (author email), `%ad` (author date), etc.
 
 ```bash
 libra log --pretty="%h - %s (%an)"
 libra log --pretty="format:%H %s"
+libra log --pretty=%P -1
 ```
 
 ### `--format <FORMAT>`

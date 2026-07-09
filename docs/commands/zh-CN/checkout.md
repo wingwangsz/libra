@@ -9,12 +9,13 @@
 libra checkout [<branch>]
 libra checkout -b <name> [<start-point>]
 libra checkout -B <name> [<start-point>]
+libra checkout --orphan <name>
 libra checkout [<tree-ish>] -- <pathspec>...
 ```
 
 ## 说明
 
-`libra checkout` 是一个 Git 兼容表面，内部委托给 `switch` 和 `restore`。它支持最常见的 `git checkout` 模式：显示当前分支、切换到已有分支、用 `-b` 从 HEAD 或显式 start-point 创建新分支、用 `-B` 从 HEAD 或显式 start-point 强制创建/重置分支、自动跟踪远程分支，以及在存在显式 `--` 分隔符时恢复路径。
+`libra checkout` 是一个 Git 兼容表面，内部委托给 `switch` 和 `restore`。它支持最常见的 `git checkout` 模式：显示当前分支、切换到已有分支、用 `-b` 从 HEAD 或显式 start-point 创建新分支、用 `-B` 从 HEAD 或显式 start-point 强制创建/重置分支、用 `--orphan` 创建 unborn orphan 分支、自动跟踪远程分支，以及在存在显式 `--` 分隔符时恢复路径。
 
 该命令存在的目的是让从 Git 迁移的开发者可以使用熟悉的肌肉记忆。对于新工作流，优先使用 `libra switch`（分支操作）和 `libra restore`（文件操作），它们提供更丰富的错误消息、结构化 JSON 输出和更清晰的语义。
 
@@ -30,6 +31,7 @@ libra checkout [<tree-ish>] -- <pathspec>...
 | `-b` | | `<name>` | 从 `[<start-point>]` 或当前 HEAD 创建新分支并切换到它 |
 | `-B` | | `<name>` | 从 `[<start-point>]` 或当前 HEAD 强制创建/重置分支并切换到它；已有分支会被重置到该提交 |
 | | `[<start-point>]` | 位置参数 | 与 `-b` / `-B` 搭配使用的可选提交、标签或分支，作为新分支 tip |
+| | `--orphan` | `<name>` | 创建 unborn orphan 分支，保留索引/工作树，并把 HEAD 切到该分支。不支持额外 start-point。 |
 | `-d` | `--detach` | | 即使目标是分支也在其提交处 detach HEAD（而非切换到分支） |
 | `-t` | `--track` | | checkout 远程跟踪分支时配置 upstream。接受式 no-op：Libra 在 checkout 远程跟踪分支时本就通过 DWIM 配置跟踪，故该标志请求的正是已有行为；对非远程目标无效果。独立显式跟踪请用 `libra switch --track`。 |
 | | `--ignore-other-worktrees` | | 即使另一个 linked worktree 已 checkout 这个共享分支，也允许 checkout；该标志会绕过 Libra 的 other-worktree 安全保护。 |
@@ -54,6 +56,9 @@ libra checkout -b fix-123 abc1234
 libra checkout -B feature-x
 libra checkout -B feature-x main
 
+# 创建 unborn orphan 分支；首个提交无 parent
+libra checkout --orphan fresh-start
+
 # 自动跟踪远程分支（创建本地分支、设置 upstream、pull）
 libra checkout feature
 
@@ -74,6 +79,7 @@ libra checkout -b feature-x            # 创建并切换到新分支
 libra checkout -b fix-123 abc1234      # 从 start-point 创建并切换
 libra checkout -B feature-x            # 强制创建或重置分支并切换
 libra checkout -B feature-x main       # 将分支重置到 start-point 并切换
+libra checkout --orphan fresh-start    # 创建 unborn 分支；首个提交无 parent
 libra checkout -- file.txt             # 从索引恢复文件到工作树
 libra checkout HEAD -- file.txt        # 从 HEAD 恢复文件到索引 + 工作树
 libra --json checkout main             # 结构化兼容输出
@@ -109,6 +115,14 @@ Switched to a new branch 'feature-x'
 ```
 
 当 `-b` 或 `-B` 搭配 start-point 使用时，创建/重置后的分支会成为当前 symbolic `HEAD`（`refs/heads/<branch>`）；Libra 不会在操作成功后把仓库留在 detached HEAD。
+
+创建并切换到 unborn orphan 分支：
+
+```text
+Switched to a new branch 'fresh-start'
+```
+
+执行 `checkout --orphan` 后，`HEAD` 是指向 `refs/heads/<branch>` 的 symbolic ref，但首个用户提交前该分支 ref 还不能解析。索引和工作树会保留上一分支的状态；首个提交没有 parent。如果同名分支已存在，Libra 会拒绝命令，不会删除或移动它。
 
 自动跟踪远程分支：
 
@@ -166,11 +180,13 @@ Updated 1 path(s) from HEAD
 | `show-current` | 不带分支的 `libra checkout` |
 | `already-on` | 目标分支已经 checkout |
 | `switch` | Checkout 已有本地分支 |
-| `create` | `checkout -b <branch> [<start-point>]` 或 `checkout -B <branch> [<start-point>]` |
+| `create` | `checkout -b <branch> [<start-point>]`、`checkout -B <branch> [<start-point>]` 或 `checkout --orphan <branch>` |
 | `track` | 从 `origin/<branch>` 创建本地分支并尝试 pull |
 | `restore-paths` | 显式 `checkout [<tree-ish>] -- <pathspec>...` 路径恢复 |
 
 远程 auto-track 输出会设置 `created: true`、`pulled: true`，并包含 `tracking.remote` 和 `tracking.remote_branch`。
+
+对于 `checkout --orphan`，`action` 为 `create`，`created` 为 `true`，`branch` 是 unborn 分支名，首个用户提交创建分支 ref 前 `commit` / `short_commit` 为 `null`。
 
 对于更丰富的分支工作流，`libra switch --json ...` 仍是首选结构化命令。对于文件工作流，`libra restore --json ...` 仍是首选；checkout path 模式只是 Git 兼容别名。
 

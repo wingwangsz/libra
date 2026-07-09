@@ -327,6 +327,17 @@ impl CommitFormatter {
         let mut result = template.to_string();
         let commit_id = commit.id.to_string();
         let short_hash = commit_id.chars().take(ctx.abbrev_len).collect::<String>();
+        let parent_ids = commit
+            .parent_commit_ids
+            .iter()
+            .map(|parent| parent.to_string())
+            .collect::<Vec<_>>();
+        let parents = parent_ids.join(" ");
+        let short_parents = parent_ids
+            .iter()
+            .map(|parent| parent.chars().take(ctx.abbrev_len).collect::<String>())
+            .collect::<Vec<_>>()
+            .join(" ");
         let (subject, _) = parse_commit_msg(&commit.message);
         let subject_line = subject.lines().next().unwrap_or("");
         let decoration = if ctx.decoration.is_empty() {
@@ -337,6 +348,8 @@ impl CommitFormatter {
 
         result = result.replace("%H", &commit_id);
         result = result.replace("%h", &short_hash);
+        result = result.replace("%P", &parents);
+        result = result.replace("%p", &short_parents);
         result = result.replace("%s", subject_line);
         result = result.replace("%f", &subject_line.replace(' ', "-"));
         result = result.replace("%an", commit.author.name.trim());
@@ -411,6 +424,38 @@ mod tests {
         let out = formatter.format(&commit, &ctx);
         assert!(out.contains(" - Test subject"));
         assert!(out.split_whitespace().next().unwrap().len() <= 8);
+    }
+
+    #[test]
+    fn format_custom_parent_placeholders() {
+        let mut commit = build_commit("Child subject");
+        let parent_a = ObjectHash::new(&[2; 20]);
+        let parent_b = ObjectHash::new(&[3; 20]);
+        commit.parent_commit_ids = vec![parent_a, parent_b];
+
+        let formatter = CommitFormatter::new(FormatType::Custom("%P|%p".into()));
+        let ctx = FormatContext {
+            graph_prefix: "",
+            decoration: "",
+            abbrev_len: 8,
+            extra_hashes: "",
+        };
+
+        let out = formatter.format(&commit, &ctx);
+        assert_eq!(
+            out,
+            format!(
+                "{} {}|{} {}",
+                parent_a,
+                parent_b,
+                parent_a.to_string().chars().take(8).collect::<String>(),
+                parent_b.to_string().chars().take(8).collect::<String>()
+            )
+        );
+
+        let root = build_commit("Root subject");
+        let out = formatter.format(&root, &ctx);
+        assert_eq!(out, "|");
     }
 
     #[test]

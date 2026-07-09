@@ -60,6 +60,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `diff_check_safety_test.rs` | P0-02 (plan-20260708) | `diff --check` 覆盖 Git 的三类安全检查：尾随空白、leftover conflict marker、new blank line at EOF，且任一命中退出码为 2 |
 | `clone_shallow_integrity_test.rs` | P0-03 (plan-20260708) | 本地 Libra 源的 `clone --depth` / `fetch --depth` 必须 fail-closed（`LBR-REPO-002`）且不留下 broken target / shallow metadata；`rev-parse --is-shallow-repository` 正确报告 shallow 布尔 |
 | `checkout_branch_startpoint_test.rs` | P0-04 (plan-20260708) | `checkout -b/-B <branch> <start-point>` 与 `switch -C <branch> <start-point>` 必须把 `HEAD` 保持为目标分支的 symbolic ref；无效 start-point 必须 fail-closed 且不移动 `HEAD` / 既有分支引用 |
+| `switch_orphan_root_test.rs` | P0-05 (plan-20260708) | `switch --orphan` / `checkout --orphan` 必须把 `HEAD` 指向 unborn 分支、保留 index/worktree、JSON 标记 `unborn=true`，并让首个用户提交成为无 parent 的 root commit；已有分支和不支持的 start-point 必须 fail-closed |
 
 ## Authoring guidelines
 

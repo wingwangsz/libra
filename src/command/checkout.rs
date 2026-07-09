@@ -38,6 +38,7 @@ EXAMPLES:
     libra checkout main                    Switch to a branch (prefer: libra switch main)
     libra checkout feature-x               Switch to another branch (prefer: libra switch feature-x)
     libra checkout -b feature-x            Create + switch to a new branch (prefer: libra switch -c feature-x)
+    libra checkout --orphan fresh-start    Create an unborn orphan branch (prefer: libra switch --orphan fresh-start)
     libra checkout --detach main           Detach HEAD at a branch's commit instead of switching
     libra checkout -t origin/main          --track accepted; remote checkout tracks via DWIM
     libra checkout -- file.txt             Restore a path from the index (prefer: libra restore file.txt)
@@ -58,6 +59,10 @@ pub struct CheckoutArgs {
     /// Create or reset a branch and switch to it
     #[clap(short = 'B', group = "sub")]
     force_new_branch: Option<String>,
+
+    /// Create an unborn orphan branch and switch to it, preserving the index/worktree
+    #[clap(long = "orphan", group = "sub")]
+    orphan_branch: Option<String>,
 
     /// Proceed even when the working tree/index differs from HEAD, discarding
     /// local modifications to tracked files. Untracked files are still preserved.
@@ -318,6 +323,13 @@ async fn run_checkout(
             force_new_branch_name.clone(),
         ));
     }
+    if let Some(ref orphan_branch_name) = args.orphan_branch
+        && is_ai_managed_branch(orphan_branch_name)
+    {
+        return Err(CheckoutError::CreatingBranchBlocked(
+            orphan_branch_name.clone(),
+        ));
+    }
 
     let previous_branch = get_current_branch().await;
     let previous_commit = current_commit_string().await?;
@@ -330,6 +342,7 @@ async fn run_checkout(
         && !args.detach
         && args.new_branch.is_none()
         && args.force_new_branch.is_none()
+        && args.orphan_branch.is_none()
     {
         return Ok(CheckoutOutput {
             action: "already-on".to_string(),
@@ -342,6 +355,41 @@ async fn run_checkout(
             created: false,
             pulled: false,
             already_on: true,
+            detached: false,
+            tracking: None,
+            restore: None,
+        });
+    }
+
+    if let Some(orphan_branch) = args.orphan_branch {
+        if let Some(start_point) = args.branch {
+            return Err(CheckoutError::DelegatedCli(
+                CliError::command_usage("checkout --orphan does not accept a start-point")
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint(format!(
+                        "run 'libra checkout --orphan {orphan_branch}' without '{start_point}'."
+                    )),
+            ));
+        }
+        let switch_output = switch::switch_to_orphan_branch(
+            orphan_branch.clone(),
+            previous_branch,
+            previous_commit,
+            output,
+        )
+        .await
+        .map_err(map_switch_error)?;
+        return Ok(CheckoutOutput {
+            action: "create".to_string(),
+            previous_branch: switch_output.previous_branch,
+            previous_commit: switch_output.previous_commit,
+            branch: Some(orphan_branch),
+            commit: None,
+            short_commit: None,
+            switched: true,
+            created: true,
+            pulled: false,
+            already_on: false,
             detached: false,
             tracking: None,
             restore: None,
@@ -504,6 +552,9 @@ async fn restore_checkout_paths(args: CheckoutArgs) -> Result<CheckoutOutput, Ch
     if args.force_new_branch.is_some() {
         return Err(CheckoutError::InvalidPathMode("-B".to_string()));
     }
+    if args.orphan_branch.is_some() {
+        return Err(CheckoutError::InvalidPathMode("--orphan".to_string()));
+    }
 
     let previous_branch = get_current_branch().await;
     let previous_commit = current_commit_string().await?;
@@ -560,14 +611,15 @@ fn map_checkout_branch_store_error(context: &str, error: BranchStoreError) -> Ch
 }
 
 fn map_switch_preflight(result: Result<(), switch::SwitchError>) -> Result<(), CheckoutError> {
-    match result {
-        Ok(()) => Ok(()),
-        Err(switch::SwitchError::DirtyUnstaged) => Err(CheckoutError::DirtyUnstaged),
-        Err(switch::SwitchError::DirtyUncommitted) => Err(CheckoutError::DirtyUncommitted),
-        Err(switch::SwitchError::UntrackedOverwrite(path)) => {
-            Err(CheckoutError::UntrackedOverwrite(path))
-        }
-        Err(err) => Err(CheckoutError::DelegatedCli(CliError::from(err))),
+    result.map_err(map_switch_error)
+}
+
+fn map_switch_error(err: switch::SwitchError) -> CheckoutError {
+    match err {
+        switch::SwitchError::DirtyUnstaged => CheckoutError::DirtyUnstaged,
+        switch::SwitchError::DirtyUncommitted => CheckoutError::DirtyUncommitted,
+        switch::SwitchError::UntrackedOverwrite(path) => CheckoutError::UntrackedOverwrite(path),
+        err => CheckoutError::DelegatedCli(CliError::from(err)),
     }
 }
 

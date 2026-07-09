@@ -9,12 +9,13 @@ Compatible with `git checkout` for common branch operations and explicit path re
 libra checkout [<branch>]
 libra checkout -b <name> [<start-point>]
 libra checkout -B <name> [<start-point>]
+libra checkout --orphan <name>
 libra checkout [<tree-ish>] -- <pathspec>...
 ```
 
 ## Description
 
-`libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, creating a new branch with `-b` from HEAD or an explicit start-point, force-creating or resetting a branch with `-B` from HEAD or an explicit start-point, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
+`libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, creating a new branch with `-b` from HEAD or an explicit start-point, force-creating or resetting a branch with `-B` from HEAD or an explicit start-point, creating an unborn orphan branch with `--orphan`, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
 
 This command exists so that developers migrating from Git can use familiar muscle memory. For new workflows, prefer `libra switch` (for branch operations) and `libra restore` (for file operations), which provide richer error messages, structured JSON output, and clearer semantics.
 
@@ -30,6 +31,7 @@ Path restoration is only enabled by an explicit `--` separator. Without `--`, `l
 | `-b` | | `<name>` | Create a new branch from `[<start-point>]` or the current HEAD and switch to it |
 | `-B` | | `<name>` | Force-create a branch from `[<start-point>]` or the current HEAD and switch to it; resets an existing branch to that commit |
 | | `[<start-point>]` | positional | Optional commit, tag, or branch used with `-b` / `-B` as the new branch tip |
+| | `--orphan` | `<name>` | Create an unborn orphan branch, preserve the index/worktree, and switch HEAD to it. A separate start-point is not supported. |
 | `-d` | `--detach` | | Detach HEAD at the named commit even when it is a branch (instead of switching to the branch) |
 | `-t` | `--track` | | Set up upstream tracking when checking out a remote-tracking branch. Accepted as a no-op: Libra always configures tracking for a remote-tracking checkout (DWIM), so this requests behavior Libra already performs; no effect for a non-remote target. Use `libra switch --track` for explicit, standalone tracking. |
 | | `--ignore-other-worktrees` | | Check out a branch even if another linked worktree has that shared branch checked out; bypasses Libra's other-worktree safety guard. |
@@ -54,6 +56,9 @@ libra checkout -b fix-123 abc1234
 libra checkout -B feature-x
 libra checkout -B feature-x main
 
+# Create an unborn orphan branch; first commit has no parents
+libra checkout --orphan fresh-start
+
 # Auto-track a remote branch (creates local, sets upstream, pulls)
 libra checkout feature
 
@@ -74,6 +79,7 @@ libra checkout -b feature-x            # Create and switch to a new branch
 libra checkout -b fix-123 abc1234      # Create and switch from a start-point
 libra checkout -B feature-x            # Force-create or reset and switch to a branch
 libra checkout -B feature-x main       # Reset branch to a start-point and switch
+libra checkout --orphan fresh-start    # Create unborn branch; first commit has no parents
 libra checkout -- file.txt             # Restore file from index to worktree
 libra checkout HEAD -- file.txt        # Restore file from HEAD to index + worktree
 libra --json checkout main             # Structured compatibility output
@@ -109,6 +115,14 @@ Switched to a new branch 'feature-x'
 ```
 
 When `-b` or `-B` is used with a start-point, the created/reset branch becomes the active symbolic `HEAD` (`refs/heads/<branch>`); Libra does not leave the repository detached after the operation.
+
+Create and switch to an unborn orphan branch:
+
+```text
+Switched to a new branch 'fresh-start'
+```
+
+After `checkout --orphan`, `HEAD` is a symbolic reference to `refs/heads/<branch>`, but that branch ref does not resolve until the first user commit. The index and working tree are preserved from the previous branch; the first commit has no parents. If the branch already exists, Libra rejects the command without deleting or moving it.
 
 Auto-track a remote branch:
 
@@ -167,11 +181,13 @@ Example for switching to an existing local branch:
 | `show-current` | `libra checkout` with no branch |
 | `already-on` | Target branch is already checked out |
 | `switch` | Existing local branch checkout |
-| `create` | `checkout -b <branch> [<start-point>]` or `checkout -B <branch> [<start-point>]` |
+| `create` | `checkout -b <branch> [<start-point>]`, `checkout -B <branch> [<start-point>]`, or `checkout --orphan <branch>` |
 | `track` | Local branch is created from `origin/<branch>` and pull is attempted |
 | `restore-paths` | Explicit `checkout [<tree-ish>] -- <pathspec>...` path restoration |
 
 Remote auto-track output sets `created: true`, `pulled: true`, and includes `tracking.remote` plus `tracking.remote_branch`.
+
+For `checkout --orphan`, `action` is `create`, `created` is `true`, `branch` is the unborn branch name, and `commit` / `short_commit` are `null` until the first user commit creates the branch ref.
 
 For richer branch workflows, `libra switch --json ...` remains the preferred structured command. For file workflows, `libra restore --json ...` remains preferred; checkout path mode is only a Git-compatible alias.
 

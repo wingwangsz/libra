@@ -75,6 +75,8 @@ libra log --no-abbrev-commit
 
 预设继承 `libra log` 既有惯例（时间戳渲染为 UTC `+0000`；`--pretty` 缩写哈希；存储消息中 subject/body 间空行已折叠），故与 Git 预设**结构**一致而非逐字节相同。`libra show --pretty=<preset>` 使用相同格式。
 
+自定义模板支持 `%H` / `%h`（完整 / 缩写提交哈希）、`%P` / `%p`（完整 / 缩写父提交哈希列表）、`%s` / `%f`（主题 / 清理后的主题）、`%an` / `%ae` / `%ad`（作者）、`%cn` / `%ce` / `%cd`（提交者）和 `%d`（装饰）。
+
 ```bash
 libra log --pretty=short
 libra log --pretty=fuller
@@ -173,11 +175,12 @@ libra log --until 2026-03-01
 
 ### `--pretty <FORMAT>`
 
-自定义 pretty-print 格式字符串。支持 `%h`（短哈希）、`%s`（主题）、`%an`（作者名）、`%ae`（作者 email）、`%ad`（作者日期）等占位符。
+自定义 pretty-print 格式字符串。支持 `%H`（完整哈希）、`%h`（短哈希）、`%P`（完整父提交哈希列表）、`%p`（短父提交哈希列表）、`%s`（主题）、`%an`（作者名）、`%ae`（作者 email）、`%ad`（作者日期）等占位符。
 
 ```bash
 libra log --pretty="%h - %s (%an)"
 libra log --pretty="format:%H %s"
+libra log --pretty=%P -1
 ```
 
 ### `--format <FORMAT>`
