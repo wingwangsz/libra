@@ -301,6 +301,20 @@ impl RpcAgent {
         binary: RpcAgentBinary,
         repo_root: Option<&std::path::Path>,
     ) -> Result<Self> {
+        Self::spawn_in_repo_with_env(binary, repo_root, &[])
+    }
+
+    /// [`Self::spawn_in_repo`] plus an operator-configured
+    /// `extra_env_allowlist` of additional exact env-var names to pass through
+    /// (A0-08 `agent.external_agents.env_allowlist_extra`). Each name is
+    /// re-checked against [`env_name_is_forbidden`] here as defense-in-depth,
+    /// so a credential/endpoint name can never reach the child even if it
+    /// slipped into config.
+    pub fn spawn_in_repo_with_env(
+        binary: RpcAgentBinary,
+        repo_root: Option<&std::path::Path>,
+        extra_env_allowlist: &[String],
+    ) -> Result<Self> {
         let mut command = Command::new(&binary.binary_path);
         command
             .env_clear()
@@ -317,6 +331,16 @@ impl RpcAgent {
         // not on this list — including every credential/endpoint variable —
         // stays out of the child.
         for name in RPC_ENV_PASSTHROUGH_ALLOWLIST {
+            if let Some(value) = std::env::var_os(name) {
+                command.env(name, value);
+            }
+        }
+        // A0-08 extra passthrough: operator-approved additional names, with a
+        // hard secret/wildcard denial re-applied here.
+        for name in extra_env_allowlist {
+            if super::trust::env_name_is_forbidden(name) {
+                continue;
+            }
             if let Some(value) = std::env::var_os(name) {
                 command.env(name, value);
             }

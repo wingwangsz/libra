@@ -90,6 +90,7 @@ EXAMPLES:
     libra agent push --remote origin                Push refs/libra/traces to a named remote
     libra agent rpc list                            Discover libra-agent-<name> RPC binaries on PATH
     libra agent rpc trust <slug>                    Trust a discovered binary (records sha256/inode provenance)
+    libra agent rpc trust --dir <path>              Register a trusted directory (binaries must live under one)
     libra agent rpc untrust <slug>                  Revoke trust (binary returns to quarantine)
     libra agent rpc invoke <slug> <method>          Invoke a single JSON-RPC method (use --params '<json>' for arguments)
     libra agent --json status                       Structured JSON output for agents";

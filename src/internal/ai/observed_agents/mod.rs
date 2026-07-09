@@ -75,9 +75,11 @@ pub use skill_projection::{
     SkillQuery, discover_skills,
 };
 pub use trust::{
-    EXTERNAL_AGENTS_ENABLED_KEY, Provenance, TrustRecord, compute_provenance,
-    ensure_parent_not_world_writable, external_agents_enabled, read_trust, record_trust,
-    revalidate_trust, revoke_trust,
+    DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY, Provenance,
+    TRUSTED_DIRS_KEY, TrustRecord, add_trusted_dir, compute_provenance,
+    ensure_dir_not_world_writable, ensure_parent_not_world_writable, env_allowlist_extra,
+    env_name_is_forbidden, external_agents_enabled, path_within_trusted_dirs, read_trust,
+    read_trusted_dirs, record_trust, revalidate_trust, revoke_trust,
 };
 
 /// Borrow the static [`ObservedAgent`] for the supplied [`AgentKind`].

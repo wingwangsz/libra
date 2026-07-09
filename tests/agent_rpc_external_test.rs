@@ -274,3 +274,83 @@ fn non_method_not_found_info_failure_propagates() {
         "info failure propagates: {err}"
     );
 }
+
+/// A0-08: `env_allowlist_extra` passes an operator-approved extra var through
+/// the cleared child, but a credential name (`*_API_KEY`) is dropped even when
+/// explicitly requested; the forbidden-name classifier and trusted-dir
+/// containment predicate are pinned here too.
+#[test]
+#[serial(rpc_env_probe)]
+fn trusted_dirs_env_allowlist_extra() {
+    use libra::internal::ai::observed_agents::{env_name_is_forbidden, path_within_trusted_dirs};
+
+    let dir = tempfile::tempdir().unwrap();
+    let body = "#!/bin/sh\n\
+        read _l; printf '{\"jsonrpc\":\"2.0\",\"id\":1,\"result\":{\"methods\":[\"capabilities\",\"env_probe\"]}}\\n'\n\
+        read _l; printf '{\"jsonrpc\":\"2.0\",\"id\":2,\"result\":{\"extra\":\"%s\",\"secret\":\"%s\"}}\\n' \"$MY_EXTRA_VAR\" \"$MYSERVICE_API_KEY\"\n";
+    let binary = plant_script(dir.path(), "extraenv", body);
+
+    let original_extra = std::env::var_os("MY_EXTRA_VAR");
+    let original_secret = std::env::var_os("MYSERVICE_API_KEY");
+    // SAFETY: serialized via #[serial(rpc_env_probe)]; removed/restored below.
+    unsafe {
+        std::env::set_var("MY_EXTRA_VAR", "extra-value");
+        std::env::set_var("MYSERVICE_API_KEY", "sk-should-be-dropped");
+    }
+    // The operator requests BOTH; the forbidden *_API_KEY must still be dropped.
+    let extra_allowlist = vec!["MY_EXTRA_VAR".to_string(), "MYSERVICE_API_KEY".to_string()];
+    let mut agent = RpcAgent::spawn_in_repo_with_env(binary, None, &extra_allowlist).unwrap();
+    agent.negotiate_capabilities().unwrap();
+    let result = agent.invoke("env_probe", None).unwrap();
+    unsafe {
+        match original_extra {
+            Some(v) => std::env::set_var("MY_EXTRA_VAR", v),
+            None => std::env::remove_var("MY_EXTRA_VAR"),
+        }
+        match original_secret {
+            Some(v) => std::env::set_var("MYSERVICE_API_KEY", v),
+            None => std::env::remove_var("MYSERVICE_API_KEY"),
+        }
+    }
+    assert_eq!(
+        result["extra"], "extra-value",
+        "an approved extra var passes through"
+    );
+    assert_eq!(
+        result["secret"], "",
+        "a *_API_KEY is dropped even when explicitly requested"
+    );
+
+    // The forbidden-name classifier (case-insensitive, wildcard-rejecting).
+    for forbidden in [
+        "OPENAI_API_KEY",
+        "gh_token",
+        "MY_SECRET",
+        "DB_PASSWORD",
+        "LIBRA_STORAGE_BUCKET",
+        "LIBRA_D1_ACCOUNT_ID",
+        "FOO*",
+        "",
+    ] {
+        assert!(
+            env_name_is_forbidden(forbidden),
+            "{forbidden:?} must be forbidden"
+        );
+    }
+    for allowed in ["MY_EXTRA_VAR", "RUST_LOG", "HTTP_PROXY"] {
+        assert!(
+            !env_name_is_forbidden(allowed),
+            "{allowed:?} must be allowed"
+        );
+    }
+
+    // Trusted-directory containment (pure).
+    let root = dir.path().canonicalize().unwrap();
+    let inside = root.join("sub").join("libra-agent-x");
+    assert!(path_within_trusted_dirs(
+        &inside,
+        std::slice::from_ref(&root)
+    ));
+    let outside = std::path::Path::new("/usr/bin/libra-agent-x");
+    assert!(!path_within_trusted_dirs(outside, &[root]));
+}
