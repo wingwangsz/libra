@@ -34,6 +34,7 @@ use crate::{
     },
     internal::{config::ConfigKv, head::Head},
     utils::{
+        attributes,
         error::{CliError, CliResult, StableErrorCode},
         ignore::{self, IgnorePolicy},
         object_ext::TreeExt,
@@ -315,11 +316,11 @@ pub struct DiffArgs {
     pub no_indent_heuristic: bool,
 
     /// Run textconv filters to make content human-diffable: a file whose
-    /// `diff=<driver>` attribute (in `.libra_attributes`) names a driver with a
-    /// `diff.<driver>.textconv` command has each side converted by that command
-    /// before diffing. Like Git, textconv is ON by default for `diff`; this flag
-    /// is the explicit opposite of `--no-textconv`. The resulting patch is for
-    /// reading, not applying.
+    /// `diff=<driver>` attribute from Git/Libra attribute sources names a driver
+    /// with a `diff.<driver>.textconv` command has each side converted by that
+    /// command before diffing. Like Git, textconv is ON by default for `diff`;
+    /// this flag is the explicit opposite of `--no-textconv`. The resulting
+    /// patch is for reading, not applying.
     #[clap(long = "textconv", overrides_with = "no_textconv")]
     pub textconv: bool,
 
@@ -1416,51 +1417,46 @@ async fn run_diff(args: &DiffArgs, output: &OutputConfig) -> Result<DiffOutput, 
     // leaves textconv'd files alone.
     let textconv_paths: std::collections::HashSet<String> =
         if !args.no_textconv && !args.check && external_command.is_none() {
-            let drivers = extract_diff_drivers(&path::attributes());
-            if drivers.is_empty() {
+            let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
+            // Per file: the (old-side, new-side) textconv command. A rename's
+            // old side is at `rename_from` and may resolve a different driver
+            // than the new side (Git resolves textconv per blob/path), so each
+            // side is looked up independently.
+            let mut path_commands: HashMap<String, (Option<String>, Option<String>)> =
+                HashMap::new();
+            for file in &files {
+                let new_path = PathBuf::from(&file.path);
+                let old_path = file
+                    .rename_from
+                    .as_deref()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| new_path.clone());
+                let new_driver = attributes::diff_driver_for_path(&new_path);
+                let new_command =
+                    resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
+                let old_command = if old_path == new_path {
+                    new_command.clone()
+                } else {
+                    let old_driver = attributes::diff_driver_for_path(&old_path);
+                    resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
+                };
+                if old_command.is_some() || new_command.is_some() {
+                    path_commands.insert(file.path.clone(), (old_command, new_command));
+                }
+            }
+            if path_commands.is_empty() {
                 std::collections::HashSet::new()
             } else {
-                let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
-                // Per file: the (old-side, new-side) textconv command. A rename's
-                // old side is at `rename_from` and may resolve a different driver
-                // than the new side (Git resolves textconv per blob/path), so each
-                // side is looked up independently.
-                let mut path_commands: HashMap<String, (Option<String>, Option<String>)> =
-                    HashMap::new();
-                for file in &files {
-                    let new_path = PathBuf::from(&file.path);
-                    let old_path = file
-                        .rename_from
-                        .as_deref()
-                        .map(PathBuf::from)
-                        .unwrap_or_else(|| new_path.clone());
-                    let new_driver = diff_driver_for_path(&drivers, &new_path);
-                    let new_command =
-                        resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
-                    let old_command = if old_path == new_path {
-                        new_command.clone()
-                    } else {
-                        let old_driver = diff_driver_for_path(&drivers, &old_path);
-                        resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
-                    };
-                    if old_command.is_some() || new_command.is_some() {
-                        path_commands.insert(file.path.clone(), (old_command, new_command));
-                    }
-                }
-                if path_commands.is_empty() {
-                    std::collections::HashSet::new()
-                } else {
-                    apply_textconv(
-                        &mut files,
-                        &path_commands,
-                        &first_map,
-                        &second_map,
-                        &ext_worktree_entries,
-                        regen_context,
-                        ws_normalize,
-                        args.ignore_blank_lines,
-                    )?
-                }
+                apply_textconv(
+                    &mut files,
+                    &path_commands,
+                    &first_map,
+                    &second_map,
+                    &ext_worktree_entries,
+                    regen_context,
+                    ws_normalize,
+                    args.ignore_blank_lines,
+                )?
             }
         } else {
             std::collections::HashSet::new()
@@ -2609,59 +2605,6 @@ fn build_rename_entry(
         binary: None,
         check_trailing_blank_start: None,
     }
-}
-
-/// Parse `.libra_attributes` for `diff` attributes, returning `(pattern, value)`
-/// pairs in file order. `value` is `Some(driver)` for `diff=<driver>` and `None`
-/// for `-diff` / `!diff` / a bare `diff` (which unset or reset the driver, so a
-/// later such entry clears an earlier `diff=<driver>` under last-match-wins).
-fn extract_diff_drivers(attr_path: &Path) -> Vec<(String, Option<String>)> {
-    let Ok(content) = std::fs::read_to_string(attr_path) else {
-        return Vec::new();
-    };
-    let mut out = Vec::new();
-    for line in content.lines() {
-        let line = line.trim();
-        if line.is_empty() || line.starts_with('#') {
-            continue;
-        }
-        let mut tokens = line.split_whitespace();
-        let Some(pattern) = tokens.next() else {
-            continue;
-        };
-        for token in tokens {
-            if let Some(driver) = token.strip_prefix("diff=") {
-                if !driver.is_empty() {
-                    out.push((pattern.to_string(), Some(driver.to_string())));
-                }
-            } else if token == "diff" || token == "-diff" || token == "!diff" {
-                // Set/unset/unspecified: no named driver → clears any earlier one.
-                out.push((pattern.to_string(), None));
-            }
-        }
-    }
-    out
-}
-
-/// The diff driver assigned to `path` by `.libra_attributes` — the LAST matching
-/// `diff` attribute wins (Git's attribute semantics); a matching unset/reset
-/// (`-diff`/`!diff`/bare `diff`) clears any earlier `diff=<driver>`, so this
-/// returns `None` for it.
-fn diff_driver_for_path(drivers: &[(String, Option<String>)], path: &Path) -> Option<String> {
-    let workdir = util::working_dir();
-    let mut result = None;
-    for (pattern, value) in drivers {
-        let mut builder = ::ignore::gitignore::GitignoreBuilder::new(&workdir);
-        if builder.add_line(None, pattern).is_err() {
-            continue;
-        }
-        if let Ok(gi) = builder.build()
-            && matches!(gi.matched(path, false), ::ignore::Match::Ignore(_))
-        {
-            result = value.clone();
-        }
-    }
-    result
 }
 
 /// Run a `diff.<driver>.textconv` command on `content`: Git writes the blob to a

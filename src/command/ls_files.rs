@@ -30,7 +30,7 @@ EXAMPLES:
     libra ls-files -m                   Show only modified files (-m = --modified)
     libra ls-files --stage              Include stage information (for conflicts)
     libra ls-files --others             Show untracked files
-    libra ls-files --exclude-standard   Exclude files matching .libraignore
+    libra ls-files --exclude-standard   Exclude files matching standard ignore sources
     libra ls-files -o -x '*.log'        Show untracked files except ones matching a pattern
     libra ls-files -o -X .gitignore-extra  Read extra exclude patterns from a file
     libra ls-files -i -o --exclude-standard  List only the ignored untracked files
@@ -73,7 +73,7 @@ pub struct LsFilesArgs {
     #[clap(long = "ignored", short = 'i')]
     pub ignored: bool,
 
-    /// Exclude files matching .libraignore patterns
+    /// Exclude files matching standard Git/Libra ignore sources
     #[clap(long)]
     pub exclude_standard: bool,
 
@@ -122,8 +122,8 @@ pub struct LsFilesArgs {
 
     /// Show line-ending info for each cached file: `i/<eol> w/<eol> attr/<attr>`
     /// before the path, where `<eol>` is `lf`/`crlf`/`mixed`/`none`/`-text` for
-    /// the index blob (`i/`) and the worktree file (`w/`). Libra has no
-    /// `.gitattributes` support, so `attr/` is always empty.
+    /// the index blob (`i/`) and the worktree file (`w/`). Line-ending
+    /// attribute reporting is not implemented, so `attr/` is always empty.
     #[clap(long)]
     pub eol: bool,
 
@@ -181,8 +181,8 @@ fn run_ls_files(
         })?;
     // Whether a path is excluded, with Git source precedence: the explicit
     // `-x`/`-X` matcher (higher precedence) decides first — an explicit negation
-    // (`Some(false)`) re-includes the path even if `.libraignore` would exclude
-    // it; only when no custom pattern matches (`None`) do the standard
+    // (`Some(false)`) re-includes the path even if a standard ignore source
+    // would exclude it; only when no custom pattern matches (`None`) do the standard
     // `--exclude-standard` rules apply.
     let is_excluded = |abs: &Path| {
         let custom = custom_excludes
@@ -244,7 +244,7 @@ fn run_ls_files(
             for entry in index.tracked_entries(*stage) {
                 let worktree_path = workdir.join(&entry.name);
                 // `-i`: among cached entries, list only those matching an exclude
-                // pattern — `.libraignore` (under `--exclude-standard`) or an
+                // pattern — standard sources under `--exclude-standard` or an
                 // explicit `-x`/`-X` pattern (a tracked file that would be ignored).
                 if _args.ignored && !is_excluded(&worktree_path) {
                     continue;
@@ -310,7 +310,7 @@ fn run_ls_files(
             }
             let abs = workdir.join(&file);
             // An untracked file is "excluded" per Git source precedence: explicit
-            // `-x`/`-X` first, then `.libraignore` under `--exclude-standard`.
+            // `-x`/`-X` first, then the standard sources under `--exclude-standard`.
             let excluded = is_excluded(&abs);
             if _args.ignored {
                 // `-i -o`: list ONLY the excluded (ignored) untracked files.
@@ -557,7 +557,8 @@ fn classify_eol(data: &[u8]) -> &'static str {
 /// Build the `git ls-files --eol` column (`i/<eol> w/<eol> attr/<attr>\t`) for
 /// one entry: the index-blob eol (loaded by object id) and the worktree-file eol
 /// (read from disk). A missing blob/file leaves that field empty (Git's
-/// `lstat`-failed case). `attr/` is always empty (Libra has no `.gitattributes`).
+/// `lstat`-failed case). `attr/` is always empty because line-ending attribute
+/// reporting is not implemented.
 /// The format (`i/%-5s w/%-5s attr/%-17s\t`) is byte-compatible with Git, and
 /// the caller inserts it immediately before the path (composing with `-t`/`-s`).
 fn eol_column(entry: &FileEntry, workdir: &Path) -> String {

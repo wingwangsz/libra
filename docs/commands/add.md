@@ -19,7 +19,7 @@ for the next `libra commit`. It supports shared Git-style pathspec matching,
 staging new content.
 
 The command resolves pathspecs relative to the current working directory, validates them
-against the repository root, and respects `.libraignore` rules. Files tracked by LFS are
+against the repository root, and respects Git/Libra ignore sources. Files tracked by LFS are
 automatically staged as pointer files. The `-A` flag stages all changes (adds, modifies,
 removes) across the entire working tree, while `-u` updates only tracked files without
 adding new ones.
@@ -86,7 +86,7 @@ libra add --refresh
 
 ### `-f, --force`
 
-Allow adding files that are otherwise ignored by `.libraignore`.
+Allow adding files that are otherwise ignored by Git/Libra ignore rules.
 
 ```bash
 libra add -f ignored_file.log
@@ -217,7 +217,8 @@ add 'src/lib.rs' (modified)
 Ignored files produce a warning on `stderr`:
 
 ```text
-warning: all specified paths are ignored by .libraignore
+warning: the following paths are ignored by configured ignore rules:
+ignored.log
 Hint: use '-f' to force staging of ignored files
 ```
 
@@ -291,7 +292,7 @@ Partial failure with `--ignore-errors`:
 
 - `added` / `modified` / `removed` correspond to new, changed, and deleted files staged
 - `refreshed` is populated only when `--refresh` is used
-- `ignored` lists paths skipped by `.libraignore`
+- `ignored` lists paths skipped by Git/Libra ignore rules
 - `failed` lists paths that failed to stage, each with `path` and `message`
 - `dry_run` is `true` when `-n` / `--dry-run` is passed; no files are actually staged
 
@@ -325,14 +326,19 @@ by clap argument groups). This makes the intent explicit: `--refresh` never stag
 content, only updates metadata. The mutual exclusivity prevents confusing combinations like
 `-A --refresh` where the user's intent would be ambiguous.
 
-### `.libraignore` instead of `.gitignore`
+### Ignore Source Precedence
 
-Libra uses `.libraignore` files for its ignore policy rather than `.gitignore`. This avoids
-conflicts when a Libra repository coexists with or is converted from a Git repository, and
-makes it clear which VCS owns the ignore rules. The ignore file format is compatible with
-Git's pattern syntax (globs, negation with `!`, directory-only patterns with trailing `/`).
-`libra init` creates a root `.libraignore` in non-bare repositories, and Git imports or
-non-bare clones copy existing `.gitignore` files to matching `.libraignore` files.
+Libra reads Git standard ignore files (`.gitignore`, `.git/info/exclude`, and
+`core.excludesFile`) plus Libra extension files (`.libraignore`). In the same
+directory, `.libraignore` has higher precedence than `.gitignore`; nearer
+directory sources override ancestors; `.git/info/exclude` and
+`core.excludesFile` are lower-precedence fallbacks. All sources use Git ignore
+pattern syntax.
+
+`libra init` still creates a root `.libraignore` in non-bare repositories for
+Libra-specific rules, and Git imports or non-bare clones may copy existing
+`.gitignore` files to matching `.libraignore` files for explicit Libra
+overrides.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -352,7 +358,7 @@ non-bare clones copy existing `.gitignore` files to matching `.libraignore` file
 | Edit diff before staging | `git add -e` / `--edit` | N/A | N/A |
 | Chmod only | `git add --chmod=+x` | N/A | N/A |
 | Sparse checkout paths | `git add --sparse` | N/A | N/A |
-| Ignore file | `.gitignore` | N/A (jj uses `.gitignore`) | `.libraignore` |
+| Ignore file | `.gitignore` | N/A (jj uses `.gitignore`) | `.gitignore` + `.libraignore` |
 | Structured JSON output | N/A | N/A | `--json` / `--machine` |
 | Error hints | Minimal | N/A | Every error type has an actionable hint |
 
@@ -379,6 +385,6 @@ Every `AddError` variant maps to an explicit `StableErrorCode`.
 
 - jj does not have an `add` command; it automatically tracks all working tree changes
 - Libra's `add` is required before `commit`, matching Git's explicit staging model
-- `.libraignore` uses the same pattern syntax as `.gitignore` but is a separate file; imports
-  and non-bare clones copy `.gitignore` rules instead of deleting or renaming the originals
+- `.gitignore` and `.libraignore` both use Git ignore syntax; `.libraignore`
+  remains the Libra-specific override file when both exist in the same directory
 - LFS-tracked files are automatically converted to pointer files during staging

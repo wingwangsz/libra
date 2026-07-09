@@ -500,12 +500,12 @@ enum Commands {
     #[command(about = "Provide content, type or size info for repository objects")]
     CatFile(command::cat_file::CatFileArgs),
     #[command(
-        about = "Report pathnames excluded by .libraignore rules",
+        about = "Report pathnames excluded by Git/Libra ignore rules",
         after_help = command::check_ignore::CHECK_IGNORE_EXAMPLES
     )]
     CheckIgnore(command::check_ignore::CheckIgnoreArgs),
     #[command(
-        about = "Report .libra_attributes attributes for pathnames",
+        about = "Report Git/Libra attributes for pathnames",
         after_help = command::check_attr::CHECK_ATTR_EXAMPLES
     )]
     CheckAttr(command::check_attr::CheckAttrArgs),

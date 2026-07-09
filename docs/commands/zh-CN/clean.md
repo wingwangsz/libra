@@ -13,7 +13,7 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 
 `libra clean` 从工作树移除未跟踪文件。与 Git 不同，Libra 要求显式模式标志：`-n` 用于 dry-run 预览，`-f` 用于实际删除。不带任一标志运行 `libra clean` 是错误。这通过强制用户明确意图来防止意外数据丢失。
 
-默认情况下，只移除文件，并遵守 `.libraignore` 规则（忽略文件会被跳过）。`-d` 标志选择同时移除未跟踪目录；`-x` 选择移除原本会受 ignore 规则保护的文件；`-X` 会反转规则，使得*只有*被忽略文件会被移除。每个候选路径都会被规范化并验证位于工作树根目录内，然后才删除，从而防止 symlink-escape 攻击。
+默认情况下，只移除文件，并遵守 Git/Libra ignore 来源（忽略文件会被跳过）。`-d` 标志选择同时移除未跟踪目录；`-x` 选择移除原本会受 ignore 规则保护的文件；`-X` 会反转规则，使得*只有*被忽略文件会被移除。每个候选路径都会被规范化并验证位于工作树根目录内，然后才删除，从而防止 symlink-escape 攻击。
 
 可选 pathspec 会将 clean 候选限制为匹配的未跟踪文件或目录前缀。这是 `clean` 当前使用的字面前缀匹配器；`:(exclude)` / `:(glob)` 等共享 pathspec magic 尚未对删除路径启用。
 
@@ -24,8 +24,8 @@ libra clean -f [-d] [-x | -X] [-e <pattern> | --exclude <pattern>]... [--json] [
 | Dry run | `-n` | `--dry-run` | 显示会被移除的内容，但不删除任何东西。 |
 | Force | `-f` | `--force` | 实际移除未跟踪文件。 |
 | Directories | `-d` | `--dir` | 同时移除未跟踪目录（否则只移除文件）。 |
-| Include ignored | `-x` | | 移除未跟踪文件，**包括**被 `.libraignore` 匹配的文件。 |
-| Only ignored | `-X` | | **仅**移除被 `.libraignore` 匹配的未跟踪文件。 |
+| Include ignored | `-x` | | 移除未跟踪文件，**包括**被 ignore 规则匹配的文件。 |
+| Only ignored | `-X` | | **仅**移除被 ignore 规则匹配的未跟踪文件。 |
 | Exclude | `-e` | `--exclude <pattern>` | 添加额外排除模式；可重复。 |
 | Pathspec | | 位置参数 | 将候选限制为匹配文件或目录前缀。`clean` 尚未启用共享 pathspec magic。 |
 | JSON | | `--json` | 输出结构化 JSON（见下方）。 |
@@ -61,15 +61,15 @@ Removing notes.txt
 
 **`-x`**
 
-覆盖 `.libraignore`。没有此标志时，被忽略文件（构建产物、缓存等）会被跳过。使用 `-x` 后，它们会像任何其他未跟踪文件一样被移除。
+覆盖配置的 ignore 来源。没有此标志时，被忽略文件（构建产物、缓存等）会被跳过。使用 `-x` 后，它们会像任何其他未跟踪文件一样被移除。
 
 **`-X`**
 
-`-x` 的反向。只移除 `.libraignore` 通常会保护的文件。适合“清理构建产物但保留手工编辑文件”的场景。
+`-x` 的反向。只移除 ignore 来源通常会保护的文件。适合“清理构建产物但保留手工编辑文件”的场景。
 
 **`-e` / `--exclude <pattern>`**
 
-为本次调用添加额外排除模式（使用 `.libraignore` 语法）。可多次传递以叠加模式：
+为本次调用添加额外排除模式（使用 Git ignore 语法）。可多次传递以叠加模式：
 
 ```bash
 libra clean -f --exclude '*.log' --exclude 'tmp/**'
@@ -95,7 +95,7 @@ libra clean -fx
 # 只移除被忽略文件（保留手工编辑文件）
 libra clean -fX
 
-# 在 .libraignore 之上叠加一个额外排除模式
+# 在配置的 ignore 来源之上叠加一个额外排除模式
 libra clean -f --exclude '*.log'
 
 # 以 JSON 格式预览（适合脚本）

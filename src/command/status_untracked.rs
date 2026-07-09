@@ -153,7 +153,7 @@ fn scan_workdir(
                 .map_err(|err| list_error(&dir, io::Error::other(err.to_string())))?
                 .to_path_buf();
             if file_type.is_dir() {
-                if util::check_gitignore(&workdir.to_path_buf(), &path) {
+                if util::check_gitignore(workdir, &path) {
                     if include_ignored {
                         scan.ignored.push(relative);
                     }
@@ -212,7 +212,7 @@ fn scan_file(
         })?;
     let tracked =
         index.tracked(file_str, 0) || tracked_paths.same_file_case_alias(workdir, relative);
-    if util::check_gitignore(&workdir.to_path_buf(), &path.to_path_buf()) {
+    if util::check_gitignore(workdir, path) {
         if include_ignored && !tracked {
             scan.ignored.push(relative.to_path_buf());
         }
@@ -244,7 +244,7 @@ fn untracked_dir_has_visible_file(workdir: &Path, dir: &Path) -> bool {
                 return true;
             };
             let path = entry.path();
-            if util::check_gitignore(&workdir.to_path_buf(), &path) {
+            if util::check_gitignore(workdir, &path) {
                 continue;
             }
             if file_type.is_file() || file_type.is_symlink() {

@@ -3111,7 +3111,7 @@ fn list_workdir_files_split_force(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>
     Ok((files, ignored))
 }
 
-/// List ignored files (not tracked by index, but ignored by .libraignore) under workdir
+/// List ignored files (not tracked by index, but ignored by configured rules) under workdir
 pub fn list_ignored_files() -> Result<Changes, StatusError> {
     changes_to_be_staged_with_policy(IgnorePolicy::OnlyIgnored)
 }

@@ -6,6 +6,7 @@ pub mod fuse;
 pub mod output;
 
 pub mod atomic_write;
+pub mod attributes;
 pub mod backoff;
 pub mod client_storage;
 pub mod convert;
@@ -33,5 +34,6 @@ pub mod test;
 pub mod text;
 pub mod thin_pack;
 pub mod tree;
+pub mod tree_attributes;
 pub mod util;
 pub mod worktree;

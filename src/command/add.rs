@@ -1,7 +1,7 @@
 //! Stages changes for the next commit (`libra add`).
 //!
 //! Implements the `add` subcommand: parses pathspecs and mode flags, applies
-//! ignore policy (`.libraignore`), classifies each path against the working
+//! ignore policy, classifies each path against the working
 //! tree and the on-disk index, writes new blob objects under the repository's
 //! object storage, and finally persists the updated index.
 //!
@@ -275,7 +275,7 @@ pub struct AddOutput {
     pub removed: Vec<String>,
     /// Files whose metadata was refreshed (--refresh mode)
     pub refreshed: Vec<String>,
-    /// Paths ignored by .libraignore (only when pathspec matches ignored files)
+    /// Paths ignored by configured ignore sources (only when pathspec matches ignored files)
     pub ignored: Vec<String>,
     /// Paths that failed under --ignore-errors
     pub failed: Vec<AddFailure>,
@@ -344,7 +344,7 @@ enum StagedAction {
 
 /// Result of [`validate_pathspecs`]: the canonicalised set of pathspecs that
 /// should drive staging, plus any pathspecs that only matched
-/// `.libraignore`d entries (reported as warnings).
+/// ignored entries (reported as warnings).
 struct ValidatedPathspecs {
     pathspecs: PathspecSet,
     ignored: Vec<String>,
@@ -944,7 +944,7 @@ fn renormalize_entry(
 fn check_ignored_only_error(output: AddOutput) -> CliResult<AddOutput> {
     if !output.ignored.is_empty() && output.is_empty() {
         let mut message =
-            String::from("the following paths are ignored by one of your .libraignore files:");
+            String::from("the following paths are ignored by configured ignore rules:");
         for path in &output.ignored {
             message.push('\n');
             message.push_str(path);
@@ -1107,7 +1107,7 @@ fn render_normal(w: &mut impl Write, result: &AddOutput, verbose: bool) -> CliRe
 /// stdout redirection.
 fn render_warnings_stderr(result: &AddOutput) {
     if !result.ignored.is_empty() {
-        eprintln!("warning: the following paths are ignored by one of your .libraignore files:");
+        eprintln!("warning: the following paths are ignored by configured ignore rules:");
         for path in &result.ignored {
             eprintln!("{path}");
         }

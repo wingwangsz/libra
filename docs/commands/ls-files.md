@@ -16,8 +16,8 @@ With no state filter it defaults to the cached index view, so tracked paths
 remain listed even when the working tree copy is modified or deleted.
 
 This public compatibility slice supports cached listing, modified/deleted
-filters, stage-style output, untracked listing, `.libraignore`-aware filtering
-via `--others --exclude-standard`, ignored-only listing via `-i`/`--ignored`
+filters, stage-style output, untracked listing, Git/Libra ignore-source
+filtering via `--others --exclude-standard`, ignored-only listing via `-i`/`--ignored`
 (`-i -o` for ignored untracked files, `-i -c` for tracked files matching an
 exclude pattern), repository-local pathspec filtering, `--error-unmatch`,
 NUL-delimited text output via `-z`, status tags via `-t`, and unmerged-only
@@ -54,11 +54,11 @@ without printing panic/backtrace or `Broken pipe` diagnostics.
 | `--others`, `-o` | Show untracked working-tree files. |
 | `--cached`, `-c` | Show files staged in the index. |
 | `-i`, `--ignored` | Show only the ignored set: `-i -o` lists ignored untracked files (the inverse of `-o`), `-i -c` lists tracked files matching an exclude pattern. Must be combined with `-o`/`-c` and needs an exclude source — `--exclude-standard` or an explicit `-x`/`-X` pattern (exit 128 otherwise), matching Git. |
-| `--exclude-standard` | With `--others`, honor `.libraignore` rules. |
+| `--exclude-standard` | With `--others`, honor standard Git/Libra ignore sources (`.gitignore`, `.git/info/exclude`, `core.excludesFile`, and `.libraignore`). |
 | `-x`, `--exclude <pattern>` | Skip untracked files matching `<pattern>` (gitignore syntax) from the `--others` listing. Repeatable; supplements `--exclude-standard`. With `-i` the pattern instead defines the ignored set. |
 | `-X`, `--exclude-from <file>` | Read additional exclude patterns from `<file>` (one per line; `#` comments and blank lines skipped) and apply them like `-x`. Repeatable. |
 | `--error-unmatch` | Exit with `LBR-CLI-003` if any explicit pathspec matches no files in the selected result set. |
-| `--eol` | Prefix each cached entry with `i/<eol> w/<eol> attr/<attr>` line-ending info: `<eol>` is `lf`/`crlf`/`mixed`/`none`/`-text` (binary) for the index blob (`i/`) and the worktree file (`w/`). Byte-compatible with `git ls-files --eol`; `attr/` is always empty (Libra has no `.gitattributes`). |
+| `--eol` | Prefix each cached entry with `i/<eol> w/<eol> attr/<attr>` line-ending info: `<eol>` is `lf`/`crlf`/`mixed`/`none`/`-text` (binary) for the index blob (`i/`) and the worktree file (`w/`). Byte-compatible with `git ls-files --eol`; `attr/` is currently empty because line-ending attribute reporting is not implemented. |
 | `-z` | Emit NUL-delimited text records instead of newline-delimited output. Text mode only; rejects `--json` / `--machine`. |
 | `<pathspec>...` | Limit output to matching paths. Supports exact files, directory prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic. Pathspecs resolve from the current working directory unless `:(top)` is used. |
 | `--json` | Emit the standard Libra JSON envelope. |
