@@ -1,7 +1,7 @@
 # Libra PR 长期方案：基于 `gh` 的 GitHub PR 命令
 
 > **文档状态**：设计定稿（实现前约束）。第一版仅 `libra pr create`，后端为本机 GitHub CLI `gh`。  
-> **最后修订**：2026-07-09（第二轮十二维复核 + 契约对齐；第三轮补充 `--offline`、错误码 category、dry-run schema 等细节；**第四轮以代码为准逐条核对** `CliErrorReport` / `OutputConfig` / `push` / `ls-remote` / `merge-base` / compat 守卫；**第五轮补齐 `gh` 官方隐式 push/fork prompt、`PushArgs` upstream setter 缺口、`run_push` side-effect 语义**；**第六轮十二维独立分析：修正控制流 ordering（gh 存在性/版本/auth 前置于 push 以避免可避免的「已推送未建 PR」）、钉死 `LBR-PR-007` category、补 unborn HEAD 与 stderr 脱敏口径、`--web` 远端一致性语义、信号转发等**——见附录 A.4/A.5/A.6）。
+> **最后修订**：2026-07-09（第二轮十二维复核 + 契约对齐；第三轮补充 `--offline`、错误码 category、dry-run schema 等细节；**第四轮以代码为准逐条核对** `CliErrorReport` / `OutputConfig` / `push` / `ls-remote` / `merge-base` / compat 守卫；**第五轮补齐 `gh` 官方隐式 push/fork prompt、`PushArgs` upstream setter 缺口、`run_push` side-effect 语义**；**第六轮十二维独立分析：修正控制流 ordering（gh 存在性/版本/auth 前置于 push）、钉死 `LBR-PR-007` category、补 unborn HEAD 与 stderr 脱敏口径、信号转发等**；**第七轮补 dry-run 分支（跳过网络 ls-remote 以兑现「仅本地推断」）、`--web` 成功/失败语义、`GH_PROMPT_DISABLED` 不存在修正、`--offline` 双码澄清**——见附录 A.4/A.5/A.6/A.7）。
 
 ## 1. 决策摘要
 
@@ -163,7 +163,7 @@ libra pr create --fill --json
 | 工作区 dirty | 默认允许 + warning；`--require-clean` 拒绝（dirty 指 index/worktree 与 HEAD 不一致，含 untracked 文件） | 拒绝时 `LBR-PR-007` |
 | 远端 head 缺失或 OID 不一致且无 `--push` | 拒绝 | `LBR-PR-004` |
 | remote 非 GitHub（第一版判定失败） | 拒绝 | `LBR-PR-003` |
-| `--offline`（全局）与 `pr create` | 拒绝：`pr create` 必须调用 GitHub API | `LBR-PR-005`（用法级预检，优先）/ 若已进入网络阶段才失败则 `LBR-NET-001` |
+| `--offline`（全局）与 `pr create` | 拒绝：`pr create` 必须调用 GitHub API | `LBR-PR-005`（用法级预检，优先，exit 129）。`--offline` 在互斥校验阶段即被拦截（§6 步骤 1），不会进入网络阶段，故 `LBR-NET-001` 对此场景不可达；保留双码引用仅为防御性文档 |
 
 ### 5.3 默认行为推断
 
@@ -178,7 +178,7 @@ libra pr create --fill --json
   6. 仍失败 → 错误，要求显式 `--base`
 - **未 push**：默认拒绝并提示 `--push` 或 `libra push -u <remote> <branch>`；不静默 push。
 - **dirty**：默认允许（PR 关心已 push 的 commit）；human 提示；JSON 中 `data.dirty: true`。
-- **成功输出**：PR URL；`--web` 只走浏览器创建流，且不可与 JSON/machine 同次调用。`--web` 仍须通过远端 head 一致性预检（§6.3）与 ahead 检查（§6.2）——`gh pr create --web` 打开预填表单，前提是分支已推送到远端，故预检不豁免；唯一豁免的是 fill/title 必填约束（浏览器表单由用户手动填写）。
+- **成功输出**：PR URL；`--web` 只走浏览器创建流，且不可与 JSON/machine 同次调用。`--web` 仍须通过远端 head 一致性预检（§6.3）与 ahead 检查（§6.2）——`gh pr create --web` 打开预填表单，前提是分支已推送到远端，故预检不豁免；唯一豁免的是 fill/title 必填约束（浏览器表单由用户手动填写）。`--web` 成功时 human 输出提示「Opening browser...」+ compare URL（非 PR URL，因 PR 在浏览器中手动完成），exit 0；失败（浏览器无法打开、非 TTY 等）→ `LBR-PR-005` 或 `LBR-IO-*`。
 - **空 title/body**：`--title ""`（空串）视为未提供 title，回退到 fill/title 必填校验；`--body ""` 视为无 body（`has_body: false`）。
 - **`--offline`（全局）**：`pr create` 必须通过网络调用 GitHub API（或 Enterprise equivalent），在 `--offline` 下直接拒绝，避免用户误以为纯本地推断可继续。
 
@@ -197,15 +197,17 @@ parse + 互斥校验
   → dirty 检查（require-clean?）
   → ahead 检查（相对 base）
   → 解析 gh 可执行文件 + 版本门禁              ← 本地、零网络副作用，前置于 push
+  → dry-run：远端 head 仅查本地 tracking（标 stale_risk）→ 输出推断结果与脱敏 gh_args，退出成功（无网络、无 push、无 create、无 browser）
   → 非 dry-run：gh auth status --hostname <host>（禁止 --show-token）  ← 前置于 push
-  → 远端 head 预检（无 --push: ls-remote | tracking+stale_risk；有 --push: 判断是否需要 push）
+  → 非 dry-run：远端 head 预检（ls-remote --heads → tracking+stale_risk fallback）
   → 可选：Libra push（仅 --push；成功后以 PushOutput 更新远端 head 判定）
-  → dry-run：输出推断结果与脱敏 gh_args，退出成功
   → 非 dry-run：Command 执行 gh pr create（超时 + stderr 上限）
   → 解析 PR URL → human 或全局 JSON/machine
 ```
 
-> **排序理由**：`--push` 路径会写远端（不可回滚的副作用）。若把 `gh` 存在性/版本/auth 检查放在 push 之后，用户在 `gh` 缺失或未认证时会得到「分支已推送但 PR 未建」——而这是**可预防**的（检查本身不触网或只触 GitHub auth，不写 Git ref）。auth 检查虽触网（GitHub），但先于 push 可以在写远端前暴露认证问题。dry-run 路径本就无 push，顺序调整不影响其语义（仍跳过 auth 与 `gh pr create`，只做版本检查）。
+> **排序理由**：`--push` 路径会写远端（不可回滚的副作用）。若把 `gh` 存在性/版本/auth 检查放在 push 之后，用户在 `gh` 缺失或未认证时会得到「分支已推送但 PR 未建」——而这是**可预防**的。auth 检查虽触网（GitHub），但先于 push 可以在写远端前暴露认证问题。
+>
+> **dry-run 分支理由**：§3.1 与 §10 均要求 dry-run「仅本地推断」。若 dry-run 经过「远端 head 预检」步骤，会触发 `ls-remote --heads` 网络调用，与「仅本地推断」矛盾。因此 dry-run 在 gh 版本检查后**立即分支**：远端 head 仅查本地 tracking ref（标 `stale_risk: true`），不调用 `ls-remote`、不 auth、不 push、不 create。`would_push` 基于 tracking ref 判定（可能过期，由 `stale_risk` 标记）。
 
 ### 6.1 编号步骤（实现清单）
 
@@ -217,12 +219,11 @@ parse + 互斥校验
 6. dirty：默认记 warning；`--require-clean` → 错误。
 7. **Ahead 检查**（见 §6.2）。同时显式拒绝 `--base` 与 `--head` 同名（head 无独有 commit）。
 8. 解析 `gh` 可执行文件；检查最低版本（临时 `>=2.40.0`，实现前用目标平台实测后写入用户文档最终值）。**本地、零网络副作用，前置于任何 push。**
-9. 非 `--dry-run`：`gh auth status --hostname <host>`（不传 `--show-token`，不透传 token 到日志）。**前置于 push**——auth 失败时不推送分支，避免「已推送未建 PR」。  
-   `--dry-run`：跳过 auth 与 `gh pr create`，JSON 标 `auth_checked: false`；但**仍执行**第 8 步版本检查（本地、无副作用），以便尽早发现缺失 `gh`。
-10. **远端 head 状态预检**（见 §6.3）：无 `--push` 时在线查 `ls-remote --heads`，失败才退到 tracking+`stale_risk`；有 `--push` 时只用于判断是否可跳过 push，不可把过期 tracking 当作已同步。若 `--push` 且 `ls-remote` 失败（网络错误或分支不存在），**不阻断** push（push 会处理），但记 warning。
-11. 若远端缺失或不一致：无 `--push` → 错误；有 `--push` → 调用 Libra push（§6.4）。push 成功后以 `PushOutput.updates[].new_oid` / `up_to_date` 作为 `remote_head_oid == local_head_oid` 的依据；`run_push` 成功路径已调用 `update_remote_tracking_refs`，不要在 `pr` 层重复手写 remote-tracking ref。若同时需要设置 upstream，必须走 §6.4 的安全 setter 方案。
-12. 组装 `gh pr create` argv：显式 `-R`/`--repo`、`--base`、`--head`，Enterprise 时 host 与 auth 一致；**永不**加入 `gh` 的 `--dry-run`。即使用户未传 `--head`，也要把 Libra 已解析的当前分支名传给 `gh --head`，避免 `gh` 在未 push 分支上提示 push 或 fork。
-13. `--dry-run`：输出将执行动作与脱敏 `gh_args`，成功退出（无 push、无 create、无 browser）。
+9. **`--dry-run` 分支**：远端 head 仅查本地 tracking ref（标 `stale_risk: true`），不调用 `ls-remote`；组装 `gh pr create` argv（脱敏）；输出推断结果与脱敏 `gh_args`，成功退出（**无网络、无 push、无 create、无 browser**）。`would_push` 基于 tracking ref 判定（可能过期，由 `stale_risk` 标记）。JSON 标 `auth_checked: false`。
+10. 非 `--dry-run`：`gh auth status --hostname <host>`（不传 `--show-token`，不透传 token 到日志）。**前置于 push**——auth 失败时不推送分支，避免「已推送未建 PR」。
+11. 非 `--dry-run`：**远端 head 状态预检**（见 §6.3）：`ls-remote --heads` 取远端 tip，失败才退到 tracking+`stale_risk`；与本地 `<head>` 分支 tip 比较。若 `--push` 且 `ls-remote` 失败（网络错误或分支不存在），**不阻断** push（push 会处理），但记 warning。
+12. 若远端缺失或不一致：无 `--push` → 错误；有 `--push` → 调用 Libra push（§6.4）。push 成功后以 `PushOutput.updates[].new_oid` / `up_to_date` 作为 `remote_head_oid == local_head_oid` 的依据；`run_push` 成功路径已调用 `update_remote_tracking_refs`，不要在 `pr` 层重复手写 remote-tracking ref。若同时需要设置 upstream，必须走 §6.4 的安全 setter 方案。
+13. 组装 `gh pr create` argv：显式 `-R`/`--repo`、`--base`、`--head`，Enterprise 时 host 与 auth 一致；**永不**加入 `gh` 的 `--dry-run`。即使用户未传 `--head`，也要把 Libra 已解析的当前分支名传给 `gh --head`，避免 `gh` 在未 push 分支上提示 push 或 fork。
 14. 非 dry-run：`std::process::Command` 执行，stdin 置空/null，捕获 stdout/stderr，超时默认 **120s**（可配置 env，见 §11），stderr 捕获上限建议 **64 KiB**。转发 SIGINT/SIGTERM 到 `gh` 子进程（见 §7.4）。
 15. 解析 PR URL；失败 → `CliError`（`LBR-PR-006` 等），stderr 脱敏后可放 `details`（截断）。
 16. human 或 `emit_json_data("pr create", …)`；失败走 `CliError` 渲染（JSON 失败在 **stderr**，成功在 **stdout**）。
@@ -616,7 +617,7 @@ hint: the remote branch is up to date; fix the GitHub error and re-run without -
 | 超时 / 中断 / 信号死亡 | 不假设 PR 未创建；hint 核查（§6.5/§7.4） |
 | 非 TTY + 需要交互 | 拒绝（缺 fill/title，或 `--web` 无 GUI） |
 | `GH_TOKEN` 环境认证 | 允许（`gh` 行为）；Libra 不记录 token 值 |
-| `gh` 意外 prompt（未被显式 flag 阻断） | stdin 为 null → `gh` 读到 EOF 应自退；额外设 `GH_PROMPT_DISABLED=1` 兜底（`gh` 尊重此 env 进入非交互模式） |
+| `gh` 意外 prompt（未被显式 flag 阻断） | stdin 为 null → `gh` 读到 EOF 且 `isatty(stdin)` 为假，`gh` 自退不 prompt；无需额外 env（`gh` 无 `GH_PROMPT_DISABLED` 等非交互 env） |
 | unborn HEAD | 拒绝（无 head tip） |
 
 可配置超时 env 名称在实现 PR 中写入 `docs/commands/pr.md` 与 README；非法值硬错误。
@@ -806,7 +807,7 @@ cargo test --features test-network --test pr_github_live_test
 | --- | --- |
 | `src/command/pr.rs` | `PR_EXAMPLES` + `#[command(after_help = …)]` |
 | `src/cli.rs` | 注册 `Commands::Pr`；`ROOT_AFTER_HELP` 的 `Remote And Cloud` 分组行；`--offline` 互斥处理 |
-| `src/command/pr.rs` | 调用 `gh` 时设 `GH_PROMPT_DISABLED=1`（§11）；预检排序：gh 版本/auth 前置于 push（§6） |
+| `src/command/pr.rs` | 调用 `gh` 时 stdin 置 `Stdio::null()`（§11）；预检排序：gh 版本/auth 前置于 push（§6）；dry-run 在 gh 版本检查后立即分支（§6.1 步骤 9） |
 | `tests/compat/help_examples_banner.rs` | 把 `pr` 加入硬编码 `VISIBLE_COMMANDS` 数组 |
 | `docs/commands/pr.md` | Examples / Common Commands 小节（`compat_command_docs_examples_section`）；`--offline` 限制说明 |
 | `docs/development/commands/pr.md` + `docs/development/commands/README.md` | 命令页 + README 增行（`command_development_readme_matches_public_cli_surface`） |
@@ -856,22 +857,22 @@ libra pr create --push --fill
 
 ## 附录 A：十二维评审与前后冲突扫描
 
-### A.1 评审矩阵（第二轮 + 第三轮补丁 + 第四/第五轮代码与 `gh` 契约核对 + 第六轮十二维独立分析，2026-07-09）
+### A.1 评审矩阵（第二轮 + 第三轮补丁 + 第四/第五轮代码与 `gh` 契约核对 + 第六轮十二维独立分析 + 第七轮补遗，2026-07-09）
 
 | 维度 | 结论 | 主要依据 / 残留风险 | 文档处置 |
 | --- | --- | --- | --- |
 | 合理性 | **通过** | PR 非 Git 协议；`gh` 降认证复杂度 | 维持边界 |
 | 可行性 | **有条件通过** | 分阶段 + fake `gh`；`gh>=2.40` 为临时地板，落地前再实测；`PushArgs` upstream setter 需先补窄 API | §6.4 §8.3 |
-| 完整性 | **有条件通过→已补** | 曾缺 fill/title 强制、gh dry-run 禁令、stdout/stderr 通道、exit 129；第六轮补 unborn HEAD / base==head / 空 title-body / SSH 端口 / 信号死亡 / GH_HOST | §5.2 §6 §9 §12 |
+| 完整性 | **有条件通过→已补** | 曾缺 fill/title 强制、gh dry-run 禁令、stdout/stderr 通道、exit 129；第六轮补 unborn HEAD / base==head / 空 title-body / SSH 端口 / 信号死亡 / GH_HOST；第七轮补 `--web` 成功/失败语义 | §5.2 §6 §9 §12 |
 | 安全性 | **有条件通过→已补** | argv 无 shell；补超时/stderr 上限/body-file 限制/禁 show-token/禁 body-file `-`；显式 `gh --head`；第六轮钉死 stderr 脱敏口径与 token 模式、PATH 信任边界、symlink | §6.1 §6.6 §7 |
 | 功能正确性与接口兼容性 | **已补强** | 全局 JSON；`CliErrorReport`；禁止子命令 `--json`；第六轮钉死 `LBR-PR-007` 单 category | §5 §9 |
-| 数据流与控制流 | **已补强→第六轮重排** | 具名 `ls-remote`；ahead 规则；in-process push；**第六轮：gh 存在/版本/auth 前置于 push**（避免可避免的「已推送未建 PR」） | §6 |
-| 性能与效率 | **通过** | 非热路径；限制进程/网络次数；第六轮 fail-fast 排序 | §10 |
-| 可靠性与容错 | **有条件通过→已补** | push/PR 部分失败、超时不假设、已存在 PR；第六轮补 SIGINT 转发 / `GH_PROMPT_DISABLED` / auth-before-push 语义 | §11 |
+| 数据流与控制流 | **已补强→第六轮重排→第七轮 dry-run 分支** | 具名 `ls-remote`；ahead 规则；in-process push；第六轮 gh 存在/版本/auth 前置于 push；**第七轮 dry-run 在 gh 版本检查后立即分支（跳过网络 ls-remote）** | §6 |
+| 性能与效率 | **通过** | 非热路径；限制进程/网络次数；第六轮 fail-fast 排序；第七轮 dry-run 零网络 | §10 |
+| 可靠性与容错 | **有条件通过→已补** | push/PR 部分失败、超时不假设、已存在 PR；第六轮补 SIGINT 转发 / auth-before-push 语义；第七轮修正 `GH_PROMPT_DISABLED` 不存在 | §11 |
 | 兼容性与互操作性 | **有条件通过** | GHE host 与 auth 对齐；fork 延后；第六轮补 SSH 显式端口 / `GH_HOST` | §12 |
 | 可扩展性与可维护性 | **通过** | 分层 + 可注入 runner；plan/request 拆分 | §13 |
 | 合规性与标准符合性 | **有条件通过→已补** | error-codes 流程；test-network gate；COMPATIBILITY；第六轮补 live test token 脱敏 | §14 §17 |
-| 前后一致性 | **已修订** | 见 A.2（含第六轮 P35–P41） | 全文对齐 |
+| 前后一致性 | **已修订** | 见 A.2（含第六轮 P35–P41 + 第七轮 P42–P44） | 全文对齐 |
 
 ### A.2 冲突与缺口清单
 
@@ -916,10 +917,13 @@ libra pr create --push --fill
 | P37 | 中·完整性 | 未处理 unborn HEAD（空仓库，HEAD 指向尚无 commit 的分支）：无 head tip，ahead 无法判定 | §5.2/§6.1 第 3 步/§8.1 不变量 12：拒绝 |
 | P38 | 中·安全 | §7.3「stderr 经敏感信息过滤」未给出口径（哪些 pattern），实现易遗漏 token 格式 | §7.3：钉死 `ghp_*`/`gho_*`/`ghu_*`/`ghs_*`/`ghr_*`/`github_pat_*` + `Authorization:`/`set-cookie` 正则 + 单测 |
 | P39 | 中·完整性 | `--base`==`--head` 未显式处理（ahead 检查会兜底但错误不可读）；空 `--title ""`/`--body ""` 行为未定义 | §5.2/§6.1 第 7 步：base==head 显式拒绝；§5.3：空串语义 |
-| P40 | 中·可靠性 | 用户 Ctrl-C 时是否转发 SIGINT 到 `gh` 子进程未写；`gh` 意外 prompt（未被 flag 阻断）时兜底未写 | §7.4/§11：SIGINT 转发 + `GH_PROMPT_DISABLED=1` 兜底 |
+| P40 | 中·可靠性 | 用户 Ctrl-C 时是否转发 SIGINT 到 `gh` 子进程未写；`gh` 意外 prompt（未被 flag 阻断）时兜底未写 | §7.4/§11：SIGINT 转发 + `Stdio::null()` 非交互兜底（`gh` 无 `GH_PROMPT_DISABLED` env，`isatty(stdin)` 为假即自退） |
 | P41 | 低·兼容 | SSH 显式端口 `ssh://git@github.com:22/...` 与 `GH_HOST` 环境变量交互未提 | §12：补端口变体；§7.2：补 `GH_HOST` 说明 |
+| P42 | **高·一致性** | §3.1/§10 要求 dry-run「仅本地推断」，但 §6 控制流中 dry-run 经过「远端 head 预检」步骤（触发 `ls-remote --heads` 网络调用），与「仅本地推断」矛盾 | §6/§6.1：dry-run 在 gh 版本检查后立即分支，远端 head 仅查本地 tracking（标 `stale_risk`），不调用 `ls-remote` |
+| P43 | 中·完整性 | `--web` 成功/失败输出语义未定义（human 输出什么？exit code？） | §5.3：`--web` 成功输出「Opening browser...」+ compare URL，exit 0；失败 → `LBR-PR-005`/`LBR-IO-*` |
+| P44 | 中·正确性 | §11 引用 `GH_PROMPT_DISABLED=1` 作为 `gh` 非交互兜底，但 `gh` 无此 env（`gh` 通过 `isatty(stdin)` 判断交互性，`Stdio::null()` 已足够） | §11：改为 `Stdio::null()` 非交互兜底，删除 `GH_PROMPT_DISABLED` 引用；§17 同步删除 |
 
-**冲突扫描结论**：P1–P4 为落地前必须遵守的契约/正确性约束；P16–P18 为第三轮补全的正确性/完整性约束；P22–P23 为第四轮以代码核对发现的**正确性/安全性冲突**（必须遵守）；P24–P29 为第四轮的完整性/兼容性补强；P30–P34 为第五轮针对 push API、`run_push` 副作用与 `gh` 官方交互行为的落地补强；**P35 为第六轮发现的控制流正确性问题（gh 预检前置于 push，必须遵守）；P36 为前后一致性冲突（单码单 category，必须钉死）；P37–P41 为第六轮完整性/安全/可靠性/兼容性补强**。无与「第一版仅 GitHub 同仓库 PR + gh 后端」目标相悖的条款。
+**冲突扫描结论**：P1–P4 为落地前必须遵守的契约/正确性约束；P16–P18 为第三轮补全的正确性/完整性约束；P22–P23 为第四轮以代码核对发现的**正确性/安全性冲突**（必须遵守）；P24–P29 为第四轮的完整性/兼容性补强；P30–P34 为第五轮针对 push API、`run_push` 副作用与 `gh` 官方交互行为的落地补强；**P35 为第六轮发现的控制流正确性问题（gh 预检前置于 push，必须遵守）；P36 为前后一致性冲突（单码单 category，必须钉死）；P37–P41 为第六轮完整性/安全/可靠性/兼容性补强；P42 为第七轮发现的 dry-run 与「仅本地推断」矛盾（必须遵守）；P43–P44 为第七轮完整性/正确性补强**。无与「第一版仅 GitHub 同仓库 PR + gh 后端」目标相悖的条款。
 
 ### A.3 第一轮已吸收、本轮保留的结论
 
@@ -977,6 +981,17 @@ libra pr create --push --fill
 
 无与第一版目标相悖的条款。`emit_json_data` public / `write_json_command_envelope` private / `for_refspecs` 为 `pub(crate)`（同 crate 可调但 `set_upstream` 字段私有不可设）/ `run_push` 返回 `PushOutput` 且有远端写入副作用 / `StableErrorCode::exit_code()` 按 **category** 映射（`cli`→129、其余→128，`AddNothingStaged` 例外）/ `severity()` 按 **kind** 映射（`Fatal`→`"fatal"`、其余→`"error"`）——均与正文一致。
 
+### A.7 第七轮：补遗（2026-07-09）
+
+本轮针对第六轮遗留的 dry-run 网络调用矛盾、`GH_PROMPT_DISABLED` 不存在、`--web` 语义缺失、`--offline` 双码歧义做补遗：
+
+| 核对项 | 结果 | 处置 |
+| --- | --- | --- |
+| dry-run 控制流与「仅本地推断」一致性 | §3.1/§10 要求 dry-run「仅本地推断」，但 §6 控制流中 dry-run 经过「远端 head 预检」→ 触发 `ls-remote --heads` 网络调用，矛盾 | §6/§6.1：dry-run 在 gh 版本检查后立即分支，远端 head 仅查本地 tracking（标 `stale_risk`），不调用 `ls-remote` |
+| `GH_PROMPT_DISABLED` 存在性 | `gh` 无此 env；`gh` 通过 `isatty(stdin)` 判断交互性，`Stdio::null()` 已足够 | §11/§17/附录 B.14：删除 `GH_PROMPT_DISABLED` 引用，改为 `Stdio::null()` 非交互兜底 |
+| `--web` 成功/失败语义 | 未定义 human 输出与 exit code | §5.3：成功输出「Opening browser...」+ compare URL，exit 0；失败 → `LBR-PR-005`/`LBR-IO-*` |
+| `--offline` 双码映射 | `LBR-PR-005`（129）与 `LBR-NET-001`（128）双码，但 `--offline` 在互斥阶段即被拦截，`LBR-NET-001` 不可达 | §5.2：明确 `LBR-PR-005` 为主路径，`LBR-NET-001` 仅防御性保留 |
+
 ---
 
 ## 附录 B：实现前待钉死项（不阻塞设计，阻塞 merge 实现 PR）
@@ -994,4 +1009,4 @@ libra pr create --push --fill
 11. **预检排序不变量**：实现时必须保证 `gh` 存在性/版本/auth 在 push 之前执行；集成测试用 mock push 断言 `gh` 缺失/auth 失败时 push **未被调用**（P35）。
 12. **`LBR-PR-007` category**：已钉死为 `repo`（P36）；若后续需 `--require-clean` dirty 的 `conflict` 语义，另建 `LBR-PR-008` 而非改 007 的 category。
 13. **stderr 脱敏实现**：落地时实现 §7.3 钉死的 token 正则过滤并加单测（构造含 `ghp_*`/`Authorization: Bearer` 的伪 stderr 断言过滤）。
-14. **`GH_PROMPT_DISABLED=1`**：调用 `gh` 时设置此 env 作为非交互兜底（§11）。
+14. **`Stdio::null()` 非交互兜底**：调用 `gh` 时 stdin 置 `Stdio::null()`，`gh` 通过 `isatty(stdin)` 判断交互性，null stdin 即自退不 prompt（§11）。`gh` 无 `GH_PROMPT_DISABLED` 等非交互 env。
