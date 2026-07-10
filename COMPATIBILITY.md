@@ -184,6 +184,10 @@ whether `.libra/shallow` contains at least one boundary.
   Optional future Git LFS rules in `.gitattributes` are tracked as a repository
   governance decision, **not** as the `libra lfs` command status.
 
+### P1-05b history-default clarification
+
+The command rows above additionally honor history-changing Git defaults through the strict local → global → system cascade: `merge.ff=true|false|only`, `merge.log=true|false|<n>`, `merge.verifySignatures=true|false`, and `commit.gpgSign=true|false`. Merge CLI overrides (`--ff`/`--no-ff`/`--ff-only`, `--verify-signatures`/`--no-verify-signatures`) win; `--no-gpg-sign` wins over `commit.gpgSign`, which in turn wins over Libra's `vault.signing` default. Invalid local/global values fail before history mutation. This clarification supersedes the older commit-row wording that described signing as driven only by `vault.signing`.
+
 ## Sub-face compatibility grading (P0/P1-touched commands)
 
 The single `Tier` column above is deliberately coarse: a command marked

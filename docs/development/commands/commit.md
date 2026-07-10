@@ -38,6 +38,8 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-07-10（plan-20260708 P1-05b）：`run_commit` 在 auto-stage、hook、对象与 ref 写入前严格读取 `commit.gpgSign`。`true` 强制使用仓库 vault key 签名，`false` 禁用签名，未配置时继承 `vault.signing`；`--no-gpg-sign` 优先级最高。无效值 `LBR-CLI-002`、读取失败 `LBR-IO-001`。回归 target：`compat_config_history_defaults`。
+
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2025-10-02 `e45fc0f7`（`feat: add option -F/--file for commit command (#10)`）：基础实现节点：add option -F/--file for commit command (#10)；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-07 `d399c043`（`feat: support show-ref dereference and commit trailers`）：功能演进：support show-ref dereference and commit trailers；该节点扩展了当前命令可用的参数或行为。
@@ -47,6 +49,8 @@ flowchart TD
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
+
+- 签名默认：`commit.gpgSign=true|false` 按 local→global→system 严格级联读取并优先于 `vault.signing`；`--no-gpg-sign` 再覆盖两者。Git 正向 `-S`/`--gpg-sign` 仍未公开。
 
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/commit.md`。

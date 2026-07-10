@@ -75,6 +75,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `pretty_format_placeholders_test.rs` | P1-04 (plan-20260708) | `log` / `show` / `shortlog` 共享 Git-like pretty-format placeholders（含 ASCII/control `%xNN`、`%%` 与 forced color）；`log --name-only --format` 分隔与 `log -z --name-status` NUL 记录对齐 Git |
 | `config_defaults_semantics_test.rs` | P1-05a (plan-20260708) | 高影响 Git config 默认值：`init.defaultBranch`、`pull.rebase` / `branch.<name>.rebase` 和 `pull.ff=true|false|only` 覆盖 local/global/system、变量名大小写、空/无效值、真实 rebase、CLI 覆盖及 fetch 前 fail-closed |
 | `config_defaults_edge_cases_test.rs` | P1-05a (plan-20260708) | 加密 local/global 默认值先解密、不可读/不支持 system scope 跳过、Git 转换报告源 `HEAD` 分支，以及配置默认值边界回归 |
+| `config_history_defaults_test.rs` | P1-05b (plan-20260708) | 历史相关默认值：`merge.ff`、`merge.log`、`merge.verifySignatures`、`commit.gpgSign` 与 CLI override 优先级 |
 
 ## Authoring guidelines
 

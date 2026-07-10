@@ -5,7 +5,7 @@ Merge one target into the current branch.
 ## Synopsis
 
 ```text
-libra merge [--ff-only | --no-ff | --squash | --no-commit] [-m <msg>] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
+libra merge [--ff | --ff-only | --no-ff] [--squash | --no-commit] [-m <msg>] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] [--autostash | --no-autostash] <branch>
 libra merge --continue
 libra merge --abort
 libra merge --restart
@@ -33,6 +33,16 @@ libra config merge.conflictStyle diff3
 
 The config is honored by both `libra merge` and `libra cherry-pick` for line-level text conflicts. Binary and modify/delete conflicts keep their two-part whole-file presentation (Git also emits no base block there), and `libra rebase` currently renders whole-file markers without a base block regardless of this setting.
 
+### History-changing merge defaults
+
+When the corresponding CLI flag is absent, Libra reads these Git-compatible defaults through the local → global → system cascade:
+
+- `merge.ff=true|false|only` allows fast-forwarding, forces a two-parent merge commit, or rejects a non-fast-forward merge. `--ff`, `--no-ff`, and `--ff-only` override it. `only` (like `--ff-only`) rejects only a genuinely diverged history: a fast-forwardable `--squash` or `--no-commit` is still allowed, matching Git.
+- `merge.log=true|false|<n>` appends up to 20 (for `true`) or `<n>` target-side commit subjects to the generated merge message. An explicit `-m` message suppresses this block. The resolved message (`-m` or the generated one, shortlog included) is recorded in the merge state, so a merge finished later with `merge --continue` (after conflicts or `--no-commit`) commits with the same message.
+- `merge.verifySignatures=true|false` controls tip-signature verification; `--verify-signatures` and `--no-verify-signatures` override it. Verification runs on the resolved target before any mutation — including autostash creation — so a rejected merge writes nothing (no stash entry, no objects).
+
+Invalid or unreadable local/global values fail before HEAD, index, worktree, or merge-state mutation (`LBR-CLI-002` or `LBR-IO-001`). Encrypted local/global values are decrypted; unreadable or unsupported system scope is skipped.
+
 Libra still does not implement octopus merges, custom strategies, strategy options, or interactive message editing (`--edit`/launching an editor). Signature verification (`--verify-signatures`) is supported but limited to the local vault PGP key (no external GPG keyring).
 
 ## Options
@@ -41,6 +51,7 @@ Libra still does not implement octopus merges, custom strategies, strategy optio
 |--------|-------------|
 | `<branch>` | Target branch, commit, or remote-tracking ref to merge. |
 | `-m, --message <MSG>` | Override the merge commit message (default `Merge <branch> into <head>`). |
+| `--ff` | Allow fast-forwarding when possible, overriding `merge.ff=false|only`. |
 | `--ff-only` | Refuse to merge unless the current branch can be fast-forwarded. |
 | `--no-ff` | Always create a two-parent merge commit, even when a fast-forward is possible. |
 | `--squash` | Produce the merged index/working tree but create no commit and do not move HEAD; finish with a plain `libra commit`. |
@@ -49,8 +60,8 @@ Libra still does not implement octopus merges, custom strategies, strategy optio
 | `--stat` | Show a diffstat of the merge result (the changes between the pre-merge HEAD and the new commit) after the merge completes. Git shows this by default; Libra defaults to no diffstat, so `--stat` opts in. Last-one-wins toggle with `--no-stat`/`-n`. Human output only. |
 | `-n`, `--no-stat` | Do not show a diffstat at the end of the merge (Libra's default). Last-one-wins toggle with `--stat`. |
 | `--no-progress` | Do not show a progress meter. No-op accepted for Git parity: Libra's merge never renders a progress meter. |
-| `--verify-signatures` | Verify the PGP signature on the tip commit of the merged branch and abort the merge if it is unsigned or the signature is bad. Like `tag -v`, only signatures made by this repository's vault PGP key can be validated (no external GPG keyring), so a commit signed elsewhere — or with an SSH signature — is treated as not verifiable. |
-| `--no-verify-signatures` | Do not verify the merged commit's signature (the default). The inverse of `--verify-signatures`; the last one wins. |
+| `--verify-signatures` | Verify the PGP signature on the tip commit and abort if it is unsigned or bad. Overrides `merge.verifySignatures`; only signatures made by this repository's vault PGP key can be validated. |
+| `--no-verify-signatures` | Do not verify the merged commit's signature, overriding `merge.verifySignatures=true`. The inverse of `--verify-signatures`; the last one wins. |
 | `--no-rerere-autoupdate` | Do not update the rerere index after the merge. No-op accepted for Git parity: Libra has no rerere. (Git's `--rerere-autoupdate` is not exposed.) |
 | `--no-gpg-sign` | Do not GPG-sign the merge commit. No-op accepted for Git parity: Libra's merge never signs. (Git's `-S`/`--gpg-sign` is not implemented.) |
 | `--continue` | Finish an in-progress merge after conflicts have been resolved and staged. |

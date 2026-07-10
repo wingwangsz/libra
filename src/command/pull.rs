@@ -443,6 +443,8 @@ pub(crate) async fn run_pull(
                 no_commit: args.no_commit,
                 // `pull` does not expose `--verify-signatures`.
                 verify_signatures: false,
+                // P1-05b scopes `merge.log` to the public merge command.
+                merge_log: 0,
                 // `pull` does not expose `--dry-run`.
                 dry_run: false,
                 // `pull --autostash` on the merge path rides the Git-faithful
@@ -974,6 +976,13 @@ fn map_merge_error_to_cli(error: &merge::PullMergeError) -> CliError {
         merge::PullMergeError::ConflictStyleRead(..) => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
         }
+        merge::PullMergeError::HistoryConfig(
+            crate::command::history_config::HistoryConfigError::Read { .. },
+        ) => CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed),
+        merge::PullMergeError::HistoryConfig(
+            crate::command::history_config::HistoryConfigError::Invalid { .. },
+        ) => CliError::command_usage(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
         merge::PullMergeError::Autostash(..) => CliError::failure(error.to_string())
             .with_stable_code(StableErrorCode::ConflictOperationBlocked)
             .with_detail("phase", "autostash"),

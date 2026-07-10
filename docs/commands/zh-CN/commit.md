@@ -175,7 +175,7 @@ libra commit --no-status -m "message"
 
 ### `--no-gpg-sign`
 
-强制生成未签名提交：跳过本次提交的 Libra vault GPG 签名，对齐 `git commit --no-gpg-sign`。当 `vault.signing=true`（`libra init` 默认）且有可用的 vault unseal key 时才会签名；`--no-gpg-sign` 无论如何都抑制签名，故仅当本就不会签名时才是 no-op。Git 的正向 `-S`/`--gpg-sign` 未公开；Libra 的提交签名改由 `vault.signing` 配置驱动。
+强制生成未签名提交：跳过本次提交的 Libra vault GPG 签名，对齐 `git commit --no-gpg-sign`。Git 兼容的 `commit.gpgSign=true|false` 默认值优先于 `vault.signing`：`true` 使用仓库 vault key 强制签名，`false` 禁用签名；未配置时继续使用 `vault.signing`。`--no-gpg-sign` 优先级最高并抑制两种配置。Git 的正向 `-S`/`--gpg-sign` 尚未公开。
 
 ```bash
 libra commit --no-gpg-sign -m "message"
@@ -322,7 +322,7 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 
 ### 默认 vault signing，而不是手动 GPG 设置
 
-在 Git 中，提交签名需要配置 `user.signingkey`、`gpg.program` 和 `commit.gpgsign`，这是多数开发者会跳过的多步流程。Libra 的 vault 在仓库初始化时自动生成并管理 PGP 签名密钥，因此提交默认零配置签名。这让签名提交成为常态而非例外，提升整个生态的供应链安全。不想签名的用户可以用 `libra config vault.signing false` 禁用。
+在 Git 中，提交签名需要配置 `user.signingkey`、`gpg.program` 和 `commit.gpgSign`，这是多数开发者会跳过的多步流程。Libra 的 vault 在仓库初始化时自动生成并管理 PGP 签名密钥，因此提交默认零配置签名。用户可用 `commit.gpgSign` 设置 Git 兼容的 scope 默认；未设置时继续使用 Libra 的 `vault.signing` 默认值。
 
 ### `--disable-pre` 标志
 
@@ -395,5 +395,5 @@ Git 没有内置提交消息格式验证；团队依赖 commitlint、husky 或 C
 - Libra 支持交互式编辑器消息编写（`-e/--edit`，以及无 `-m`/`-F` 的裸 `commit` 在有可用编辑器时打开）
 - jj 没有带暂存的传统 `commit` 命令；`jj commit` 会完成 working copy commit
 - 支持 `--fixup` 和 `--squash`（autosquash 提交重组）
-- Vault signing 替代 Git 的 `commit.gpgsign` 和 `user.signingkey` 配置
+- Vault signing 替代外部 keyring；`commit.gpgSign` 已生效，`user.signingkey` 仍由 vault 管理
 - 支持 `--cleanup=<mode>` 消息清理（`strip`/`whitespace`/`verbatim`/`scissors`/`default`），未给时回退到 `commit.cleanup` 配置；`commit.verbose` 配置可使 `-v` 成为默认

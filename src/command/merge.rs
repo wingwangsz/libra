@@ -98,15 +98,19 @@ pub struct MergeArgs {
     /// the same merge against the recorded target commit, regenerating fresh
     /// conflict markers. The re-run uses default merge options (an original
     /// `-m`/`--no-ff`/`--squash`/`--no-commit` is not replayed).
-    #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff_only", "no_ff", "message", "squash", "no_commit", "verify_signatures"])]
+    #[arg(long, conflicts_with_all = ["branch", "continue_merge", "abort", "ff", "ff_only", "no_ff", "message", "squash", "no_commit", "verify_signatures"])]
     pub restart: bool,
 
     /// Refuse to merge unless the current branch can fast-forward to the target.
-    #[arg(long = "ff-only", conflicts_with_all = ["no_ff", "continue_merge", "abort"])]
+    #[arg(long = "ff-only", conflicts_with_all = ["ff", "no_ff", "continue_merge", "abort"])]
     pub ff_only: bool,
 
+    /// Allow fast-forwarding when possible, overriding `merge.ff`.
+    #[arg(long, conflicts_with_all = ["ff_only", "no_ff", "continue_merge", "abort"])]
+    pub ff: bool,
+
     /// Always create a merge commit, even when a fast-forward would be possible.
-    #[arg(long = "no-ff", conflicts_with_all = ["ff_only", "continue_merge", "abort"])]
+    #[arg(long = "no-ff", conflicts_with_all = ["ff", "ff_only", "continue_merge", "abort"])]
     pub no_ff: bool,
 
     /// Use the given message for the merge commit instead of the default.
@@ -115,12 +119,12 @@ pub struct MergeArgs {
 
     /// Merge changes but stage the result without committing or moving HEAD
     /// (no merge info recorded); finalize with a normal `commit`.
-    #[arg(long, conflicts_with_all = ["ff_only", "continue_merge", "abort"])]
+    #[arg(long, conflicts_with_all = ["continue_merge", "abort"])]
     pub squash: bool,
 
     /// Perform the merge and stage the result but stop before committing,
     /// recording merge state; finalize with `libra merge --continue`.
-    #[arg(long = "no-commit", conflicts_with_all = ["squash", "ff_only", "continue_merge", "abort"])]
+    #[arg(long = "no-commit", conflicts_with_all = ["squash", "continue_merge", "abort"])]
     pub no_commit: bool,
 
     /// Automatically stash local changes before the merge and re-apply them
@@ -248,6 +252,10 @@ pub(crate) struct PullMergeOptions {
     /// Checked on the SAME loaded commit that is merged (no re-resolution), so the
     /// verified object is exactly the merged object. Always `false` for `pull`.
     pub verify_signatures: bool,
+    /// Number of target-side subjects appended to an auto-generated merge
+    /// message (`merge.log`). Always `0` for `pull`: its auto-merge keeps the
+    /// plain message form; only `libra merge` reads the config.
+    pub merge_log: usize,
     /// `libra merge --dry-run`: report the would-be outcome and write NOTHING —
     /// no index/worktree/HEAD/reflog/merge-state mutation and no object-store
     /// writes (auto-merged blobs are computed in memory only). Always `false`
@@ -272,6 +280,12 @@ pub(crate) struct MergeState {
     pub target_ref: String,
     pub base: String,
     pub conflicted_paths: Vec<String>,
+    /// Merge message resolved at merge start (`-m` override or the generated
+    /// default including the `merge.log` shortlog), replayed verbatim by
+    /// `merge --continue`. `None` for states written by older binaries, which
+    /// fall back to the plain `Merge <target> into <head>` form.
+    #[serde(default)]
+    pub message: Option<String>,
 }
 
 impl MergeState {
@@ -446,6 +460,8 @@ pub(crate) enum PullMergeError {
     BadMergeSignature { commit: String },
     #[error("failed to verify the signature of the merged commit: {0}")]
     SignatureCheck(String),
+    #[error(transparent)]
+    HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
 }
 
 pub(crate) type MergeError = PullMergeError;
@@ -509,6 +525,14 @@ impl From<PullMergeError> for CliError {
             PullMergeError::ConflictStyleRead(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
+            PullMergeError::HistoryConfig(
+                crate::command::history_config::HistoryConfigError::Read { .. },
+            ) => CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed),
+            PullMergeError::HistoryConfig(
+                crate::command::history_config::HistoryConfigError::Invalid { .. },
+            ) => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("fix the offending value with 'libra config <key> <value>'"),
             PullMergeError::StateLoad(..) | PullMergeError::IndexLoad(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -607,15 +631,47 @@ async fn run_merge(args: MergeArgs, output: &OutputConfig) -> Result<MergeOutput
     }
     match (args.branch.as_deref(), args.continue_merge, args.abort) {
         (Some(branch), false, false) => {
+            let (ff_only, no_ff) = if args.ff_only {
+                (true, false)
+            } else if args.no_ff {
+                (false, true)
+            } else if args.ff {
+                (false, false)
+            } else {
+                match crate::command::history_config::merge_fast_forward().await? {
+                    Some(crate::command::history_config::MergeFastForward::Allow) | None => {
+                        (false, false)
+                    }
+                    Some(crate::command::history_config::MergeFastForward::CreateMergeCommit) => {
+                        (false, true)
+                    }
+                    Some(crate::command::history_config::MergeFastForward::Only) => (true, false),
+                }
+            };
+            let verify_signatures = if args.verify_signatures {
+                true
+            } else if args.no_verify_signatures {
+                false
+            } else {
+                crate::command::history_config::merge_verify_signatures()
+                    .await?
+                    .unwrap_or(false)
+            };
+            let merge_log = if args.message.is_some() {
+                0
+            } else {
+                crate::command::history_config::merge_log_limit().await?
+            };
             let options = PullMergeOptions {
-                ff_only: args.ff_only,
-                no_ff: args.no_ff,
+                ff_only,
+                no_ff,
                 message: args.message.clone(),
                 squash: args.squash,
                 no_commit: args.no_commit,
                 // `--verify-signatures` is enforced inside the merge on the loaded
                 // tip commit, so the verified object is exactly the merged object.
-                verify_signatures: args.verify_signatures,
+                verify_signatures,
+                merge_log,
                 dry_run: args.dry_run,
                 autostash: if args.autostash {
                     Some(true)
@@ -834,6 +890,23 @@ pub(crate) async fn run_merge_for_pull_with_options(
         return Err(PullMergeError::MergeInProgress);
     }
 
+    // Resolve and load the merge target up front so `--verify-signatures` /
+    // `merge.verifySignatures` runs BEFORE any mutation — including autostash
+    // object writes and stale-sidecar recovery below. The loaded commit is
+    // passed through to the merge itself, so the verified object is exactly
+    // the merged object (no time-of-check/time-of-use re-resolution gap).
+    let commit_hash = resolve_merge_target(target_ref)
+        .await
+        .map_err(|_| PullMergeError::InvalidTarget(upstream.to_string()))?;
+    let target_commit: Commit =
+        load_object(&commit_hash).map_err(|error| PullMergeError::TargetLoad {
+            commit_id: commit_hash.to_string(),
+            detail: error.to_string(),
+        })?;
+    if options.verify_signatures {
+        verify_merge_commit_signature(&target_commit).await?;
+    }
+
     // ── autostash (lore.md §1.8) ──
     // Stale-sidecar recovery: a leftover sidecar with NO merge in progress
     // (crash after a finalize apply, or an interrupted start) is promoted to
@@ -894,7 +967,7 @@ pub(crate) async fn run_merge_for_pull_with_options(
         }
     }
 
-    let result = run_merge_for_pull_inner(target_ref, upstream, output, options).await;
+    let result = run_merge_for_pull_inner(target_commit, upstream, output, options).await;
     // Uniform finalize: applies when no merge state persists (clean success,
     // up-to-date, squash, or a start failure), holds while state exists
     // (conflict / --no-commit). The merge outcome itself is never changed.
@@ -909,27 +982,14 @@ pub(crate) async fn run_merge_for_pull_with_options(
 }
 
 async fn run_merge_for_pull_inner(
-    target_ref: &str,
+    // Pre-resolved and (when requested) signature-verified by
+    // `run_merge_for_pull_with_options` BEFORE autostash/recovery mutations;
+    // reusing the same loaded object keeps verify-and-merge TOCTOU-free.
+    target_commit: Commit,
     upstream: &str,
     output: &OutputConfig,
     options: PullMergeOptions,
 ) -> Result<PullMergeSummary, PullMergeError> {
-    let commit_hash = resolve_merge_target(target_ref)
-        .await
-        .map_err(|_| PullMergeError::InvalidTarget(upstream.to_string()))?;
-    let target_commit: Commit =
-        load_object(&commit_hash).map_err(|error| PullMergeError::TargetLoad {
-            commit_id: commit_hash.to_string(),
-            detail: error.to_string(),
-        })?;
-
-    // `--verify-signatures`: validate the resolved tip's PGP signature on the
-    // SAME loaded commit, before any state mutation — so the verified object is
-    // exactly the merged object (no time-of-check/time-of-use re-resolution gap).
-    if options.verify_signatures {
-        verify_merge_commit_signature(&target_commit).await?;
-    }
-
     let Some(current_commit_id) = Head::current_commit().await else {
         let files_changed = count_changed_files(None, &target_commit)?;
         // `--dry-run`: report the fast-forward preview without applying it
@@ -1003,9 +1063,11 @@ async fn run_merge_for_pull_inner(
     }
 
     // `--no-ff` cannot be combined with `--ff-only` (clap rejects the pair on
-    // the pull surface), so reaching `ff_only` here means a genuine
-    // non-fast-forward history.
-    if options.ff_only {
+    // the pull surface). `ff_only` (flag or `merge.ff=only`) must reject only
+    // a genuinely diverged history: a fast-forwardable `--squash`/`--no-commit`
+    // merely skipped the fast-forward branch above and is allowed (Git accepts
+    // `merge.ff=only` + `--squash` when the target is fast-forwardable).
+    if options.ff_only && lca.id != current_commit.id {
         return Err(PullMergeError::NonFastForward {
             current: current_commit.id.to_string(),
             target: target_commit.id.to_string(),
@@ -1019,6 +1081,7 @@ async fn run_merge_for_pull_inner(
         upstream,
         ThreeWayMergeOptions {
             message_override: options.message.clone(),
+            merge_log: options.merge_log,
             squash: options.squash,
             no_commit: options.no_commit,
             dry_run: options.dry_run,
@@ -1047,6 +1110,7 @@ impl MergeTreeEntry {
 
 struct ThreeWayMergeOptions<'a> {
     message_override: Option<String>,
+    merge_log: usize,
     squash: bool,
     no_commit: bool,
     /// Preview only: compute the outcome, write nothing (lore.md §1.3).
@@ -1106,6 +1170,23 @@ async fn perform_three_way_merge(
         });
     }
 
+    // Resolve the final merge message ONCE, up front — `-m` override or the
+    // generated default including the `merge.log` shortlog — so the conflict
+    // and `--no-commit` states persist it and `merge --continue` replays it
+    // instead of regenerating a plain message (which would drop `-m` and the
+    // configured shortlog).
+    let resolved_message = match &options.message_override {
+        Some(message) => message.clone(),
+        None => crate::command::merge_message::default_message(
+            current_commit.id,
+            target_commit.id,
+            upstream,
+            &head_name,
+            options.merge_log,
+        )
+        .map_err(PullMergeError::History)?,
+    };
+
     if !merge_result.conflicts.is_empty() {
         // Resolved only on the conflict path: a clean merge never renders
         // markers, so an invalid style config cannot block it.
@@ -1115,6 +1196,7 @@ async fn perform_three_way_merge(
         })?;
         write_conflicted_merge_state(MergeConflictInput {
             head_name,
+            message: resolved_message,
             upstream: upstream.to_string(),
             base: base_commit.id,
             ours: current_commit.id,
@@ -1180,6 +1262,7 @@ async fn perform_three_way_merge(
             target_ref: upstream.to_string(),
             base: base_commit.id.to_string(),
             conflicted_paths: Vec::new(),
+            message: Some(resolved_message.clone()),
         }
         .save()?;
         return Ok(PullMergeSummary {
@@ -1198,9 +1281,7 @@ async fn perform_three_way_merge(
         });
     }
 
-    let message = options
-        .message_override
-        .unwrap_or_else(|| format!("Merge {upstream} into {head_name}"));
+    let message = resolved_message;
     let merge_commit = Commit::from_tree_id(
         tree_id,
         vec![current_commit.id, target_commit.id],
@@ -1265,6 +1346,8 @@ pub(crate) async fn conflict_style_from_config() -> Result<diffy::ConflictStyle,
 
 struct MergeConflictInput {
     head_name: String,
+    /// Resolved merge message (see [`MergeState::message`]).
+    message: String,
     upstream: String,
     base: ObjectHash,
     ours: ObjectHash,
@@ -1326,6 +1409,7 @@ fn write_conflicted_merge_state(input: MergeConflictInput) -> Result<(), PullMer
             .iter()
             .map(|path| path.display().to_string())
             .collect(),
+        message: Some(input.message),
     };
     state.save()?;
 
@@ -1407,7 +1491,13 @@ async fn run_merge_continue(output: &OutputConfig) -> Result<MergeOutput, MergeE
     let index_items = index_tree_items(&index)?;
     let files_changed = count_item_map_changes(&original_items, &index_items);
     let tree_id = create_tree_from_items_map(&index_items).map_err(MergeError::TreeCreate)?;
-    let message = format!("Merge {} into {}", state.target_ref, state.head_name);
+    // Replay the message resolved at merge start (`-m` or the generated
+    // default with the `merge.log` shortlog); states written by older
+    // binaries carry no message and keep the plain form.
+    let message = state
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("Merge {} into {}", state.target_ref, state.head_name));
     let merge_commit = Commit::from_tree_id(
         tree_id,
         vec![orig_head, target],

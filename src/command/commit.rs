@@ -207,10 +207,12 @@ pub struct CommitArgs {
 
     /// Force an unsigned commit: skip Libra's vault GPG signing
     /// (`vault_sign_commit`) for this commit, matching `git commit
-    /// --no-gpg-sign`. Vault signing runs when `vault.signing=true` (the `libra
-    /// init` default) and a vault unseal key is available; `--no-gpg-sign`
-    /// suppresses it regardless, so it is a no-op only when signing would not
-    /// have happened anyway. (Git's positive `-S`/`--gpg-sign` is not exposed.)
+    /// --no-gpg-sign`. Signing is resolved as: `--no-gpg-sign` (highest) >
+    /// `commit.gpgSign=true|false` (Git-compatible local→global→system
+    /// cascade; `true` force-signs with the repository vault key, `false`
+    /// disables signing) > the `vault.signing` Libra default (signs when
+    /// `true` — the `libra init` default — and a vault unseal key is
+    /// available). (Git's positive `-S`/`--gpg-sign` is not exposed.)
     #[arg(long = "no-gpg-sign")]
     pub no_gpg_sign: bool,
 }
@@ -318,6 +320,9 @@ pub enum CommitError {
 
     #[error("{0}")]
     InvalidConfig(String),
+
+    #[error(transparent)]
+    HistoryConfig(#[from] crate::command::history_config::HistoryConfigError),
 }
 
 impl From<CommitError> for CliError {
@@ -356,6 +361,14 @@ impl From<CommitError> for CliError {
                     "supported formats: '<unix> <+HHMM|-HHMM>', RFC 3339, 'YYYY-MM-DD HH:MM:SS +HHMM', 'YYYY-MM-DD', relative dates, or a Unix timestamp",
                 ),
             CommitError::InvalidConfig(..) => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("fix the offending value with 'libra config <key> <value>'"),
+            CommitError::HistoryConfig(
+                crate::command::history_config::HistoryConfigError::Read { .. },
+            ) => CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed),
+            CommitError::HistoryConfig(
+                crate::command::history_config::HistoryConfigError::Invalid { .. },
+            ) => CliError::command_usage(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("fix the offending value with 'libra config <key> <value>'"),
             CommitError::MessageFileRead { .. } => {
@@ -773,6 +786,8 @@ pub async fn run_commit(
     // `--porcelain` is a machine-readable preview and, like Git, implies
     // `--dry-run`: it prints status and never creates the commit.
     let dry_run = args.dry_run || args.porcelain;
+    let signing_policy =
+        crate::command::history_config::commit_signing_policy(args.no_gpg_sign).await?;
 
     // Auto-stage tracked modifications/deletions (git commit -a). For a dry run
     // this still computes the would-be-committed state, so snapshot the index
@@ -990,18 +1005,30 @@ pub async fn run_commit(
             .await);
         }
 
-        let gpg_sig = if args.no_gpg_sign {
-            None
-        } else {
-            vault_sign_commit(
-                &tree.id,
-                &grandpa_commit_id,
-                &author,
-                &committer,
-                &commit_message,
-                false,
-            )
-            .await?
+        let gpg_sig = match signing_policy {
+            crate::command::history_config::CommitSigningPolicy::Disable => None,
+            crate::command::history_config::CommitSigningPolicy::Force => {
+                vault_sign_commit(
+                    &tree.id,
+                    &grandpa_commit_id,
+                    &author,
+                    &committer,
+                    &commit_message,
+                    true,
+                )
+                .await?
+            }
+            crate::command::history_config::CommitSigningPolicy::InheritVault => {
+                vault_sign_commit(
+                    &tree.id,
+                    &grandpa_commit_id,
+                    &author,
+                    &committer,
+                    &commit_message,
+                    false,
+                )
+                .await?
+            }
         };
 
         let commit = Commit::new(
@@ -1077,18 +1104,30 @@ pub async fn run_commit(
         .await);
     }
 
-    let gpg_sig = if args.no_gpg_sign {
-        None
-    } else {
-        vault_sign_commit(
-            &tree.id,
-            &parents_commit_ids,
-            &author,
-            &committer,
-            &commit_message,
-            false,
-        )
-        .await?
+    let gpg_sig = match signing_policy {
+        crate::command::history_config::CommitSigningPolicy::Disable => None,
+        crate::command::history_config::CommitSigningPolicy::Force => {
+            vault_sign_commit(
+                &tree.id,
+                &parents_commit_ids,
+                &author,
+                &committer,
+                &commit_message,
+                true,
+            )
+            .await?
+        }
+        crate::command::history_config::CommitSigningPolicy::InheritVault => {
+            vault_sign_commit(
+                &tree.id,
+                &parents_commit_ids,
+                &author,
+                &committer,
+                &commit_message,
+                false,
+            )
+            .await?
+        }
     };
 
     let commit = Commit::new(

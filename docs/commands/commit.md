@@ -280,10 +280,11 @@ libra commit --no-status -m "message"
 
 Force an unsigned commit: skip Libra's vault GPG signing for this commit,
 matching `git commit --no-gpg-sign`. Vault signing runs when `vault.signing=true`
-(the `libra init` default) and a vault unseal key is available; `--no-gpg-sign`
-suppresses it regardless, so it is a no-op only when signing would not have
-happened anyway. Git's positive `-S`/`--gpg-sign` is not exposed; Libra's commit
-signing is driven by the `vault.signing` config instead.
+(the `libra init` default) and a vault unseal key is available. The Git-compatible
+`commit.gpgSign=true|false` default overrides `vault.signing`: `true` force-signs
+with the repository vault key and `false` disables signing. `--no-gpg-sign` has
+highest precedence and suppresses either configuration. Git's positive
+`-S`/`--gpg-sign` is not exposed.
 
 ```bash
 libra commit --no-gpg-sign -m "message"
@@ -496,11 +497,12 @@ teams that use different commit message conventions.
 ### Vault signing by default instead of manual GPG setup
 
 In Git, commit signing requires configuring `user.signingkey`, `gpg.program`, and
-`commit.gpgsign` -- a multi-step process that most developers skip. Libra's vault
+`commit.gpgSign` -- a multi-step process that most developers skip. Libra's vault
 automatically generates and manages a PGP signing key at repository initialization, so
 commits are signed by default with zero configuration. This makes signed commits the norm
 rather than the exception, improving supply-chain security for the entire ecosystem. Users
-who do not want signing can disable it with `libra config vault.signing false`.
+can use `commit.gpgSign` for a Git-compatible scoped default; when it is unset,
+`vault.signing` remains the Libra default.
 
 ### `--disable-pre` flag
 
@@ -581,4 +583,4 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 - `-v`/`--verbose` appends the staged diff to the editor template (below a `# ----- >8 -----` scissors line); the diff is stripped on save and never enters the commit message. When no editor is opened, `-v` prints the staged diff to stderr.
 - jj does not have a traditional `commit` command with staging; `jj commit` finalizes the working copy commit
 - `--fixup` and `--squash` are supported (autosquash markers); `--cleanup=<mode>` controls comment/scissors stripping
-- Vault signing replaces Git's `commit.gpgsign` and `user.signingkey` configuration
+- Vault signing replaces the external keyring; `commit.gpgSign` is honored while `user.signingkey` remains vault-managed

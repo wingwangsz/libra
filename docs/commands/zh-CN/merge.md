@@ -5,7 +5,7 @@
 ## 概要
 
 ```text
-libra merge [--ff-only | --no-ff | --squash | --no-commit] [-m <msg>] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
+libra merge [--ff | --ff-only | --no-ff] [--squash | --no-commit] [-m <msg>] [--no-edit] [--stat | -n | --no-stat] [--verify-signatures | --no-verify-signatures] [--no-rerere-autoupdate] [--no-gpg-sign] [--dry-run] <branch>
 libra merge --continue
 libra merge --abort
 libra merge --restart
@@ -25,6 +25,10 @@ libra merge --restart
 
 Libra 仍未实现 octopus merge、自定义策略、策略选项或交互式消息编辑（`--edit`/启动编辑器）。签名验证（`--verify-signatures`）已支持，但仅限本仓库 vault PGP key（无外部 GPG keyring）。
 
+### 会改变历史的 merge 默认值
+
+未传对应 CLI 标志时，Libra 按 local → global → system 级联读取 Git 兼容默认值：`merge.ff=true|false|only` 分别允许快进、强制双父 merge commit、仅允许快进（`--ff`/`--no-ff`/`--ff-only` 优先；`only` 与 `--ff-only` 只拒绝真正分叉的历史——可快进的 `--squash`/`--no-commit` 仍被允许，与 Git 一致）；`merge.log=true|false|<n>` 在自动生成的 merge 消息中追加最多 20 条或 `<n>` 条目标侧提交 subject（显式 `-m` 时不追加）。解析后的消息（`-m` 或含 shortlog 的生成消息）会记录进 merge state，冲突或 `--no-commit` 之后用 `merge --continue` 收尾时按原消息提交；`merge.verifySignatures=true|false` 控制 tip 签名验证（正反 CLI 标志优先），验证在解析出的目标上、任何变更（包括 autostash 创建）之前执行——被拒绝的 merge 不写任何内容（无 stash 条目、无对象）。无效或不可读的 local/global 值在修改 HEAD/index/工作树/merge state 前以 `LBR-CLI-002` 或 `LBR-IO-001` 失败；local/global 加密值先解密，不可读或不支持的 system scope 跳过。
+
 ### `--dry-run`（Libra 扩展）
 
 `libra merge --dry-run <branch>` 预演合并结果而**不写任何东西**——不动 HEAD、索引、工作树、reflog、merge 状态与对象库（自动合并的 blob 仅在内存中计算）。因为只读，脏工作树也可预演（注意预演不校验工作树干净度，真实合并仍可能拒绝）。结果：fast-forward / 已最新 / 干净三方合并 → 退出 0；会冲突 → 输出 `Would conflict in: <paths>` 并退出 1（结果信号，非真实冲突的 128）。`--json` 下带 `"dry_run": true`（冲突时另有 `"would_conflict": true`），真实合并的输出不含这两个键（schema 冻结）。
@@ -39,6 +43,7 @@ Libra 仍未实现 octopus merge、自定义策略、策略选项或交互式消
 |--------|-------------|
 | `<branch>` | 要合并的目标分支、提交或远程跟踪引用。 |
 | `-m, --message <MSG>` | 覆盖合并提交消息（默认 `Merge <branch> into <head>`）。 |
+| `--ff` | 允许可行的快进，覆盖 `merge.ff=false|only`。 |
 | `--ff-only` | 仅当当前分支可快进时才合并，否则失败。 |
 | `--no-ff` | 即使可以快进也强制生成双父合并提交。 |
 | `--squash` | 生成合并后的索引/工作树但不创建提交、不移动 HEAD；随后用普通 `libra commit` 收尾。 |
@@ -47,8 +52,8 @@ Libra 仍未实现 octopus merge、自定义策略、策略选项或交互式消
 | `--stat` | 合并完成后显示 diffstat（合并前 HEAD 与新提交之间的变更）。Git 默认显示；Libra 默认不显示，故用 `--stat` 主动开启。与 `--no-stat`/`-n` 构成 last-wins 切换。仅人类输出。 |
 | `-n`, `--no-stat` | 合并结束时不显示 diffstat（Libra 默认）。与 `--stat` 构成 last-wins 切换。 |
 | `--no-progress` | 不显示进度条。为对齐 Git 而接受的 no-op：Libra 的 merge 从不渲染进度条。 |
-| `--verify-signatures` | 验证被合并分支 tip 的 PGP 签名，未签名或签名无效则中止合并。与 `tag -v` 同源：仅能验证本仓库 vault PGP key 所签（无外部 GPG keyring），故他处签名或 SSH 签名视为不可验证。 |
-| `--no-verify-signatures` | 不验证被合并提交的签名（默认）。`--verify-signatures` 的反向；last-wins。 |
+| `--verify-signatures` | 验证被合并分支 tip 的 PGP 签名，未签名或签名无效则中止；覆盖 `merge.verifySignatures`。仅能验证本仓库 vault PGP key 所签。 |
+| `--no-verify-signatures` | 不验证被合并提交的签名，覆盖 `merge.verifySignatures=true`；与正向标志 last-wins。 |
 | `--no-rerere-autoupdate` | 合并后不更新 rerere 索引。为对齐 Git 而接受的 no-op：Libra 无 rerere。（Git 的 `--rerere-autoupdate` 未公开。） |
 | `--no-gpg-sign` | 不对合并提交 GPG 签名。为对齐 Git 而接受的 no-op：Libra 的 merge 从不签名。（Git 的 `-S`/`--gpg-sign` 未实现。） |
 | `--continue` | 在冲突已解决并暂存后完成进行中的合并。 |
