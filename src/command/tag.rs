@@ -299,6 +299,14 @@ enum TagError {
     #[error("unsupported tag sort key '{0}'")]
     InvalidSortKey(String),
 
+    #[error(
+        "bad config value '{value}' for 'tag.sort' (expected refname or creatordate, reversible with '-')"
+    )]
+    InvalidSortConfig { value: String },
+
+    #[error("failed to read config 'tag.sort': {detail}")]
+    SortConfigRead { detail: String },
+
     #[error("failed to sign tag: {0}")]
     VaultSign(String),
 
@@ -412,6 +420,12 @@ impl From<TagError> for CliError {
             TagError::InvalidSortKey(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("supported sort keys: refname, -refname, creatordate, -creatordate"),
+            TagError::InvalidSortConfig { .. } => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("fix the offending value with 'libra config tag.sort <key>' (refname, -refname, creatordate, -creatordate)"),
+            TagError::SortConfigRead { .. } => {
+                CliError::fatal(message).with_stable_code(StableErrorCode::IoReadFailed)
+            }
             TagError::VaultSign(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("ensure the vault is initialized and signing is configured"),
@@ -654,7 +668,25 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
             no_merged.as_ref(),
         )
         .await?;
-        sort_tags(&mut tags, args.sort.as_deref())?;
+        // `--sort` wins; otherwise the Git-compatible `tag.sort` config
+        // default applies (strict local→global→system cascade). Resolved here,
+        // after list-mode detection, so a configured sort never flips a tag
+        // CREATION into list mode. When neither is set, Git's default order is
+        // refname-ascending (Libra's raw store order is insertion order).
+        let config_sort = if args.sort.is_none() {
+            configured_tag_sort().await?
+        } else {
+            None
+        };
+        match (args.sort.as_deref(), config_sort.as_deref()) {
+            (Some(key), _) => sort_tags(&mut tags, Some(key))?,
+            (None, Some(key)) => {
+                sort_tags(&mut tags, Some(key)).map_err(|_| TagError::InvalidSortConfig {
+                    value: key.to_string(),
+                })?
+            }
+            (None, None) => sort_tags(&mut tags, Some("refname"))?,
+        }
         return Ok(TagOutput::List { tags });
     }
 
@@ -858,6 +890,20 @@ async fn collect_tags(
 
 /// Sort tag entries by the given key. Supported keys: `refname`, `-refname`,
 /// `creatordate`, `-creatordate`. The `-` prefix reverses the order.
+/// Read the Git-compatible `tag.sort` default through the strict
+/// local → global → system cascade (P1-05d).
+async fn configured_tag_sort() -> Result<Option<String>, TagError> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        "tag.sort",
+    )
+    .await
+    .map(|value| value.map(|v| v.trim().to_string()))
+    .map_err(|error| TagError::SortConfigRead {
+        detail: format!("{error:#}"),
+    })
+}
+
 fn sort_tags(tags: &mut [TagListEntry], key: Option<&str>) -> Result<(), TagError> {
     let Some(key) = key else {
         return Ok(());

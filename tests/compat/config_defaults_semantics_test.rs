@@ -1235,3 +1235,154 @@ fn invalid_status_config_fails_before_output() {
         fixture.success(&repo, &["config", "--unset", key]);
     }
 }
+
+// ── P1-05d: branch.sort / tag.sort defaults ──────────────────────────────────
+
+#[test]
+fn branch_sort_config_orders_list_and_cli_wins() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("branch-sort");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "base.txt", "base\n", "base");
+    fixture.success(&repo, &["branch", "v1.10"]);
+    fixture.success(&repo, &["branch", "v1.9"]);
+
+    // version:refname from config orders v1.9 before v1.10.
+    fixture.success(&repo, &["config", "branch.sort", "version:refname"]);
+    let listed = fixture.success(&repo, &["branch"]);
+    let out = stdout_trim(&listed);
+    let pos = |needle: &str| out.find(needle).unwrap_or(usize::MAX);
+    assert!(
+        pos("v1.9") < pos("v1.10"),
+        "branch.sort=version:refname must order versions: {out}"
+    );
+
+    // The CLI flag overrides the config.
+    let cli = fixture.success(&repo, &["branch", "--sort=-refname"]);
+    let cli_out = stdout_trim(&cli);
+    let cli_pos = |needle: &str| cli_out.find(needle).unwrap_or(usize::MAX);
+    assert!(
+        cli_pos("v1.9") < cli_pos("v1.10"),
+        "--sort=-refname must override the config (v1.9 > v1.10 lexically): {cli_out}"
+    );
+
+    // Branch creation still works with a configured sort.
+    fixture.success(&repo, &["branch", "created-with-config"]);
+    assert!(stdout_trim(&fixture.success(&repo, &["branch"])).contains("created-with-config"));
+
+    // Invalid config fails closed before any listing output.
+    fixture.success(&repo, &["config", "branch.sort", "sideways"]);
+    let rejected = fixture.run(&repo, &["branch"]);
+    assert_eq!(rejected.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("branch.sort"));
+    assert!(rejected.stdout.is_empty());
+
+    // Repeated config values collapse to the LAST one (documented narrowing:
+    // Git stacks repeated sort keys into a multi-key sort; Libra's cascade is
+    // single-value).
+    fixture.success(&repo, &["config", "--", "branch.sort", "-refname"]);
+    fixture.success(&repo, &["config", "--add", "branch.sort", "refname"]);
+    let stacked = stdout_trim(&fixture.success(&repo, &["branch"]));
+    let stacked_pos = |needle: &str| stacked.find(needle).unwrap_or(usize::MAX);
+    assert!(
+        stacked_pos("v1.10") < stacked_pos("v1.9"),
+        "the last repeated branch.sort value (refname asc) must win: {stacked}"
+    );
+}
+
+#[test]
+fn branch_sort_config_keeps_unborn_head_line() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("branch-sort-unborn");
+    fixture.init_repo(&repo);
+    fixture.success(&repo, &["config", "branch.sort", "refname"]);
+
+    // An unborn repository still shows the current-branch line: the config
+    // default, unlike the --sort flag, must not suppress it.
+    let listed = fixture.success(&repo, &["branch"]);
+    assert!(
+        stdout_trim(&listed).starts_with("* "),
+        "unborn HEAD line expected with branch.sort set: {}",
+        stdout_trim(&listed)
+    );
+}
+
+#[test]
+fn sort_config_read_failure_is_io_error_before_listing() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("sort-config-read-failure");
+    fixture.init_repo(&repo);
+    fixture.commit_file(
+        &repo, "base.txt", "base
+", "base",
+    );
+    fixture.success(&repo, &["tag", "v1"]);
+    // An unreadable global config DB (a directory in its place) must fail
+    // both listings closed with LBR-IO-001 naming the offending key.
+    fs::create_dir_all(fixture.home.join(".libra").join("config.db"))
+        .expect("create unreadable config-db directory");
+
+    let branch = fixture.run(&repo, &["branch"]);
+    assert_eq!(branch.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&branch.stderr);
+    assert!(stderr.contains("LBR-IO-001"), "{stderr}");
+    assert!(stderr.contains("branch.sort"), "{stderr}");
+    assert!(branch.stdout.is_empty());
+
+    let tag = fixture.run(&repo, &["tag"]);
+    assert_eq!(tag.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&tag.stderr);
+    assert!(stderr.contains("LBR-IO-001"), "{stderr}");
+    assert!(stderr.contains("tag.sort"), "{stderr}");
+    assert!(tag.stdout.is_empty());
+}
+
+#[test]
+fn tag_sort_config_orders_list_without_forcing_list_mode() {
+    let fixture = Fixture::new();
+    let repo = fixture.path("tag-sort");
+    fixture.init_repo(&repo);
+    fixture.commit_file(&repo, "base.txt", "base\n", "base");
+    fixture.success(&repo, &["tag", "zulu"]);
+    fixture.success(&repo, &["tag", "alpha"]);
+
+    // Unset: Git's default is refname-ascending (not insertion order).
+    let default_order = stdout_trim(&fixture.success(&repo, &["tag"]));
+    assert_eq!(
+        default_order.lines().collect::<Vec<_>>(),
+        vec!["alpha", "zulu"],
+        "default tag order must be refname-ascending"
+    );
+
+    // Config reverses it; the CLI flag wins over the config.
+    fixture.success(&repo, &["config", "--", "tag.sort", "-refname"]);
+    let reversed = stdout_trim(&fixture.success(&repo, &["tag"]));
+    assert_eq!(reversed.lines().collect::<Vec<_>>(), vec!["zulu", "alpha"]);
+    let cli = stdout_trim(&fixture.success(&repo, &["tag", "--sort=refname", "-l"]));
+    assert_eq!(cli.lines().collect::<Vec<_>>(), vec!["alpha", "zulu"]);
+
+    // A configured sort must NOT flip tag creation into list mode.
+    fixture.success(&repo, &["tag", "mid"]);
+    let created = stdout_trim(&fixture.success(&repo, &["tag"]));
+    assert!(
+        created.lines().any(|l| l == "mid"),
+        "tag creation must still work with tag.sort set: {created}"
+    );
+
+    // Invalid config fails closed before any listing output.
+    fixture.success(&repo, &["config", "tag.sort", "sideways"]);
+    let rejected = fixture.run(&repo, &["tag"]);
+    assert_eq!(rejected.status.code(), Some(129));
+    assert!(String::from_utf8_lossy(&rejected.stderr).contains("tag.sort"));
+    assert!(rejected.stdout.is_empty());
+
+    // Repeated config values collapse to the LAST one (documented narrowing).
+    fixture.success(&repo, &["config", "--", "tag.sort", "-refname"]);
+    fixture.success(&repo, &["config", "--add", "tag.sort", "refname"]);
+    let stacked = stdout_trim(&fixture.success(&repo, &["tag", "-l"]));
+    assert_eq!(
+        stacked.lines().next(),
+        Some("alpha"),
+        "the last repeated tag.sort value must win: {stacked}"
+    );
+}

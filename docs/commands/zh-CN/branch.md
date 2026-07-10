@@ -24,7 +24,7 @@ libra branch --show-current
 
 删除有两种形式：`-d` 执行安全删除，移除前会检查该分支是否已完全合并到当前分支；`-D` 无论合并状态如何都会强制删除。两者都拒绝删除你当前所在的分支。
 
-`--contains` 和 `--no-contains` 过滤器（别名为 `--with` 和 `--without`）可将分支列表缩小到历史中包含或不包含某个提交的分支；省略提交参数时默认为 HEAD。`--merged [<commit>]` / `--no-merged [<commit>]` 列出已合并（或尚未合并）入某提交的分支——即 tip 是否可从该提交到达，缺省 HEAD，是 `--contains` 的反方向。`--sort <key>` 按 `refname`、`version:refname`（数值感知）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序，前导 `-` 反转。
+`--contains` 和 `--no-contains` 过滤器（别名为 `--with` 和 `--without`）可将分支列表缩小到历史中包含或不包含某个提交的分支；省略提交参数时默认为 HEAD。`--merged [<commit>]` / `--no-merged [<commit>]` 列出已合并（或尚未合并）入某提交的分支——即 tip 是否可从该提交到达，缺省 HEAD，是 `--contains` 的反方向。`--sort <key>` 按 `refname`、`version:refname`（数值感知）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序，前导 `-` 反转。未传该标志时，Git 兼容的 `branch.sort` 配置默认生效（严格 local → global → system 级联；无效值在任何列表输出前以 `LBR-CLI-002` fail-closed，local/global 读取失败为 `LBR-IO-001`）。与标志不同，配置默认既不隐含 `--list` 也不抑制 unborn-HEAD 行，与 Git 一致。已记录收窄：Git 会把重复的 `branch.sort` 值叠成多键排序；Libra 只应用胜出 scope 的最后一个值。
 
 ## 选项
 
@@ -47,7 +47,7 @@ libra branch --show-current
 | | `--no-contains` | `[commit]`（默认 HEAD） | 只列出不包含该提交的分支。别名：`--without` |
 | | `--merged` | `[commit]`（默认 HEAD） | 只列出已合并入该提交的分支（tip 可从其到达） |
 | | `--no-merged` | `[commit]`（默认 HEAD） | 只列出尚未合并入该提交的分支 |
-| | `--sort` | `<key>` | 按 `refname`、`version:refname`（`v:refname`）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序；前导 `-` 反转（dash 形式用 `--sort=-committerdate`） |
+| | `--sort` | `<key>` | 按 `refname`、`version:refname`（`v:refname`）、`committerdate`/`creatordate`/`authordate`（tip 提交的 committer 日期，`authordate` 为 author 日期）、`objectsize`（tip 对象字节大小）或 `objectname`（tip 提交的对象 id）排序；前导 `-` 反转（dash 形式用 `--sort=-committerdate`）。优先于 `branch.sort` 配置默认 |
 | | `--format` | `<format>` | 以 for-each-ref 格式串渲染每个分支（如 `%(refname:short)`、`%(objectname)`、`%(HEAD)`、`%(upstream)`、`%(if)`…`%(end)`）。取代默认 `* name` 列表（及 `-v`/`--column`），复用 for-each-ref atom 引擎 |
 | | `--column[=<mode>]` | `always` / `auto` / `never` | 将分支列表按列布局而非每行一个（bare `--column` 即 `always`；`auto` 仅在 stdout 为终端时）。列模式显示纯文本无颜色的名称。 |
 | | `--no-column` | | 不按列布局列出分支（等价于 `--column=never`），撤销先前的 `--column`（最后出现者生效）。分支默认每行一个，故单独使用时为 no-op。 |

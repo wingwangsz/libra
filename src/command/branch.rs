@@ -810,6 +810,12 @@ enum BranchError {
     #[error("unsupported sort key '{0}'")]
     InvalidSortKey(String),
 
+    #[error("bad config value '{value}' for '{key}' (expected a for-each-ref sort key)")]
+    InvalidSortConfig { key: &'static str, value: String },
+
+    #[error("failed to read config '{key}': {detail}")]
+    SortConfigRead { key: &'static str, detail: String },
+
     #[error("invalid upstream '{0}'")]
     InvalidUpstream(String),
 
@@ -939,6 +945,17 @@ impl From<BranchError> for CliError {
             .with_hint(
                 "supported keys: refname, version:refname (v:refname), committerdate, creatordate, authordate, objectsize, objectname, each reversible with a leading '-'",
             ),
+            BranchError::InvalidSortConfig { key, value } => {
+                CliError::command_usage(format!(
+                    "bad config value '{value}' for '{key}' (expected a for-each-ref sort key)"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint(format!(
+                    "fix the offending value with 'libra config {key} <key>' (e.g. refname, -committerdate, version:refname)"
+                ))
+            }
+            BranchError::SortConfigRead { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoReadFailed),
             BranchError::InvalidUpstream(upstream) => {
                 CliError::fatal(format!("invalid upstream '{upstream}'"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -1784,13 +1801,33 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
 
     // `--sort` orders the entries here (reflected in both human and JSON
     // output); the renderer then preserves this order instead of applying its
-    // default current-first ordering.
+    // default current-first ordering. Without the flag, the Git-compatible
+    // `branch.sort` config default applies (strict local→global→system
+    // cascade). The config is resolved here — after `has_commit_filters` and
+    // `show_unborn_head` — so a configured sort, unlike the flag, neither
+    // implies `--list` nor suppresses the unborn-HEAD line (Git behavior).
+    let config_sort = if args.sort.is_none() {
+        configured_branch_sort().await?
+    } else {
+        None
+    };
     let sorted = match args.sort.as_deref() {
         Some(key) => {
             sort_branch_entries(&mut entries, key, args.ignore_case)?;
             true
         }
-        None => false,
+        None => match config_sort.as_deref() {
+            Some(key) => {
+                sort_branch_entries(&mut entries, key, args.ignore_case).map_err(|_| {
+                    BranchError::InvalidSortConfig {
+                        key: "branch.sort",
+                        value: key.to_string(),
+                    }
+                })?;
+                true
+            }
+            None => false,
+        },
     };
 
     Ok(BranchOutput::List {
@@ -2372,6 +2409,22 @@ async fn resolve_commits(commits: &[String]) -> Result<HashSet<ObjectHash>, Bran
 /// `creatordate` / `authordate` (the tip commit's date), `objectsize` (the tip
 /// object's byte size), and `objectname` (the tip commit's object id), with a
 /// leading `-` reversing. Unknown keys are a usage error.
+/// Read the Git-compatible `branch.sort` default through the strict
+/// local → global → system cascade (P1-05d). Empty values are rejected by the
+/// caller via [`sort_branch_entries`]'s key validation.
+async fn configured_branch_sort() -> Result<Option<String>, BranchError> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        "branch.sort",
+    )
+    .await
+    .map(|value| value.map(|v| v.trim().to_string()))
+    .map_err(|error| BranchError::SortConfigRead {
+        key: "branch.sort",
+        detail: format!("{error:#}"),
+    })
+}
+
 fn sort_branch_entries(
     entries: &mut [BranchListEntry],
     key: &str,

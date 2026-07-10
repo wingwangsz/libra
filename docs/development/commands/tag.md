@@ -41,6 +41,7 @@ flowchart TD
 - 2026-06-06 `58b0cc16`（`feat(tag): add --points-at list filter (v0.17.1406)`）：新增 `--points-at <object>`（字段 `points_at`），列表模式下按 peel-to-commit 过滤标签；不可解析对象映射为 `LBR-CLI-003`（exit 129）。该提交曾在一次 reconcile 中从工作树丢失，已于 2026-06-18 依据原提交 diff 恢复（含单元测试、端到端测试与文档）。
 - 2026-05-18 `b534c401`（`fix(commit,stash,index-pack,tag): restore Issues URL on internal-invariant paths`）：实现修正：restore Issues URL on internal-invariant paths；该节点把边界行为、错误处理或兼容差异纳入当前实现约束。
 - 2026-05-16 `fff9cbb0`（`test(tag): pin Display for 5 static-message TagError variants (v0.17.292)`）：测试契约：pin Display for 5 static-message TagError variants (v0.17.292)；相关行为已有回归守卫，后续变更需要继续满足。
+- 2026-07-11（plan-20260708 P1-05d，sort 片）：`tag.sort` 配置默认接入严格 local→global→system 级联（`configured_tag_sort`，`--sort` 优先）。配置在 list 模式判定之后解析，因而配置的排序不会把 `libra tag <name>`（创建）翻成列表。两者皆未设置时列表按 `refname` 升序（Git 默认；此前为 DB 插入序）。无效配置值 → `TagError::InvalidSortConfig`（`LBR-CLI-002`），读取失败 → `SortConfigRead`（`LBR-IO-001`），均在输出前。`creatordate` 仍为对象哈希近似（与 `--sort` 相同，文档已注明）。已记录收窄：重复配置值只应用胜出 scope 的最后一个（Git 叠成多键排序）。回归：`compat_config_defaults_semantics` 的 `tag_sort_config_orders_list_without_forcing_list_mode`（含多值 last-wins）、`sort_config_read_failure_is_io_error_before_listing`（不可读 global 库 → LBR-IO-001 点名键）。
 - 历史结论：当前文档应以这些提交之后的代码、测试和兼容矩阵为准；更早的迁移式文档只保留为背景，不再作为事实来源。
 
 ## 当前状态
