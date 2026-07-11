@@ -3,10 +3,17 @@ use super::{DiffArgs, DiffError};
 const DEFAULT_CONTEXT: usize = 3;
 const DEFAULT_RENAME_SCORE: u32 = 30000;
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 pub(super) struct ResolvedDiffConfig {
     pub(super) context: usize,
     pub(super) rename_threshold: Option<u32>,
+    pub(super) prefixes: DiffPrefixes,
+}
+
+#[derive(Clone)]
+pub(super) struct DiffPrefixes {
+    pub(super) source: String,
+    pub(super) destination: String,
 }
 
 /// Resolve every supported `diff.*` default before progress or diff scanning.
@@ -22,9 +29,11 @@ pub(super) async fn resolve_diff_config(args: &DiffArgs) -> Result<ResolvedDiffC
         None if args.no_renames => None,
         None => configured_diff_renames().await?,
     };
+    let prefixes = configured_diff_prefixes(args).await?;
     Ok(ResolvedDiffConfig {
         context,
         rename_threshold,
+        prefixes,
     })
 }
 
@@ -41,6 +50,64 @@ async fn read_diff_config(key: &'static str) -> Result<Option<String>, DiffError
         key,
         detail: format!("{error:#}"),
     })
+}
+
+async fn read_raw_diff_config(key: &'static str) -> Result<Option<String>, DiffError> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        key,
+    )
+    .await
+    .map_err(|error| DiffError::DiffConfigRead {
+        key,
+        detail: format!("{error:#}"),
+    })
+}
+
+async fn configured_diff_bool(key: &'static str) -> Result<bool, DiffError> {
+    let Some(value) = read_diff_config(key).await? else {
+        return Ok(false);
+    };
+    crate::internal::config::parse_git_config_bool(&value)
+        .ok_or(DiffError::InvalidDiffConfig { key, value })
+}
+
+async fn configured_diff_prefixes(args: &DiffArgs) -> Result<DiffPrefixes, DiffError> {
+    let no_prefix = configured_diff_bool("diff.noPrefix").await?;
+    let mnemonic = configured_diff_bool("diff.mnemonicPrefix").await?;
+    let configured_source = read_raw_diff_config("diff.srcPrefix").await?;
+    let configured_destination = read_raw_diff_config("diff.dstPrefix").await?;
+
+    let (mut source, mut destination) = if no_prefix {
+        (String::new(), String::new())
+    } else if mnemonic {
+        mnemonic_prefixes(args)
+    } else {
+        (
+            configured_source.unwrap_or_else(|| "a/".to_string()),
+            configured_destination.unwrap_or_else(|| "b/".to_string()),
+        )
+    };
+    if args.reverse {
+        std::mem::swap(&mut source, &mut destination);
+    }
+    Ok(DiffPrefixes {
+        source,
+        destination,
+    })
+}
+
+fn mnemonic_prefixes(args: &DiffArgs) -> (String, String) {
+    let pair = if args.staged {
+        ("c/", "i/")
+    } else if args.old.is_some() && args.new.is_none() {
+        ("c/", "w/")
+    } else if args.old.is_some() {
+        ("c/", "c/")
+    } else {
+        ("i/", "w/")
+    };
+    (pair.0.to_string(), pair.1.to_string())
 }
 
 /// `diff.context`: non-negative Git integer, default 3. CLI `-U` wins.

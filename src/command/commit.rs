@@ -315,6 +315,11 @@ pub enum CommitError {
     #[error("failed to calculate staged changes: {0}")]
     StagedChanges(String),
 
+    /// A `commit -v` diff error whose stable code and remediation hints must be
+    /// preserved instead of being mislabeled as repository corruption.
+    #[error("{0}")]
+    VerboseDiff(crate::utils::error::CliError),
+
     #[error("{0}")]
     EditorFailed(String),
 
@@ -329,6 +334,7 @@ impl From<CommitError> for CliError {
     fn from(error: CommitError) -> Self {
         match &error {
             CommitError::LockPolicy(inner) => inner.clone(),
+            CommitError::VerboseDiff(inner) => inner.clone(),
             CommitError::IndexLoad(..) => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("the index file may be corrupted; try 'libra status' to verify"),
@@ -1349,13 +1355,13 @@ async fn resolve_final_message(
     } else {
         // No editor was opened. `-v` here just prints the staged diff to stderr
         // (it never enters the message).
-        if verbose
-            && !output.is_json()
-            && !output.quiet
-            && let Ok(diff) = diff::staged_diff_text().await
-            && !diff.trim().is_empty()
-        {
-            eprintln!("{diff}");
+        if verbose {
+            let diff = diff::staged_diff_text()
+                .await
+                .map_err(|e| CommitError::VerboseDiff(CliError::from(e)))?;
+            if !output.is_json() && !output.quiet && !diff.trim().is_empty() {
+                eprintln!("{diff}");
+            }
         }
         // Git's `default` and `scissors` cleanup both carry an "if the message is
         // edited" clause: `default` is strip-when-edited / whitespace-otherwise, and
@@ -1449,7 +1455,7 @@ async fn build_verbose_template(
 ) -> Result<String, CommitError> {
     let diff = diff::staged_diff_text()
         .await
-        .map_err(|e| CommitError::StagedChanges(e.to_string()))?;
+        .map_err(|e| CommitError::VerboseDiff(CliError::from(e)))?;
     let mut buffer = String::new();
     buffer.push_str(initial);
     if !initial.is_empty() && !initial.ends_with('\n') {
@@ -2385,7 +2391,7 @@ mod test {
     ///
     /// Source-chained / wrapper variants (IndexLoad, IndexSave,
     /// TreeCreation, ObjectStorage, ParentCommitLoad, HeadUpdate,
-    /// PreCommitHook, VaultSign, AutoStage, StagedChanges,
+    /// PreCommitHook, VaultSign, AutoStage, StagedChanges, VerboseDiff,
     /// MessageFileRead) wrap upstream error strings via `{0}` /
     /// `{detail}` and are intentionally skipped — their content is
     /// owned by the wrapped error type.

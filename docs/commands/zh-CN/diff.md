@@ -170,6 +170,20 @@ libra diff --output my.patch
 libra --json diff --staged
 ```
 
+## 配置默认值
+
+未提供后续 CLI 前缀覆盖能力时，patch 路径前缀按严格 local → global → system
+级联读取。`diff.noPrefix=true` 移除两侧前缀；否则
+`diff.mnemonicPrefix=true` 会按 index–worktree、commit–worktree、commit–index、
+commit–commit 比较分别选择 `i/`/`w/`、`c/`/`w/`、`c/`/`i/`、`c/`/`c/`，`-R`
+交换前缀顺序。两个布尔均未启用时，`diff.srcPrefix` 与 `diff.dstPrefix` 分别替换 `a/` 与 `b/`；值按
+原样使用，如需斜杠应自行包含。优先级为 `noPrefix` → `mnemonicPrefix` → 自定义
+前缀 → `a/`/`b/`。无效布尔或不可读的 local/global 配置在进度/输出前失败；
+不可读或不支持的 system scope 按既有配置契约跳过。前缀改写发生在
+`--relative` 之后，作用于内建 rename/binary 与 `commit -v` patch，不改写外部
+diff 驱动的 verbatim 输出。与 Git 一样，`commit -v` 始终使用内建 staged diff，
+忽略 `diff.external`。
+
 ## 人类可读输出
 
 支持的输出模式：

@@ -161,6 +161,17 @@ transfer with `LBR-REPO-002` instead of leaving refs that point at commits whose
 parents are missing. `rev-parse --is-shallow-repository` is supported and reports
 whether `.libra/shallow` contains at least one boundary.
 
+Diff prefix configuration is part of the `diff` compatibility surface:
+`diff.noPrefix`, `diff.mnemonicPrefix`, `diff.srcPrefix`, and `diff.dstPrefix`
+honor the strict local → global → system cascade and Git precedence. Mnemonic
+pairs cover index/worktree (`i/w`), commit/worktree (`c/w`), commit/index
+(`c/i`), and commit/commit (`c/c`); `-R` swaps the pair, `/dev/null` remains
+unprefixed, external-driver output remains verbatim, and `commit -v` uses the
+built-in staged diff as Git does. The shared plumbing wrappers inherit these
+display prefixes while continuing to suppress porcelain rename defaults.
+Unreadable local/global stores fail closed; unreadable or unsupported system
+scope is skipped under the established strict-config contract.
+
 ## Git commands intentionally absent from `src/cli.rs`
 
 | Command | Tier | Notes |
@@ -206,7 +217,7 @@ enumeration of **sub-faces**, each graded into one of the four tiers so
 | `common-user-flow` | The normal, interactive human path works like Git. |
 | `porcelain-machine` | `--porcelain` / `-z` / exit code / stdout-vs-stderr are script-parseable like Git. |
 | `conflict-aware` | Unmerged index, sequencer state, and conflict-aware `status`/`diff`/`restore` are correct. |
-| `config-aware` | Common Git config defaults (e.g. `status.*`, `diff.renames`, `pull.rebase`) are honored. |
+| `config-aware` | Common Git config defaults (e.g. `status.*`, `diff.renames`, diff prefix controls, `pull.rebase`) are honored. |
 | `plumbing-compatible` | Object / ref / rev-syntax / raw output is byte-close to Git. |
 
 **Bucket meaning** (same four tiers as the top-level matrix): *supported* = solid

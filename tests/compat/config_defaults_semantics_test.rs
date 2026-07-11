@@ -15,6 +15,10 @@ use tempfile::{TempDir, tempdir};
 
 #[path = "config_defaults_diff.rs"]
 mod diff_defaults;
+#[path = "config_defaults_diff_prefix.rs"]
+mod diff_prefix_defaults;
+#[path = "config_defaults_diff_prefix_edges.rs"]
+mod diff_prefix_edges;
 
 const PATH_ENV: &str = "/usr/bin:/bin:/usr/sbin:/sbin";
 

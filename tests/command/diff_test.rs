@@ -2139,7 +2139,8 @@ fn test_diff_word_diff_modes() {
 }
 
 /// `diff.external` routes each file's patch through the configured driver
-/// (GIT_EXTERNAL_DIFF protocol: worktree new side reports an all-zero hash);
+/// verbatim (even when its output resembles built-in metadata). The
+/// GIT_EXTERNAL_DIFF protocol reports an all-zero worktree hash;
 /// `--no-ext-diff` falls back to the internal patch and `--stat` bypasses it.
 #[cfg(unix)]
 #[test]
@@ -2157,7 +2158,11 @@ fn test_diff_external_driver_replaces_patch() {
     fs::write(p.join("f.txt"), "l1\nCHANGED\n").unwrap();
 
     let driver = p.join("driver.sh");
-    fs::write(&driver, "#!/bin/sh\necho \"EXTDIFF $1 newhex=$6\"\n").unwrap();
+    fs::write(
+        &driver,
+        "#!/bin/sh\nprintf 'diff --git a/f.txt b/f.txt\\n--- a/f.txt\\n+++ b/f.txt\\nnewhex=%s\\n\\n' \"$6\"\n",
+    )
+    .unwrap();
     fs::set_permissions(&driver, fs::Permissions::from_mode(0o755)).unwrap();
     assert_cli_success(
         &run_libra_command(
@@ -2166,21 +2171,38 @@ fn test_diff_external_driver_replaces_patch() {
         ),
         "set diff.external",
     );
+    assert_cli_success(
+        &run_libra_command(&["config", "diff.srcPrefix", "OLD/"], p),
+        "set diff.srcPrefix",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "diff.dstPrefix", "NEW/"], p),
+        "set diff.dstPrefix",
+    );
 
     // Patch output is produced by the external driver.
     let out = run_libra_command(&["diff", "f.txt"], p);
     assert_cli_success(&out, "external diff");
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(
-        s.contains("EXTDIFF f.txt newhex=000000"),
-        "external driver output replaces the patch (worktree new-hex is zeros): {s}"
+        s.as_bytes()
+            .starts_with(b"diff --git a/f.txt b/f.txt\n--- a/f.txt\n+++ b/f.txt\n"),
+        "external driver metadata-looking lines must remain byte-for-byte verbatim: {s:?}"
     );
-    assert!(!s.contains("diff --git"), "internal patch suppressed: {s}");
+    assert!(
+        s.contains("newhex=000000"),
+        "worktree hash is all-zero: {s:?}"
+    );
+    assert!(
+        s.ends_with("\n\n"),
+        "external trailing bytes are verbatim: {s:?}"
+    );
+    assert!(!s.contains("OLD/") && !s.contains("NEW/"), "{s:?}");
 
     // `--no-ext-diff` restores the internal patch.
     let internal = run_libra_command(&["diff", "--no-ext-diff", "f.txt"], p);
     assert!(
-        String::from_utf8_lossy(&internal.stdout).contains("diff --git a/f.txt"),
+        String::from_utf8_lossy(&internal.stdout).contains("diff --git OLD/f.txt NEW/f.txt"),
         "--no-ext-diff uses the internal diff"
     );
 

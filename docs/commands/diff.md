@@ -174,6 +174,24 @@ libra diff --output my.patch
 libra --json diff --staged
 ```
 
+## Configuration Defaults
+
+When no future command-line prefix override is present, patch path prefixes honor
+the strict local → global → system cascade. `diff.noPrefix=true` removes both
+prefixes; otherwise `diff.mnemonicPrefix=true` selects `i/`/`w/`, `c/`/`w/`,
+`c/`/`i/`, or `c/`/`c/` for index–worktree, commit–worktree, commit–index, or
+commit–commit comparisons.
+`-R` swaps the selected pair. When neither boolean is enabled,
+`diff.srcPrefix` and `diff.dstPrefix` replace `a/` and `b/` independently; values
+are used verbatim, so include a trailing slash if desired. The precedence is
+`noPrefix` → `mnemonicPrefix` → custom prefixes → `a/`/`b/`. Invalid booleans and
+unreadable local/global config fail before progress/output; unreadable or
+unsupported system scope is skipped under the established config contract.
+Prefix rewriting happens after
+`--relative`, applies to built-in rename/binary and `commit -v` patches, and does
+not alter verbatim external-diff output. Like Git, `commit -v` always uses the
+built-in staged diff and ignores `diff.external`.
+
 ## Human Output
 
 Supported output modes:

@@ -563,6 +563,39 @@ fn verbose_template_includes_diff_but_message_excludes_it() {
         "base commit failed"
     );
     stage_file(&repo, "a.txt", "hello world\n");
+    assert!(
+        run_libra(&["config", "diff.srcPrefix", "COMMIT-OLD/"], &repo)
+            .status
+            .success(),
+        "setting diff.srcPrefix failed"
+    );
+    assert!(
+        run_libra(&["config", "diff.dstPrefix", "COMMIT-NEW/"], &repo)
+            .status
+            .success(),
+        "setting diff.dstPrefix failed"
+    );
+
+    // Git's commit-verbose helper always uses the built-in staged diff. A
+    // configured external driver must neither replace nor reformat the template.
+    let external_diff = temp.path().join("external_diff.sh");
+    fs::write(
+        &external_diff,
+        "#!/bin/sh\nprintf 'EXTDIFF-SENTINEL\\n\\n'\n",
+    )
+    .unwrap();
+    let mut external_perms = fs::metadata(&external_diff).unwrap().permissions();
+    external_perms.set_mode(0o755);
+    fs::set_permissions(&external_diff, external_perms).unwrap();
+    assert!(
+        run_libra(
+            &["config", "diff.external", external_diff.to_str().unwrap()],
+            &repo,
+        )
+        .status
+        .success(),
+        "setting diff.external failed"
+    );
 
     // Editor: capture the template it received, then write the final message.
     let capture = temp.path().join("captured.txt");
@@ -600,6 +633,14 @@ fn verbose_template_includes_diff_but_message_excludes_it() {
         template.contains("hello world"),
         "template must contain the staged diff: {template}"
     );
+    assert!(
+        template.contains("diff --git COMMIT-OLD/a.txt COMMIT-NEW/a.txt"),
+        "verbose staged diff must honor configured prefixes: {template}"
+    );
+    assert!(
+        !template.contains("EXTDIFF-SENTINEL"),
+        "commit -v must ignore diff.external: {template}"
+    );
 
     let msg = last_commit_message(&repo);
     assert!(
@@ -613,6 +654,77 @@ fn verbose_template_includes_diff_but_message_excludes_it() {
     assert!(
         !msg.contains("hello world"),
         "staged diff must not enter the message: {msg}"
+    );
+}
+
+#[test]
+fn verbose_without_editor_propagates_invalid_diff_config_before_commit() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    stage_file(&repo, "base.txt", "base\n");
+    assert!(run_libra(&["commit", "-m", "base"], &repo).status.success());
+    stage_file(&repo, "next.txt", "next\n");
+    assert!(
+        run_libra(&["config", "diff.noPrefix", "sideways"], &repo)
+            .status
+            .success()
+    );
+
+    let out = run_libra(
+        &["commit", "-v", "-m", "must not commit", "--no-gpg-sign"],
+        &repo,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "invalid diff config must abort no-editor commit -v: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    assert!(stderr.contains("diff.noPrefix"), "{stderr}");
+    assert!(
+        last_commit_message(&repo).contains("base"),
+        "HEAD must remain on the base commit"
+    );
+}
+
+#[test]
+fn verbose_without_editor_preserves_diff_config_read_error_before_commit() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    init_repo(&repo);
+    stage_file(&repo, "base.txt", "base\n");
+    assert!(run_libra(&["commit", "-m", "base"], &repo).status.success());
+    stage_file(&repo, "next.txt", "next\n");
+    for (key, value) in [
+        ("diff.context", "3"),
+        ("diff.renames", "true"),
+        ("diff.noPrefix", "false"),
+        ("diff.mnemonicPrefix", "false"),
+    ] {
+        assert!(run_libra(&["config", key, value], &repo).status.success());
+    }
+    fs::create_dir_all(
+        repo.join(".libra-test-home")
+            .join(".libra")
+            .join("config.db"),
+    )
+    .unwrap();
+
+    let out = run_libra(
+        &["commit", "-v", "-m", "must not commit", "--no-gpg-sign"],
+        &repo,
+    );
+    assert_eq!(out.status.code(), Some(128));
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("LBR-IO-001"), "{stderr}");
+    assert!(stderr.contains("diff.srcPrefix"), "{stderr}");
+    assert!(!stderr.contains("LBR-REPO-002"), "{stderr}");
+    assert!(
+        last_commit_message(&repo).contains("base"),
+        "HEAD must remain on the base commit"
     );
 }
 

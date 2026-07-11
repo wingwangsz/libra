@@ -31,7 +31,7 @@ use tempfile::NamedTempFile;
 
 #[cfg(test)]
 use self::options::parse_rename_score;
-use self::options::{ResolvedDiffConfig, resolve_diff_config};
+use self::options::{DiffPrefixes, ResolvedDiffConfig, resolve_diff_config};
 use crate::{
     command::{
         get_target_commit, load_object, read_worktree_blob_bytes,
@@ -557,7 +557,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     validate_diff_algorithm(&args).map_err(CliError::from)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
-    let mut result = run_diff(&args, output, config)
+    let mut result = run_diff(&args, output, &config)
         .await
         .map_err(CliError::from)?;
     // lore.md 2.2: read-only sparse view — scope ONLY the working-tree diff
@@ -574,6 +574,7 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     if !result.external_diff_applied {
         apply_relative_filter(&args, &mut result);
         apply_word_diff(&args, &mut result, output, io::stdout().is_terminal())?;
+        apply_diff_prefixes(&mut result, &config.prefixes);
     }
     render_diff_output(&args, &result, output)
 }
@@ -657,6 +658,85 @@ fn apply_relative_filter(args: &DiffArgs, result: &mut DiffOutput) {
     result.files_changed = result.files.len();
     result.total_insertions = result.files.iter().map(|file| file.insertions).sum();
     result.total_deletions = result.files.iter().map(|file| file.deletions).sum();
+}
+
+fn apply_diff_prefixes(result: &mut DiffOutput, prefixes: &DiffPrefixes) {
+    if prefixes.source == "a/" && prefixes.destination == "b/" {
+        return;
+    }
+    for file in &mut result.files {
+        let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
+        let replacements = [
+            (
+                format!("diff --git a/{old_path} b/{}", file.path),
+                format!(
+                    "diff --git {}{old_path} {}{}",
+                    prefixes.source, prefixes.destination, file.path
+                ),
+            ),
+            (
+                format!("--- a/{old_path}"),
+                format!("--- {}{old_path}", prefixes.source),
+            ),
+            (
+                format!("+++ b/{}", file.path),
+                format!("+++ {}{}", prefixes.destination, file.path),
+            ),
+            (
+                format!("Binary files a/{old_path} and b/{} differ", file.path),
+                format!(
+                    "Binary files {}{old_path} and {}{} differ",
+                    prefixes.source, prefixes.destination, file.path
+                ),
+            ),
+            (
+                format!("Binary files /dev/null and b/{} differ", file.path),
+                format!(
+                    "Binary files /dev/null and {}{} differ",
+                    prefixes.destination, file.path
+                ),
+            ),
+            (
+                format!("Binary files a/{old_path} and /dev/null differ"),
+                format!(
+                    "Binary files {}{old_path} and /dev/null differ",
+                    prefixes.source
+                ),
+            ),
+        ];
+        let mut before_hunk = true;
+        let mut rewritten = String::with_capacity(file.raw_diff.len());
+        for segment in file.raw_diff.split_inclusive('\n') {
+            let (line, ending) = split_diff_line_ending(segment);
+            if line.starts_with("@@") {
+                before_hunk = false;
+            }
+            if before_hunk {
+                rewritten.push_str(&apply_diff_prefixes_to_line(line, &replacements));
+                rewritten.push_str(ending);
+            } else {
+                rewritten.push_str(segment);
+            }
+        }
+        file.raw_diff = rewritten;
+    }
+}
+
+fn split_diff_line_ending(segment: &str) -> (&str, &str) {
+    let Some(without_lf) = segment.strip_suffix('\n') else {
+        return (segment, "");
+    };
+    match without_lf.strip_suffix('\r') {
+        Some(line) => (line, "\r\n"),
+        None => (without_lf, "\n"),
+    }
+}
+
+fn apply_diff_prefixes_to_line(line: &str, replacements: &[(String, String); 6]) -> String {
+    replacements
+        .iter()
+        .find_map(|(from, to)| (line == from).then(|| to.clone()))
+        .unwrap_or_else(|| line.to_string())
 }
 
 /// Word-diff rendering mode (`--word-diff=<MODE>`), excluding `none` (which
@@ -1251,7 +1331,7 @@ fn emit_worktree_scan_progress(args: &DiffArgs, output: &OutputConfig) {
 async fn run_diff(
     args: &DiffArgs,
     output: &OutputConfig,
-    config: ResolvedDiffConfig,
+    config: &ResolvedDiffConfig,
 ) -> Result<DiffOutput, DiffError> {
     util::require_repo().map_err(|_| DiffError::NotInRepo)?;
     tracing::debug!("diff args: {:?}", args);
@@ -4344,7 +4424,9 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         reverse: false,
         text: false,
         binary: false,
-        no_ext_diff: false,
+        // Git's commit-verbose helper always renders the built-in staged diff;
+        // `diff.external` must not replace the editor template or stderr patch.
+        no_ext_diff: true,
         color_moved: None,
         no_color_moved: false,
         find_renames: None,
@@ -4357,7 +4439,8 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         ext_diff: false,
     };
     let config = resolve_diff_config(&args).await?;
-    let result = run_diff(&args, &OutputConfig::default(), config).await?;
+    let mut result = run_diff(&args, &OutputConfig::default(), &config).await?;
+    apply_diff_prefixes(&mut result, &config.prefixes);
     Ok(format_unified_diff(&result))
 }
 
@@ -4703,6 +4786,44 @@ mod test {
         assert!(!inexact_rename_detection_exceeds_limit(1000, 1000));
         assert!(inexact_rename_detection_exceeds_limit(1001, 1));
         assert!(inexact_rename_detection_exceeds_limit(1, 1001));
+    }
+
+    #[test]
+    fn prefix_rewrite_preserves_crlf_hunk_bytes() {
+        let raw_diff = "diff --git a/f.txt b/f.txt\r\nindex 1111111..2222222 100644\r\n--- a/f.txt\r\n+++ b/f.txt\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n";
+        let mut result = DiffOutput {
+            old_ref: "index".to_string(),
+            new_ref: "worktree".to_string(),
+            files: vec![DiffFileStat {
+                path: "f.txt".to_string(),
+                status: "modified".to_string(),
+                insertions: 1,
+                deletions: 1,
+                hunks: Vec::new(),
+                raw_diff: raw_diff.to_string(),
+                rename_from: None,
+                similarity: None,
+                binary: None,
+                check_trailing_blank_start: None,
+            }],
+            total_insertions: 1,
+            total_deletions: 1,
+            files_changed: 1,
+            external_diff_applied: false,
+            binary_patch: false,
+        };
+        apply_diff_prefixes(
+            &mut result,
+            &DiffPrefixes {
+                source: "OLD/".to_string(),
+                destination: "NEW/".to_string(),
+            },
+        );
+
+        assert_eq!(
+            result.files[0].raw_diff,
+            "diff --git OLD/f.txt NEW/f.txt\r\nindex 1111111..2222222 100644\r\n--- OLD/f.txt\r\n+++ NEW/f.txt\r\n@@ -1 +1 @@\r\n-old\r\n+new\r\n"
+        );
     }
 
     struct ColorOverrideReset;
