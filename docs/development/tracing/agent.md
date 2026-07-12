@@ -1127,7 +1127,7 @@ libra 当前 `agent_checkpoint` 表关注 `parent_commit`、`tree_oid`、`metada
 
 验收：
 
-- `libra agent list --json` 每个首批 agent 都有 capability/stability/support_wave 字段，schema 测试固定字段名；非首批 agent 若出现，必须 `supported=false` 且不可 install/launch。
+- `libra agent list --json` 每个首批 agent 都有 capability/stability/support_wave 字段，schema 测试固定字段名；非首批 agent（`gemini`/`cursor`/`copilot`/`factory-ai`）不在该 listing 中出现（仅保留在静态 registry 以保证历史会话可读、doctor 仍可诊断残留 hook），因此列表天然满足「不得标为 `supported=true` 或可 install/launch」。
 - `libra agent add gemini` / `add cursor` / `add copilot` / `add factory-ai` 返回 actionable unsupported，不静默成功；`libra agent add claude-code` 走 Claude hook install，`add codex` / `add opencode` 在各自 HookProvider 落地后走对应安装流程。
 - fake `libra-agent-test` fixture 覆盖 protocol mismatch、capability 未声明、method error、stdout 超限、timeout、PATH conflict。
 - fixture 覆盖 stderr 泄露风险：外部二进制输出疑似 token/email/path 到 stderr 时，默认用户输出和 JSON 错误必须只出现 redacted/truncated 摘要。

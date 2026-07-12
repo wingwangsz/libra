@@ -30,6 +30,8 @@ the 「还未实现的功能」 table of [`../tracing/agent.md`](../tracing/agen
    undeclared capabilities stay fail-closed.
 5. **Non-first-batch supported roster** — `gemini` / `cursor` / `copilot` /
    `factory-ai` stay `supported=false` (unsupported, not hook-installable, not
-   launchable); the first batch is `claude-code` / `codex` / `opencode`. Pinned
-   by `tests/command/agent_roster_test.rs::agent_roster_surface` and
+   launchable) and are omitted from `agent list` entirely; the first batch is
+   `claude-code` / `codex` / `opencode`. The omission is pinned by
+   `tests/command/agent_roster_test.rs::agent_roster_surface`; the unsupported
+   registry classification stays pinned by
    `tests/compat/agent_capability_matrix_pin.rs`.

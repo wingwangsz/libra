@@ -43,7 +43,7 @@ for any other non-roster agent — return an actionable unsupported error.
 | Subcommand | Description |
 |------------|-------------|
 | `status` | Report captured external-agent session status |
-| `list` | List agents with their capability matrix (roster, hooks, install state) |
+| `list` | List the supported agents with their capability matrix (roster, hooks, install state) |
 | `enable` | Enable one or more external agents and install hooks |
 | `add` | Alias of `enable`: `add <name>` ≡ `enable --agent <name>` |
 | `disable` | Disable one or more external agents and uninstall hooks |
@@ -100,12 +100,15 @@ libra --json agent checkpoint list
 libra --json agent rpc list
 ```
 
-`agent list --json` carries a stable `schema_version` plus one row per known
-agent (`slug`, `agent_kind`, `stability`, `supported`, `support_wave`,
-`registered`, `transcript_readable`, `hook_installable`, `installed`,
-`launchable_review`, `launchable_investigate`, `external_binary`,
-`config_paths`, `protected_dirs`, `capabilities`). The row shape is a frozen
-contract for automation.
+`agent list --json` carries a stable `schema_version` plus one row per
+supported agent — the first-batch roster `claude-code`, `codex` and
+`opencode`. Unsupported agents (`gemini`, `cursor`, `copilot`, `factory-ai`)
+stay registered so historical sessions remain readable, but they are omitted
+from the listing. Each row carries `slug`, `agent_kind`, `stability`,
+`supported`, `support_wave`, `registered`, `transcript_readable`,
+`hook_installable`, `installed`, `launchable_review`, `launchable_investigate`,
+`external_binary`, `config_paths`, `protected_dirs`, `capabilities`. The row
+shape is a frozen contract for automation.
 
 `agent session list --json` and `agent checkpoint list --json` return one
 page per call: `data` carries a `schema_version`, the rows under `sessions`
@@ -239,8 +242,9 @@ on them:
 - **The non-first-batch roster is unsupported.** Only `claude-code`, `codex` and
   `opencode` are supported, hook-installable and launchable for
   review/investigate. `gemini` (uninstall-only, see the Description above),
-  `cursor`, `copilot` and `factory-ai` are `supported=false`: `add`/`enable`
-  returns an actionable unsupported error and they are not launchable.
+  `cursor`, `copilot` and `factory-ai` are `supported=false`, are omitted from
+  `agent list`, and `add`/`enable` returns an actionable unsupported error;
+  they are not launchable.
 
 ## Notes
 

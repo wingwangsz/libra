@@ -31,7 +31,7 @@ libra agent rpc <subcommand>
 | 子命令 | 说明 |
 |------------|-------------|
 | `status` | 报告已捕获的外部代理会话状态 |
-| `list` | 列出代理能力矩阵（roster、hook、安装状态） |
+| `list` | 列出受支持代理的能力矩阵（roster、hook、安装状态） |
 | `enable` | 启用一个或多个外部代理并安装 hook |
 | `add` | `enable` 的别名：`add <name>` ≡ `enable --agent <name>` |
 | `disable` | 禁用一个或多个外部代理并卸载 hook |
@@ -85,7 +85,7 @@ libra --json agent checkpoint list
 libra --json agent rpc list
 ```
 
-`agent list --json` 携带稳定的 `schema_version` 与每个已知代理一行（`slug`、`agent_kind`、`stability`、`supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`installed`、`launchable_review`、`launchable_investigate`、`external_binary`、`config_paths`、`protected_dirs`、`capabilities`）。行结构是面向自动化的冻结契约。
+`agent list --json` 携带稳定的 `schema_version`，并为每个受支持代理输出一行——首批 roster `claude-code`、`codex`、`opencode`。非首批代理（`gemini`、`cursor`、`copilot`、`factory-ai`）仍保留在注册表中以保证历史会话可读，但不会出现在该列表里。每行携带 `slug`、`agent_kind`、`stability`、`supported`、`support_wave`、`registered`、`transcript_readable`、`hook_installable`、`installed`、`launchable_review`、`launchable_investigate`、`external_binary`、`config_paths`、`protected_dirs`、`capabilities`。行结构是面向自动化的冻结契约。
 
 `agent session list --json` 与 `agent checkpoint list --json` 每次返回一页：`data` 携带 `schema_version`、位于 `sessions` / `checkpoints` 下的行（单行结构不变），以及 `next_cursor`——传回 `--cursor` 的不透明游标，列表耗尽时为 `null`。页序为最新在前（`started_at` / `created_at` 降序，行 id 作为并列时的次序键）。
 
