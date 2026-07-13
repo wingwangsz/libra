@@ -987,10 +987,15 @@ async fn write_committed_checkpoint(
     let transcript_redacted = match AgentKind::from_db_str(agent_kind) {
         Some(kind) => {
             let adapter = agent_for(kind);
-            let transcript_path = envelope
-                .transcript_path
-                .as_ref()
-                .map(std::path::PathBuf::from);
+            let seam_ctx = crate::internal::ai::observed_agents::AgentSessionCtx {
+                session_id: libra_session_id.to_string(),
+                provider_session_id: envelope.session_id.clone(),
+                working_dir: std::path::PathBuf::from(&envelope.cwd),
+                transcript_path: envelope
+                    .transcript_path
+                    .as_ref()
+                    .map(std::path::PathBuf::from),
+            };
             // DR-04a (ADR-DR-02): resolve the unified `TranscriptSource` seam
             // instead of reading `transcript_path` directly. `File` sources are
             // opened once inside the resolver (after the provider-root security
@@ -999,7 +1004,7 @@ async fn write_committed_checkpoint(
             // DR-04b) carry an `ExportAuthorized` tag the writer binds to this
             // session. A forged path outside the provider root resolves to
             // `None` and falls back to the redacted prompt (fail-closed gate).
-            let raw = match resolve_transcript_source(adapter, transcript_path.as_deref()) {
+            let raw = match resolve_transcript_source(adapter, &seam_ctx) {
                 Ok(Some(TranscriptSource::File { mut file, .. })) => {
                     Some(file.read_bounded(TRANSCRIPT_READ_HARD_CAP_BYTES))
                 }

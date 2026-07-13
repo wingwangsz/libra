@@ -236,8 +236,198 @@ pub fn stable_promoted_spec_for(kind: AgentKind) -> Option<&'static StablePromot
         .find(|spec| spec.kind == kind)
 }
 
+// ---------------------------------------------------------------------------
+// DR-03 — Codex rollout discovery (plan-20260713; GC-DR-08 bounded traversal)
+// ---------------------------------------------------------------------------
+
+/// Directory-entry cap per level and total-file cap for the rollout walk —
+/// hard bounds so a hostile/bloated `$CODEX_HOME` cannot stall a hook or
+/// import (GC-DR-08).
+const ROLLOUT_MAX_ENTRIES_PER_DIR: usize = 4_096;
+const ROLLOUT_MAX_FILES_SCANNED: usize = 10_000;
+
+fn codex_sessions_root() -> Option<std::path::PathBuf> {
+    let home = std::env::var_os("LIBRA_TEST_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::home_dir)?;
+    let codex_home = match std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from) {
+        Some(path) if path.is_absolute() => path,
+        _ => home.join(".codex"),
+    };
+    Some(codex_home.join("sessions"))
+}
+
+/// List a directory's entry names, sorted DESCENDING (newest date-partition
+/// first), bounded by [`ROLLOUT_MAX_ENTRIES_PER_DIR`].
+fn sorted_desc_entries(dir: &std::path::Path) -> Vec<std::ffi::OsString> {
+    let Ok(read) = fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<std::ffi::OsString> = read
+        .take(ROLLOUT_MAX_ENTRIES_PER_DIR)
+        .filter_map(|entry| entry.ok().map(|e| e.file_name()))
+        .collect();
+    names.sort_unstable_by(|a, b| b.cmp(a));
+    names
+}
+
+/// Locate the newest Codex rollout JSONL for `session_id` under
+/// `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl`
+/// (plan-20260713 DR-03, mirroring Entire's `findRolloutBySessionID`).
+///
+/// Bounded (GC-DR-08): fixed depth 3, per-dir and total-file caps, newest
+/// date partitions first, first match wins. Fail-closed on an invalid id or
+/// a symlinked match; `Ok(None)` when nothing is found.
+pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>> {
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 64
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+    if !valid {
+        return Err(anyhow!(
+            "invalid Codex session id (expected alnum/dash/underscore, ≤64 chars)"
+        ));
+    }
+    let Some(root) = codex_sessions_root() else {
+        return Ok(None);
+    };
+    let suffix = format!("-{session_id}.jsonl");
+    let mut files_seen = 0usize;
+    for year in sorted_desc_entries(&root) {
+        let year_dir = root.join(&year);
+        if !year_dir.is_dir() {
+            continue;
+        }
+        for month in sorted_desc_entries(&year_dir) {
+            let month_dir = year_dir.join(&month);
+            if !month_dir.is_dir() {
+                continue;
+            }
+            for day in sorted_desc_entries(&month_dir) {
+                let day_dir = month_dir.join(&day);
+                if !day_dir.is_dir() {
+                    continue;
+                }
+                for name in sorted_desc_entries(&day_dir) {
+                    files_seen += 1;
+                    if files_seen > ROLLOUT_MAX_FILES_SCANNED {
+                        return Ok(None); // bounded: give up, never stall
+                    }
+                    let name_str = name.to_string_lossy();
+                    if name_str.starts_with("rollout-") && name_str.ends_with(&suffix) {
+                        let candidate = day_dir.join(&name);
+                        let meta = fs::symlink_metadata(&candidate)
+                            .context("stat candidate Codex rollout")?;
+                        if meta.file_type().is_symlink() {
+                            return Err(anyhow!("refusing symlinked Codex rollout (fail-closed)"));
+                        }
+                        return Ok(Some(candidate));
+                    }
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
 #[cfg(test)]
 mod tests {
+
+    // -- DR-03: codex_rollout_discovery ------------------------------------
+
+    struct CodexHomeGuard {
+        prior_home: Option<std::ffi::OsString>,
+        prior_codex: Option<std::ffi::OsString>,
+    }
+    impl CodexHomeGuard {
+        fn set(home: &std::path::Path, codex_home: &std::path::Path) -> Self {
+            let prior_home = std::env::var_os("LIBRA_TEST_HOME");
+            let prior_codex = std::env::var_os("CODEX_HOME");
+            // SAFETY: test-only env mutation, restored on drop; #[serial].
+            unsafe {
+                std::env::set_var("LIBRA_TEST_HOME", home);
+                std::env::set_var("CODEX_HOME", codex_home);
+            }
+            Self {
+                prior_home,
+                prior_codex,
+            }
+        }
+    }
+    impl Drop for CodexHomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior_home {
+                    Some(v) => std::env::set_var("LIBRA_TEST_HOME", v),
+                    None => std::env::remove_var("LIBRA_TEST_HOME"),
+                }
+                match &self.prior_codex {
+                    Some(v) => std::env::set_var("CODEX_HOME", v),
+                    None => std::env::remove_var("CODEX_HOME"),
+                }
+            }
+        }
+    }
+
+    /// DR-03: date-partitioned rollout lookup by session id — newest match
+    /// wins, invalid ids and symlinks fail closed, absence is Ok(None), and
+    /// the walk stays bounded.
+    #[test]
+    #[serial_test::serial]
+    fn codex_rollout_discovery() {
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let codex_home = tmp.path().join("codex-home");
+        std::fs::create_dir_all(&home).unwrap();
+        let _g = CodexHomeGuard::set(&home, &codex_home);
+        let sid = "0199a213-81a0-7800-8aa2-58a4a352b423";
+
+        // Absent store → Ok(None).
+        assert!(find_codex_rollout(sid).unwrap().is_none());
+
+        // Two date partitions carry the same session id; the NEWEST wins.
+        let old_day = codex_home.join("sessions/2026/06/30");
+        let new_day = codex_home.join("sessions/2026/07/13");
+        std::fs::create_dir_all(&old_day).unwrap();
+        std::fs::create_dir_all(&new_day).unwrap();
+        let old_file = old_day.join(format!("rollout-2026-06-30T10-00-00-{sid}.jsonl"));
+        let new_file = new_day.join(format!("rollout-2026-07-13T09-30-00-{sid}.jsonl"));
+        std::fs::write(&old_file, "{}\n").unwrap();
+        std::fs::write(&new_file, "{}\n").unwrap();
+        // Unrelated session in the newest partition must not match.
+        std::fs::write(
+            new_day.join("rollout-2026-07-13T08-00-00-ffffffff-0000-0000-0000-000000000000.jsonl"),
+            "{}\n",
+        )
+        .unwrap();
+
+        let found = find_codex_rollout(sid).unwrap().expect("found");
+        assert_eq!(found, new_file, "newest date partition must win");
+
+        // Invalid ids fail closed (no traversal).
+        assert!(find_codex_rollout("").is_err());
+        assert!(find_codex_rollout("../escape").is_err());
+        assert!(find_codex_rollout("id with spaces").is_err());
+
+        // Symlinked rollout fails closed.
+        #[cfg(unix)]
+        {
+            let sid_link = "abcdef00-1111-2222-3333-444444444444";
+            let target = tmp.path().join("outside.jsonl");
+            std::fs::write(&target, "{}\n").unwrap();
+            std::os::unix::fs::symlink(
+                &target,
+                new_day.join(format!("rollout-2026-07-13T12-00-00-{sid_link}.jsonl")),
+            )
+            .unwrap();
+            assert!(
+                find_codex_rollout(sid_link).is_err(),
+                "symlinked rollout must be rejected"
+            );
+        }
+    }
+
     use std::path::PathBuf;
 
     use super::*;

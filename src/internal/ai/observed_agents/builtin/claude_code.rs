@@ -13,7 +13,8 @@
 use std::{
     fs,
     io::{self, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
+    time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result, anyhow};
@@ -23,7 +24,7 @@ use super::super::{
     adapter::{AgentKind, AgentSessionCtx, ObservedAgent, TranscriptTruncator},
     capability::{
         ModelExtractor, PromptExtractor, SkillEvent, SkillEventExtractor, SubagentAwareExtractor,
-        TokenCalculator, TranscriptAnalyzer,
+        TokenCalculator, TranscriptAnalyzer, TranscriptPreparer,
     },
     extract,
 };
@@ -99,6 +100,9 @@ impl ObservedAgent for ClaudeCodeObservedAgent {
 
     // AG-21 transcript intelligence: Claude Code session JSONL supports
     // the full extraction surface (see `observed_agents::extract`).
+    fn as_transcript_preparer(&self) -> Option<&dyn TranscriptPreparer> {
+        Some(self)
+    }
     fn as_transcript_analyzer(&self) -> Option<&dyn TranscriptAnalyzer> {
         Some(self)
     }
@@ -404,8 +408,327 @@ pub fn write_truncated_transcript(
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// DR-01 — transcript flush-wait gate (plan-20260713 ADR-DR-07 / GC-DR-04)
+// ---------------------------------------------------------------------------
+
+/// Default bounded flush-wait budget (GC-DR-04: ≤ 2s, leaving read/redact/
+/// write headroom inside the 10s hook ceiling).
+pub const FLUSH_WAIT_BUDGET: Duration = Duration::from_millis(2_000);
+/// Poll cadence while waiting for the tail to settle.
+const FLUSH_POLL_INTERVAL: Duration = Duration::from_millis(100);
+/// A transcript whose mtime is at least this old is already settled — skip
+/// the wait entirely (the "stale mtime 跳过" rule).
+const FLUSH_STALE_THRESHOLD: Duration = Duration::from_secs(3);
+
+/// Outcome of one flush-wait pass (diagnostic; callers proceed to read
+/// either way — a budget-exhausted tail simply parses `incomplete`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FlushOutcome {
+    /// Tail settled (complete last line + quiescent mtime) or the file was
+    /// already stale/absent — nothing to wait for.
+    Settled,
+    /// Budget ran out while the tail still looked in-flight.
+    BudgetExhausted,
+}
+
+/// Does the file currently end in a complete JSONL record (trailing
+/// newline + parseable last line)?
+fn tail_is_complete(path: &Path) -> bool {
+    let Ok(bytes) = fs::read(path) else {
+        return false;
+    };
+    if bytes.is_empty() {
+        return true; // empty file: nothing in flight
+    }
+    if bytes.last() != Some(&b'\n') {
+        return false;
+    }
+    let Some(last_line) = bytes[..bytes.len() - 1].split(|b| *b == b'\n').next_back() else {
+        return true;
+    };
+    serde_json::from_slice::<serde_json::Value>(last_line).is_ok()
+}
+
+/// Bounded synchronous wait for Claude's async JSONL flush to settle
+/// (plan-20260713 DR-01). Never fails the caller: the outcome is
+/// diagnostic-only, and reads proceed regardless.
+pub fn flush_wait(path: &Path, budget: Duration, poll: Duration) -> FlushOutcome {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return FlushOutcome::Settled; // absent: nothing to wait for
+    };
+    // Stale-mtime short-circuit: a transcript untouched for a while is not
+    // mid-flush; waiting would only burn hook budget.
+    if let Ok(modified) = meta.modified()
+        && modified
+            .elapsed()
+            .map(|age| age >= FLUSH_STALE_THRESHOLD)
+            .unwrap_or(false)
+    {
+        return FlushOutcome::Settled;
+    }
+    let deadline = Instant::now() + budget;
+    loop {
+        if tail_is_complete(path) {
+            return FlushOutcome::Settled;
+        }
+        if Instant::now() >= deadline {
+            return FlushOutcome::BudgetExhausted;
+        }
+        std::thread::sleep(poll.min(deadline.saturating_duration_since(Instant::now())));
+    }
+}
+
+impl TranscriptPreparer for ClaudeCodeObservedAgent {
+    /// DR-01: bounded flush-wait before the seam opens the transcript.
+    /// Always `Ok` — a budget-exhausted tail is read anyway and its final
+    /// turn parses `incomplete` (upgradeable later; ADR-DR-07).
+    fn prepare_transcript(&self, session: &AgentSessionCtx) -> Result<()> {
+        if let Some(path) = session.transcript_path.as_deref() {
+            let outcome = flush_wait(path, FLUSH_WAIT_BUDGET, FLUSH_POLL_INTERVAL);
+            if outcome == FlushOutcome::BudgetExhausted {
+                tracing::warn!(
+                    session_id = %session.session_id,
+                    "transcript flush-wait budget exhausted; reading a possibly \
+                     in-flight tail (final turn will parse incomplete)"
+                );
+            }
+        }
+        Ok(())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DR-02 — independent session discovery (plan-20260713)
+// ---------------------------------------------------------------------------
+
+/// Claude Code's project-directory slug for a working directory: every
+/// character outside `[A-Za-z0-9]` becomes `-` (best-effort pinned to the
+/// current probe version — e.g. `/run/media/eli/data/gitmono/libra` →
+/// `-run-media-eli-data-gitmono-libra`). Upstream changes to this rule are
+/// caught by the pinned vectors in `claude_session_dir_resolve`.
+pub fn claude_project_slug(cwd: &Path) -> String {
+    cwd.to_string_lossy()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect()
+}
+
+fn claude_home() -> Option<PathBuf> {
+    std::env::var_os("LIBRA_TEST_HOME")
+        .map(PathBuf::from)
+        .or_else(dirs::home_dir)
+}
+
+/// `~/.claude/projects/<slug>` for `cwd` (DR-02 `session_dir`).
+pub fn claude_session_dir(cwd: &Path) -> Option<PathBuf> {
+    Some(
+        claude_home()?
+            .join(".claude")
+            .join("projects")
+            .join(claude_project_slug(cwd)),
+    )
+}
+
+/// Locate the on-disk session JSONL for `(cwd, session_id)` without a hook
+/// pointer (DR-02 `resolve_session_file`). Fail-closed: an invalid id, a
+/// symlink, or a path escaping the projects root is an error; an absent
+/// file is `Ok(None)`.
+pub fn resolve_session_file(cwd: &Path, session_id: &str) -> Result<Option<PathBuf>> {
+    let valid = !session_id.is_empty()
+        && session_id.len() <= 64
+        && session_id
+            .chars()
+            .all(|c| c.is_ascii_hexdigit() || c == '-');
+    if !valid {
+        return Err(anyhow!(
+            "invalid Claude session id (expected hex/dash, ≤64 chars)"
+        ));
+    }
+    let Some(dir) = claude_session_dir(cwd) else {
+        return Ok(None);
+    };
+    let candidate = dir.join(format!("{session_id}.jsonl"));
+    let meta = match fs::symlink_metadata(&candidate) {
+        Ok(meta) => meta,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => {
+            return Err(err).context("stat candidate Claude session file");
+        }
+    };
+    if meta.file_type().is_symlink() {
+        return Err(anyhow!(
+            "refusing symlinked Claude session file (fail-closed)"
+        ));
+    }
+    // Containment: the resolved file must stay under the projects root
+    // (defense against slug/`..` surprises; reads still go through the
+    // provider-root seam).
+    let projects_root = claude_home()
+        .map(|home| home.join(".claude").join("projects"))
+        .and_then(|root| root.canonicalize().ok());
+    let canonical = candidate
+        .canonicalize()
+        .context("canonicalize candidate Claude session file")?;
+    match projects_root {
+        Some(root) if canonical.starts_with(&root) => Ok(Some(candidate)),
+        _ => Err(anyhow!(
+            "Claude session file escapes the projects root (fail-closed)"
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+
+    // -- DR-02: claude_session_dir_resolve ---------------------------------
+
+    struct HomeGuard {
+        prior: Option<std::ffi::OsString>,
+    }
+    impl HomeGuard {
+        fn set(path: &Path) -> Self {
+            let prior = std::env::var_os("LIBRA_TEST_HOME");
+            // SAFETY: test-only env mutation, restored on drop; #[serial].
+            unsafe { std::env::set_var("LIBRA_TEST_HOME", path) };
+            Self { prior }
+        }
+    }
+    impl Drop for HomeGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prior {
+                    Some(v) => std::env::set_var("LIBRA_TEST_HOME", v),
+                    None => std::env::remove_var("LIBRA_TEST_HOME"),
+                }
+            }
+        }
+    }
+
+    /// DR-02 pinned slug vectors + session-file resolution semantics.
+    #[test]
+    #[serial_test::serial]
+    fn claude_session_dir_resolve() {
+        // Pinned slug vectors (probe: Claude Code 2.1.207 layout).
+        assert_eq!(
+            claude_project_slug(Path::new("/run/media/eli/data/gitmono/libra")),
+            "-run-media-eli-data-gitmono-libra"
+        );
+        assert_eq!(
+            claude_project_slug(Path::new("/home/user/my.project_x")),
+            "-home-user-my-project-x"
+        );
+        assert_eq!(claude_project_slug(Path::new("/")), "-");
+        assert_eq!(claude_project_slug(Path::new("/a b/中文")), "-a-b---"); // non-ASCII → '-'
+
+        let home = tempfile::tempdir().unwrap();
+        let _g = HomeGuard::set(home.path());
+        let cwd = Path::new("/work/proj");
+        let dir = claude_session_dir(cwd).expect("home resolves");
+        assert!(dir.ends_with(".claude/projects/-work-proj"));
+
+        // Absent file → Ok(None).
+        assert!(
+            resolve_session_file(cwd, "0a12b043-5f5d-40d2-8f46-47b1f4370564")
+                .unwrap()
+                .is_none()
+        );
+
+        // Present file → Ok(Some(path)).
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("0a12b043-5f5d-40d2-8f46-47b1f4370564.jsonl");
+        std::fs::write(&file, "{}\n").unwrap();
+        let found = resolve_session_file(cwd, "0a12b043-5f5d-40d2-8f46-47b1f4370564")
+            .unwrap()
+            .expect("file found");
+        assert_eq!(found, file);
+
+        // Invalid ids fail closed (traversal attempts included).
+        assert!(resolve_session_file(cwd, "").is_err());
+        assert!(resolve_session_file(cwd, "../escape").is_err());
+        assert!(resolve_session_file(cwd, "id with spaces").is_err());
+
+        // Symlinked session file fails closed.
+        #[cfg(unix)]
+        {
+            let target = home.path().join("outside.jsonl");
+            std::fs::write(&target, "{}\n").unwrap();
+            let link = dir.join("abcdef00-0000-0000-0000-000000000001.jsonl");
+            std::os::unix::fs::symlink(&target, &link).unwrap();
+            assert!(
+                resolve_session_file(cwd, "abcdef00-0000-0000-0000-000000000001").is_err(),
+                "symlink must be rejected"
+            );
+        }
+    }
+
+    // -- DR-01: transcript_flush_gate --------------------------------------
+
+    /// DR-01 flush-wait states: absent file, settled tail, stale mtime,
+    /// budget exhaustion on an in-flight tail, and mid-wait completion.
+    /// No real Claude binary involved (GC-DR-07).
+    #[test]
+    fn transcript_flush_gate() {
+        let dir = tempfile::tempdir().unwrap();
+        let budget = Duration::from_millis(300);
+        let poll = Duration::from_millis(20);
+
+        // Absent file: settled immediately.
+        assert_eq!(
+            flush_wait(&dir.path().join("nope.jsonl"), budget, poll),
+            FlushOutcome::Settled
+        );
+
+        // Complete tail: settled immediately.
+        let complete = dir.path().join("complete.jsonl");
+        std::fs::write(&complete, "{\"type\":\"user\"}\n").unwrap();
+        assert_eq!(flush_wait(&complete, budget, poll), FlushOutcome::Settled);
+
+        // In-flight tail (no trailing newline): budget exhausts, bounded.
+        let inflight = dir.path().join("inflight.jsonl");
+        std::fs::write(&inflight, "{\"type\":\"assistant\",\"partial").unwrap();
+        let started = Instant::now();
+        assert_eq!(
+            flush_wait(&inflight, budget, poll),
+            FlushOutcome::BudgetExhausted
+        );
+        assert!(
+            started.elapsed() < budget + Duration::from_millis(500),
+            "wait must stay bounded"
+        );
+
+        // Tail completing mid-wait: settles before the budget.
+        let settling = dir.path().join("settling.jsonl");
+        std::fs::write(&settling, "{\"type\":\"assistant\",\"partial").unwrap();
+        let writer = {
+            let settling = settling.clone();
+            std::thread::spawn(move || {
+                std::thread::sleep(Duration::from_millis(60));
+                let mut f = fs::OpenOptions::new().append(true).open(&settling).unwrap();
+                f.write_all(b"\":true}\n").unwrap();
+            })
+        };
+        assert_eq!(
+            flush_wait(&settling, Duration::from_millis(2_000), poll),
+            FlushOutcome::Settled
+        );
+        writer.join().unwrap();
+
+        // Stale mtime short-circuits even with an incomplete tail.
+        let stale = dir.path().join("stale.jsonl");
+        std::fs::write(&stale, "{\"type\":\"assistant\",\"partial").unwrap();
+        let old = std::time::SystemTime::now() - Duration::from_secs(30);
+        let file = fs::OpenOptions::new().write(true).open(&stale).unwrap();
+        file.set_modified(old).unwrap();
+        drop(file);
+        let started = Instant::now();
+        assert_eq!(flush_wait(&stale, budget, poll), FlushOutcome::Settled);
+        assert!(
+            started.elapsed() < Duration::from_millis(100),
+            "stale file must not wait"
+        );
+    }
+
     use super::*;
 
     #[test]
