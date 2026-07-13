@@ -82,7 +82,8 @@ pub enum MergeStrategy {
 }
 
 /// Conflict-side preference accepted by the default three-way strategy.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
 pub enum MergeFavor {
     /// Resolve only conflicting paths/hunks in favor of the current HEAD side.
     Ours,
@@ -2262,7 +2263,8 @@ fn try_merge_blob_contents(
         match merge_options.merge_bytes(&base_blob.data, &ours_blob.data, &theirs_blob.data) {
             Ok(merged) => merged,
             Err(conflicted) => match favor {
-                Some(favor) => resolve_favored_content(conflicted, marker_len, favor)?,
+                Some(favor) => resolve_favored_content(conflicted, marker_len, favor)
+                    .map_err(PullMergeError::TreeCreate)?,
                 None => return Ok(None),
             },
         };
@@ -2295,7 +2297,7 @@ fn resolve_favored_content(
     conflicted: Vec<u8>,
     marker_len: usize,
     favor: MergeFavor,
-) -> Result<Vec<u8>, PullMergeError> {
+) -> Result<Vec<u8>, String> {
     let marker = |byte: u8, label: Option<&[u8]>| {
         let mut line = vec![byte; marker_len];
         if let Some(label) = label {
@@ -2319,11 +2321,7 @@ fn resolve_favored_content(
             })
             .map(|relative| start + relative)
     };
-    let malformed = || {
-        PullMergeError::TreeCreate(
-            "internal three-way merge produced malformed conflict markers".to_string(),
-        )
-    };
+    let malformed = || "internal three-way merge produced malformed conflict markers".to_string();
 
     let mut output = Vec::with_capacity(conflicted.len());
     let mut cursor = 0usize;
@@ -2350,6 +2348,27 @@ fn resolve_favored_content(
     }
     output.extend_from_slice(&conflicted[cursor..]);
     Ok(output)
+}
+
+/// Merge three blob payloads and resolve only overlapping regions in favor of
+/// the requested side. Cleanly merged ranges are preserved. Cherry-pick and
+/// revert share this with merge so `-X ours`/`-X theirs` have identical hunk
+/// semantics across all non-interactive history controls.
+pub(crate) fn merge_bytes_with_favor(
+    base: &[u8],
+    ours: &[u8],
+    theirs: &[u8],
+    favor: MergeFavor,
+) -> Result<Vec<u8>, String> {
+    let marker_len = unambiguous_conflict_marker_length(&[base, ours, theirs]);
+    let mut merge_options = diffy::MergeOptions::new();
+    merge_options
+        .set_conflict_style(diffy::ConflictStyle::Diff3)
+        .set_conflict_marker_length(marker_len);
+    match merge_options.merge_bytes(base, ours, theirs) {
+        Ok(merged) => Ok(merged),
+        Err(conflicted) => resolve_favored_content(conflicted, marker_len, favor),
+    }
 }
 
 fn unambiguous_conflict_marker_length(sides: &[&[u8]]) -> usize {

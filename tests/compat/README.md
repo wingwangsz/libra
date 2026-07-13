@@ -77,7 +77,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `config_defaults_edge_cases_test.rs` | P1-05a (plan-20260708) | 加密 local/global 默认值先解密、不可读/不支持 system scope 跳过、Git 转换报告源 `HEAD` 分支，以及配置默认值边界回归 |
 | `config_history_defaults_test.rs` | P1-05b (plan-20260708) | 历史相关默认值：`merge.ff`、`merge.log`、`merge.verifySignatures`、`commit.gpgSign` 与 CLI override 优先级 |
 | `fetch_remote_refspec_test.rs` | P1-06 (plan-20260708) | 显式/配置 fetch refspec 精确映射、FETCH_HEAD/remote HEAD 元数据、`remotes.default`、多 ref 事务回滚、remote rename tracking namespace 迁移与 `ls-remote --symref` |
-| `noninteractive_history_controls_test.rs` | P1-07a/P1-07b (plan-20260708) | rebase `--autostash`/sandbox `--exec`/atomic `--update-refs`/reflog `--fork-point`；merge `-s ours` 双父+当前 tree、`-X ours/theirs` 仅偏向冲突 hunk、无关历史 clean/conflict/restart/continue，以及 `--log` custom-message 持久化与负向 toggle last-wins |
+| `noninteractive_history_controls_test.rs` | P1-07a/P1-07b/P1-07c (plan-20260708) | rebase 非交互 controls；merge `-s ours`、hunk-level `-X`、无关历史与 `--log`；cherry-pick/revert last-wins hunk-level `-X`、revert cleanup conflict→continue 与 corrupt-index fail-closed，以及 reset merge/keep staged/unstaged 保留或拒绝、untracked collision、file/directory 转换、symlink ancestor no-follow 和原子回滚（Unix 33 E2E） |
 
 ## Authoring guidelines
 

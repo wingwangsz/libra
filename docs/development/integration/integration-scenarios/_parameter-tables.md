@@ -81,7 +81,8 @@
 | `reset --soft` | `cli.restore-reset-diff` | 只移动 HEAD，保留 index/工作区 |
 | `reset --mixed` | `cli.restore-reset-diff` | 移动 HEAD 并重置 index |
 | `reset --hard` | `cli.restore-reset-diff` | HEAD、index、工作区全部回到目标 revision |
-| `reset --pathspec-from-file` / `--keep` / `--merge` | `cli.restore-reset-diff` | 当前未实现，runner 负向断言稳定错误 |
+| `reset --pathspec-from-file` | `cli.restore-reset-diff` | 已实现；负向步骤因 pathspec 文件缺失而失败（非「未实现」） |
+| `reset --merge` / `--keep` | `cli.restore-reset-diff`, `compat_noninteractive_history_controls` | runner 验证公开正向入口；Cargo compat 精确固定安全本地变更保留、受影响路径覆盖拒绝、HEAD/index/worktree 原子不变 |
 
 
 
@@ -134,7 +135,10 @@
 | `rebase --update-refs` / `--no-update-refs` | `compat_noninteractive_history_controls` | captured-tip 原子移动、linked-worktree checkout 排除、skip/start-empty rewrite 映射 |
 | `rebase --fork-point` / `--no-fork-point` | `compat_noninteractive_history_controls` | force-moved upstream reflog 只 replay topic commit，parent 链落到新 upstream |
 | `cherry-pick <commit>` / `cherry-pick -x <commit>` | `cli.merge-rebase-cherry-revert-smoke` | 指定提交修改被重放到当前分支；默认消息不追加来源行，`-x` 追加来源提交行 |
+| repeatable `cherry-pick -X ours/theirs` | `compat_noninteractive_history_controls` | last-wins，仅选择冲突 hunk，clean hunk 与 parent 链固定 |
 | `revert <commit>` / `A..B`, `revert --continue` / `--abort` | `cli.merge-rebase-cherry-revert-smoke` | 单提交反向提交覆盖；范围回滚和空会话控制为负向断言 |
+| repeatable `revert -X ours/theirs` | `compat_noninteractive_history_controls` | last-wins，仅选择冲突 hunk，clean hunk 与 parent 链固定 |
+| `revert --cleanup=<mode>` | `compat_noninteractive_history_controls` | cleanup 选择跨 conflict→continue 持久化，scissors 后的内容不进入最终提交消息 |
 | `grep` / `grep -F/-i/-n/-c/-l/-L/-e/-f/--tree/--cached` | `cli.grep-blame-describe-shortlog` | 工作区、index、pathspec、pattern file 和历史 tree 搜索可观察 |
 | `grep -z` / `grep --untracked` / grep 0/1/2 exit codes | `cli.grep-blame-describe-shortlog` | 已实现；runner 正向断言 NUL 路径输出、未跟踪文件搜索，并负向断言无匹配退出 1、命令错误退出 2 |
 | `blame` / `blame -L` / `blame <file> <commit>` / `blame --porcelain` | `cli.grep-blame-describe-shortlog` | 行级作者、提交、范围限制和 porcelain 头部可观察 |
