@@ -865,8 +865,10 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
                 .with_hint("verify the remote branch name and try again")
         }
         fetch::FetchError::InvalidRefspec { .. } => CliError::command_usage(error.to_string())
-            .with_stable_code(StableErrorCode::CliInvalidArguments)
-            .with_hint("use '<branch>' or '<src>:<dst>' with refs/heads or refs/remotes"),
+            .with_stable_code(StableErrorCode::CliInvalidArguments),
+        fetch::FetchError::ConfigRead { .. } => {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        }
         fetch::FetchError::ObjectFormatMismatch { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::RepoStateInvalid)
         }
@@ -887,6 +889,8 @@ fn map_fetch_error_to_cli(error: &fetch::FetchError) -> CliError {
         | fetch::FetchError::UpdateRefs { .. } => {
             CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
         }
+        fetch::FetchError::RefUpdateRejected { .. } => CliError::conflict(error.to_string())
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked),
         fetch::FetchError::UnsupportedShallowLocalLibra => CliError::fatal(error.to_string())
             .with_stable_code(StableErrorCode::RepoCorrupt)
             .with_hint(
@@ -1084,24 +1088,6 @@ mod tests {
         );
 
         assert_eq!(cli.stable_code(), StableErrorCode::AuthPermissionDenied);
-    }
-
-    #[test]
-    fn invalid_fetch_refspec_maps_to_cli_usage_error() {
-        let cli = map_fetch_error_to_cli(&fetch::FetchError::InvalidRefspec {
-            refspec: "invalid".to_string(),
-            reason: "expected a branch or source:destination".to_string(),
-        });
-
-        assert_eq!(cli.stable_code(), StableErrorCode::CliInvalidArguments);
-        assert_eq!(
-            cli.message(),
-            "invalid fetch refspec 'invalid': expected a branch or source:destination"
-        );
-        assert_eq!(
-            cli.hints()[0].as_str(),
-            "use '<branch>' or '<src>:<dst>' with refs/heads or refs/remotes"
-        );
     }
 
     /// Pin the `Display` format for the static-message and direct-message

@@ -6,9 +6,12 @@
 //! contract (see `docs/development/tracing/agent.md` AG-17): key set changes
 //! require a schema bump and a compat-test update in the same PR.
 //!
-//! Per E9, non-first-batch agents are listed (they stay `registered` so
-//! historical data remains discoverable) but must never surface as
-//! `supported`, `hook_installable`, `installed` or `launchable_*`.
+//! The listing surfaces only the supported roster (`claude-code` / `codex` /
+//! `opencode`). Per E9 the non-first-batch agents (`gemini` / `cursor` /
+//! `copilot` / `factory-ai`) stay `registered` in the static registry so
+//! historical `agent_session` data remains readable and doctor can still
+//! reason about residual hooks — but they are intentionally omitted from this
+//! listing rather than shown as unsupported rows.
 
 use clap::Args;
 use serde::Serialize;
@@ -66,6 +69,13 @@ pub async fn execute_safe(_args: ListArgs, output: &OutputConfig) -> CliResult<(
     let mut agents = Vec::with_capacity(AgentKind::all().len());
     for kind in AgentKind::all() {
         let row = registration_for(*kind);
+        // Only the supported roster (claude-code / codex / opencode) is
+        // surfaced. Unsupported agents stay in the static registry so
+        // historical sessions remain readable and doctor can still reason
+        // about residual hooks, but they are omitted from this listing.
+        if !row.supported {
+            continue;
+        }
         let adapter = agent_for(*kind);
         // Runtime install state is only meaningful (and per E9 only
         // allowed) for supported, hook-installable agents; everything
