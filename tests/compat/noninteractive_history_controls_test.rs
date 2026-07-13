@@ -13,6 +13,7 @@ struct CliFixture {
     _temp: TempDir,
     root: PathBuf,
     home: PathBuf,
+    #[cfg(target_os = "linux")]
     sandbox_helper: PathBuf,
 }
 
@@ -22,26 +23,28 @@ impl CliFixture {
         let root = temp.path().to_path_buf();
         let home = root.join("home");
         fs::create_dir_all(&home).expect("create isolated home");
-        let sandbox_helper = root.join("test-linux-sandbox");
-        fs::write(
-            &sandbox_helper,
-            "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 125\n",
-        )
-        .expect("write test sandbox helper");
-        #[cfg(unix)]
-        {
+        #[cfg(target_os = "linux")]
+        let sandbox_helper = {
             use std::os::unix::fs::PermissionsExt;
+            let sandbox_helper = root.join("test-linux-sandbox");
+            fs::write(
+                &sandbox_helper,
+                "#!/bin/sh\nwhile [ \"$#\" -gt 0 ]; do\n  if [ \"$1\" = \"--\" ]; then\n    shift\n    exec \"$@\"\n  fi\n  shift\ndone\nexit 125\n",
+            )
+            .expect("write test sandbox helper");
             let mut permissions = fs::metadata(&sandbox_helper)
                 .expect("stat test sandbox helper")
                 .permissions();
             permissions.set_mode(0o755);
             fs::set_permissions(&sandbox_helper, permissions)
                 .expect("make test sandbox helper executable");
-        }
+            sandbox_helper
+        };
         Self {
             _temp: temp,
             root,
             home,
+            #[cfg(target_os = "linux")]
             sandbox_helper,
         }
     }
