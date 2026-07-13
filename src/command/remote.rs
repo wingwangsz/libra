@@ -8,7 +8,10 @@ use std::{
 
 use clap::Subcommand;
 use git_internal::hash::get_hash_kind;
-use sea_orm::{ColumnTrait, DbErr, EntityTrait, QueryFilter, TransactionTrait};
+use sea_orm::{
+    ActiveModelTrait, ActiveValue::Set, ColumnTrait, DbErr, EntityTrait, QueryFilter,
+    TransactionTrait,
+};
 use serde::Serialize;
 
 use crate::{
@@ -18,7 +21,7 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
-        model::reference,
+        model::{reference, reflog},
         protocol::{DiscRef, set_wire_hash_kind},
     },
     utils::{
@@ -66,8 +69,8 @@ impl std::fmt::Display for SetUrlMode {
 /// `--help` examples shown in `libra remote --help` output (attached
 /// in `src/cli.rs` via `after_help` on the `Remote` subcommand).
 ///
-/// `remote` exposes eight sub-commands (`add` / `remove` / `rename`
-/// / `-v` / `show` / `get-url` / `set-url` / `prune`); the banner pins
+/// `remote` exposes configuration, inspection, update, and ref-management
+/// subcommands; the banner pins
 /// the most common invocation per sub-command (where it carries enough
 /// signal beyond the sub-command name) plus a JSON variant so users can
 /// map intent to invocation without reading the design doc. Cross-cutting
@@ -79,6 +82,10 @@ EXAMPLES:
                                                    Register a new remote
     libra remote add -f origin git@example.com:org/repo.git
                                                    Register a remote and fetch from it
+    libra remote add -t main --tags origin git@example.com:org/repo.git
+                                                   Track only main and fetch all tags
+    libra remote add --mirror backup git@example.com:org/repo.git
+                                                   Register a mirror remote (writes remote.<name>.mirror=true)
     libra remote rename origin upstream            Rename an existing remote
     libra remote remove upstream                   Drop a remote and its tracking refs
     libra remote get-url --all origin              Print every URL configured for origin
@@ -86,6 +93,7 @@ EXAMPLES:
                                                    Replace the push URL only
     libra remote prune --dry-run origin            Preview which tracking refs would be removed
     libra remote update                            Fetch all configured remotes (or named ones)
+    libra remote update -p                         Fetch all remotes, then prune stale tracking refs
     libra remote set-branches origin main          Track only the named branch(es)
     libra remote set-head origin main              Point the remote's default branch at main
     libra remote set-head origin --auto            Query the remote and set HEAD automatically
@@ -104,6 +112,27 @@ pub enum RemoteCmds {
         /// Immediately fetch from the new remote after adding it.
         #[clap(short = 'f', long = "fetch")]
         fetch: bool,
+        /// Track only the given branch(es): write a specific
+        /// `remote.<name>.fetch` refspec per branch instead of the default
+        /// wildcard. Repeatable.
+        #[clap(short = 't', long = "track", value_name = "BRANCH")]
+        track: Vec<String>,
+        /// Point the remote's HEAD at <BRANCH> (`refs/remotes/<name>/HEAD`).
+        #[clap(short = 'm', long = "master", value_name = "BRANCH")]
+        master: Option<String>,
+        /// Configure `remote.<name>.tagOpt = --tags` (fetch all tags).
+        #[clap(long = "tags", conflicts_with = "no_tags")]
+        tags: bool,
+        /// Configure `remote.<name>.tagOpt = --no-tags` (fetch no tags).
+        #[clap(long = "no-tags")]
+        no_tags: bool,
+        /// Mark the remote as a mirror: write the `remote.<name>.mirror=true`
+        /// marker (like Git's `remote add --mirror=fetch`). Incompatible with
+        /// `-t`/`--track`. NARROWING vs Git: the marker is informational —
+        /// Libra does not write a `+refs/*:refs/*` refspec because `libra fetch`
+        /// is not yet mirror-aware (matching `libra clone --mirror`).
+        #[clap(long = "mirror", conflicts_with = "track")]
+        mirror: bool,
     },
     /// Remove a remote
     Remove {
@@ -187,6 +216,10 @@ pub enum RemoteCmds {
         /// Remotes or remote groups to update (default: all remotes).
         #[arg(value_name = "GROUP")]
         groups: Vec<String>,
+        /// After fetching, prune remote-tracking branches that no longer exist
+        /// on the remote (Git's `remote update -p`).
+        #[arg(short = 'p', long = "prune")]
+        prune: bool,
     },
     /// Set the branches tracked by a remote (rewrites `remote.<name>.fetch`).
     ///
@@ -423,6 +456,12 @@ pub enum RemoteOutput {
     },
     Update {
         remotes: Vec<String>,
+        /// Stale remote-tracking branches pruned by `update -p`. Serialized
+        /// only when non-empty so a plain `remote update` (no `-p`) keeps its
+        /// original `{action, remotes}` JSON shape; `#[serde(default)]` keeps
+        /// deserialization of the old shape working.
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        pruned: Vec<RemotePruneEntry>,
     },
     Show {
         name: String,
@@ -477,6 +516,17 @@ fn validate_remote_usage(command: &RemoteCmds) -> CliResult<()> {
         } => {
             validate_tracking_branch_name(branch)?;
         }
+        // `remote add -t <branch>` / `-m <branch>` interpolate the branch name
+        // into a fetch refspec / the remote-HEAD ref, so they are validated with
+        // the same rules as set-branches/set-head before anything is persisted.
+        RemoteCmds::Add { track, master, .. } => {
+            for branch in track {
+                validate_tracking_branch_name(branch)?;
+            }
+            if let Some(branch) = master {
+                validate_tracking_branch_name(branch)?;
+            }
+        }
         _ => {}
     }
     Ok(())
@@ -507,7 +557,31 @@ async fn run_remote(
     output: &OutputConfig,
 ) -> Result<RemoteOutput, RemoteError> {
     match command {
-        RemoteCmds::Add { name, url, fetch } => run_add_remote(name, url, fetch, output).await,
+        RemoteCmds::Add {
+            name,
+            url,
+            fetch,
+            track,
+            master,
+            tags,
+            no_tags,
+            mirror,
+        } => {
+            run_add_remote(
+                AddRemoteArgs {
+                    name,
+                    url,
+                    fetch,
+                    track,
+                    master,
+                    tags,
+                    no_tags,
+                    mirror,
+                },
+                output,
+            )
+            .await
+        }
         RemoteCmds::Remove { name } => run_remove_remote(name).await,
         RemoteCmds::Rename { old, new } => run_rename_remote(old, new).await,
         RemoteCmds::List => run_list_remotes(true).await,
@@ -529,7 +603,7 @@ async fn run_remote(
             value,
         } => run_set_url(name, value, push, add, delete, all).await,
         RemoteCmds::Prune { name, dry_run } => run_prune_remote(name, dry_run).await,
-        RemoteCmds::Update { groups } => run_remote_update(groups, output).await,
+        RemoteCmds::Update { groups, prune } => run_remote_update(groups, prune, output).await,
         RemoteCmds::SetBranches {
             add,
             name,
@@ -544,21 +618,94 @@ async fn run_remote(
     }
 }
 
-async fn run_add_remote(
+/// Arguments for `remote add`, including its cold-configuration flags.
+struct AddRemoteArgs {
     name: String,
     url: String,
     fetch: bool,
+    track: Vec<String>,
+    master: Option<String>,
+    tags: bool,
+    no_tags: bool,
+    mirror: bool,
+}
+
+async fn run_add_remote(
+    args: AddRemoteArgs,
     output: &OutputConfig,
 ) -> Result<RemoteOutput, RemoteError> {
+    let AddRemoteArgs {
+        name,
+        url,
+        fetch,
+        track,
+        master,
+        tags,
+        no_tags,
+        mirror,
+    } = args;
+
     if remote_exists(&name).await? {
         return Err(RemoteError::AlreadyExists { name });
     }
 
+    let write_err = |error: anyhow::Error| RemoteError::ConfigWrite {
+        detail: error.to_string(),
+    };
+
     ConfigKv::set(&format!("remote.{name}.url"), &url, false)
         .await
-        .map_err(|error| RemoteError::ConfigWrite {
-            detail: error.to_string(),
+        .map_err(write_err)?;
+
+    // `--mirror`: record the informational `remote.<name>.mirror=true` marker
+    // (matching Git's `remote add --mirror=fetch` and `libra clone --mirror`).
+    // We deliberately do NOT write a `+refs/*:refs/*` fetch refspec: Libra's
+    // fetch is not yet mirror-aware, so the marker is informational only.
+    if mirror {
+        ConfigKv::set(&format!("remote.{name}.mirror"), "true", false)
+            .await
+            .map_err(write_err)?;
+    }
+
+    // `-t <branch>`: track only the named branch(es) by writing a specific fetch
+    // refspec per branch instead of the default wildcard (same format as
+    // `remote set-branches`).
+    for branch in &track {
+        let spec = format!("+refs/heads/{branch}:refs/remotes/{name}/{branch}");
+        ConfigKv::add(&format!("remote.{name}.fetch"), &spec, false)
+            .await
+            .map_err(write_err)?;
+    }
+
+    // `--tags`/`--no-tags`: record the tag-fetch preference as `remote.<name>.tagOpt`
+    // — the exact key `libra fetch`/`clone` read (config keys are case-sensitive).
+    if tags || no_tags {
+        let tagopt = if tags { "--tags" } else { "--no-tags" };
+        ConfigKv::set(&format!("remote.{name}.tagOpt"), tagopt, false)
+            .await
+            .map_err(write_err)?;
+    }
+
+    // `-m <branch>`: point the remote's HEAD at the given branch. Unlike
+    // `remote set-head`, this is written unconditionally at add time (the
+    // tracking ref does not exist yet, matching Git's `remote add -m`).
+    if let Some(branch) = &master {
+        let db = get_db_conn_instance().await;
+        let txn_name = name.clone();
+        let txn_branch = branch.clone();
+        db.transaction::<_, (), DbErr>(move |txn| {
+            Box::pin(async move {
+                Head::update_result_with_conn(txn, Head::Branch(txn_branch), Some(&txn_name))
+                    .await
+                    .map_err(|e| DbErr::Custom(e.to_string()))?;
+                Ok(())
+            })
+        })
+        .await
+        .map_err(|e| RemoteError::ConfigWrite {
+            detail: e.to_string(),
         })?;
+    }
 
     // `-f`/`--fetch`: pull from the new remote right after registering it. The
     // remote stays registered even if the fetch fails.
@@ -588,8 +735,59 @@ async fn run_rename_remote(old: String, new: String) -> Result<RemoteOutput, Rem
         return Err(RemoteError::SshKeyNamespaceExists { name: new });
     }
 
+    let db = get_db_conn_instance().await;
+    let old_for_txn = old.clone();
+    let new_for_txn = new.clone();
     let new_for_error = new.clone();
-    ConfigKv::rename_remote(&old, &new).await.map_err(|error| {
+    db.transaction::<_, (), anyhow::Error>(move |txn| {
+        Box::pin(async move {
+            let target_rows = reference::Entity::find()
+                .filter(reference::Column::Remote.eq(&new_for_txn))
+                .all(txn)
+                .await?;
+            if !target_rows.is_empty() {
+                return Err(anyhow::anyhow!(
+                    "tracking reference namespace for remote '{}' already exists",
+                    new_for_txn
+                ));
+            }
+
+            ConfigKv::rename_remote_with_conn(txn, &old_for_txn, &new_for_txn).await?;
+
+            let old_tracking_prefix = format!("refs/remotes/{old_for_txn}/");
+            let new_tracking_prefix = format!("refs/remotes/{new_for_txn}/");
+            let rows = reference::Entity::find()
+                .filter(reference::Column::Remote.eq(&old_for_txn))
+                .all(txn)
+                .await?;
+            for row in rows {
+                let mut active: reference::ActiveModel = row.into();
+                active.remote = Set(Some(new_for_txn.clone()));
+                if let Some(name) = active.name.as_ref()
+                    && let Some(suffix) = name.strip_prefix(&old_tracking_prefix)
+                {
+                    active.name = Set(Some(format!("{new_tracking_prefix}{suffix}")));
+                }
+                active.update(txn).await?;
+            }
+
+            let reflog_rows = reflog::Entity::find()
+                .filter(reflog::Column::RefName.starts_with(&old_tracking_prefix))
+                .all(txn)
+                .await?;
+            for row in reflog_rows {
+                let new_ref_name =
+                    row.ref_name
+                        .replacen(&old_tracking_prefix, &new_tracking_prefix, 1);
+                let mut active: reflog::ActiveModel = row.into();
+                active.ref_name = Set(new_ref_name);
+                active.update(txn).await?;
+            }
+            Ok(())
+        })
+    })
+    .await
+    .map_err(|error| {
         let detail = error.to_string();
         if detail.contains("SSH key namespace for remote") {
             RemoteError::SshKeyNamespaceExists {
@@ -762,14 +960,34 @@ async fn run_set_url(
     })
 }
 
-/// Resolve the set of remotes for `remote update`: with no arguments, every
-/// configured remote (in config order); otherwise each argument is either a
+/// Resolve the set of remotes for `remote update`: with no arguments, use
+/// `remotes.default` when non-empty and otherwise every configured remote;
+/// each explicit argument is either a
 /// `remotes.<group>` config (expanded to its space-separated members) or a
 /// single remote name. The result preserves first-seen order and de-duplicates.
 async fn resolve_update_remotes(groups: Vec<String>) -> Result<Vec<String>, RemoteError> {
-    if groups.is_empty() {
-        return list_remote_names().await;
-    }
+    let groups = if groups.is_empty() {
+        let defaults = ConfigKv::get_all("remotes.default")
+            .await
+            .map_err(|error| RemoteError::ConfigRead {
+                detail: error.to_string(),
+            })?;
+        let mut default_entries = Vec::new();
+        let mut seen = HashSet::new();
+        for entry in defaults {
+            for name in entry.value.split_whitespace().map(String::from) {
+                if seen.insert(name.clone()) {
+                    default_entries.push(name);
+                }
+            }
+        }
+        if default_entries.is_empty() {
+            return list_remote_names().await;
+        }
+        default_entries
+    } else {
+        groups
+    };
     let mut resolved = Vec::new();
     let mut seen = HashSet::new();
     for entry in groups {
@@ -791,20 +1009,48 @@ async fn resolve_update_remotes(groups: Vec<String>) -> Result<Vec<String>, Remo
     Ok(resolved)
 }
 
-/// `remote update [<group>|<remote>...]`: fetch from each resolved remote. An
-/// unknown remote name is an error; a fetch failure aborts the run.
+/// `remote update [-p|--prune] [<group>|<remote>...]`: fetch from each resolved
+/// remote, then optionally prune. An unknown remote name is an error; a fetch
+/// failure aborts the run before any pruning happens.
 async fn run_remote_update(
     groups: Vec<String>,
+    prune: bool,
     output: &OutputConfig,
 ) -> Result<RemoteOutput, RemoteError> {
     let remotes = resolve_update_remotes(groups).await?;
-    let mut updated = Vec::new();
-    for name in remotes {
-        ensure_remote_exists(&name).await?;
-        fetch_remote_by_name(&name, output).await?;
-        updated.push(name);
+    // Validate the full batch before the first remote is contacted. A typo in
+    // remotes.default or an invalid remote.<name>.fetch refspec must not leave
+    // an earlier remote updated behind a deterministic configuration error.
+    for name in &remotes {
+        ensure_remote_exists(name).await?;
+        fetch::validate_configured_fetch_refspecs(name).await?;
     }
-    Ok(RemoteOutput::Update { remotes: updated })
+    // First pass: fetch every resolved remote. A fetch failure aborts the run
+    // HERE, before any tracking ref is deleted, so `-p` can never delete refs
+    // for an early remote and then strand that destructive side effect behind
+    // an error raised while fetching a later remote.
+    let mut updated = Vec::new();
+    for name in &remotes {
+        fetch_remote_by_name(name, output).await?;
+        updated.push(name.clone());
+    }
+    // Second pass: `-p`/`--prune` drops local remote-tracking branches that no
+    // longer exist on the remote (reuses `run_prune_remote`). Reached only once
+    // every fetch above succeeded.
+    let mut pruned = Vec::new();
+    if prune {
+        for name in &updated {
+            if let RemoteOutput::Prune { stale_branches, .. } =
+                run_prune_remote(name.clone(), false).await?
+            {
+                pruned.extend(stale_branches);
+            }
+        }
+    }
+    Ok(RemoteOutput::Update {
+        remotes: updated,
+        pruned,
+    })
 }
 
 /// Fetch from a configured remote by name. Shared by `remote update` and
@@ -820,6 +1066,60 @@ async fn fetch_remote_by_name(name: &str, output: &OutputConfig) -> Result<(), R
         })?;
     fetch::fetch_repository_safe(remote_config, None, false, None, None, output).await?;
     Ok(())
+}
+
+/// Build the set of branch names a remote currently advertises, normalised into
+/// the local remote-tracking display form used by [`classify_stale_tracking_branches`]:
+/// `<branch>` for `refs/heads/<branch>` and `mr/<x>` for `refs/mr/<x>`. Peeled
+/// (`^{}`) and tag refs are ignored — they are not tracked under
+/// `refs/remotes/<name>/*`. Shared by `remote prune` and `fetch --prune` so both
+/// derive the live-branch set identically.
+pub(crate) fn remote_advertised_branch_names(refs: &[DiscRef]) -> HashSet<String> {
+    refs.iter()
+        .filter_map(|reference| {
+            reference
+                ._ref
+                .strip_prefix("refs/heads/")
+                .map(String::from)
+                .or_else(|| {
+                    reference
+                        ._ref
+                        .strip_prefix("refs/mr/")
+                        .map(|mr| format!("mr/{mr}"))
+                })
+        })
+        .collect()
+}
+
+/// Classify which locally-stored remote-tracking branches under
+/// `refs/remotes/<name>/*` are stale — i.e. the remote no longer advertises a
+/// matching `refs/heads/<branch>` (or `refs/mr/<x>`). The cached
+/// `refs/remotes/<name>/HEAD` is never reported. Pure (no deletion); shared by
+/// `remote prune` and `fetch --prune` so both classify staleness identically.
+pub(crate) fn classify_stale_tracking_branches(
+    name: &str,
+    remote_branch_names: &HashSet<String>,
+    local_remote_branches: &[Branch],
+) -> Vec<RemotePruneEntry> {
+    let head_ref = format!("refs/remotes/{name}/HEAD");
+    let prefix = format!("refs/remotes/{name}/");
+    let mut stale_branches = Vec::new();
+    for local_branch in local_remote_branches {
+        if local_branch.name == head_ref {
+            continue;
+        }
+        let Some(branch_name) = local_branch.name.strip_prefix(&prefix) else {
+            continue;
+        };
+        if remote_branch_names.contains(branch_name) {
+            continue;
+        }
+        stale_branches.push(RemotePruneEntry {
+            remote_ref: local_branch.name.clone(),
+            branch: format!("{name}/{branch_name}"),
+        });
+    }
+    stale_branches
 }
 
 async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, RemoteError> {
@@ -844,22 +1144,8 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
 
     set_wire_hash_kind(discovery.hash_kind);
 
-    let remote_branch_names: HashSet<String> = discovery
-        .refs
-        .iter()
-        .filter_map(|reference| {
-            reference
-                ._ref
-                .strip_prefix("refs/heads/")
-                .map(String::from)
-                .or_else(|| {
-                    reference
-                        ._ref
-                        .strip_prefix("refs/mr/")
-                        .map(|mr| format!("mr/{mr}"))
-                })
-        })
-        .collect();
+    let remote_branch_names =
+        fetch::configured_remote_tracking_branch_names(&name, &discovery.refs).await?;
 
     let local_remote_branches =
         Branch::list_branches_result(Some(&name))
@@ -874,25 +1160,12 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
                 },
             })?;
 
-    let head_ref = format!("refs/remotes/{name}/HEAD");
-    let prefix = format!("refs/remotes/{name}/");
-    let mut stale_branches = Vec::new();
+    let stale_branches =
+        classify_stale_tracking_branches(&name, &remote_branch_names, &local_remote_branches);
 
-    for local_branch in &local_remote_branches {
-        if local_branch.name == head_ref {
-            continue;
-        }
-
-        let Some(branch_name) = local_branch.name.strip_prefix(&prefix) else {
-            continue;
-        };
-
-        if remote_branch_names.contains(branch_name) {
-            continue;
-        }
-
-        if !dry_run {
-            Branch::delete_branch_result(&local_branch.name, Some(&name))
+    if !dry_run {
+        for entry in &stale_branches {
+            Branch::delete_branch_result(&entry.remote_ref, Some(&name))
                 .await
                 .map_err(|error| match error {
                     BranchStoreError::Delete { name, detail } => {
@@ -907,11 +1180,6 @@ async fn run_prune_remote(name: String, dry_run: bool) -> Result<RemoteOutput, R
                     },
                 })?;
         }
-
-        stale_branches.push(RemotePruneEntry {
-            remote_ref: local_branch.name.clone(),
-            branch: format!("{name}/{branch_name}"),
-        });
     }
 
     Ok(RemoteOutput::Prune {
@@ -951,7 +1219,15 @@ async fn ssh_key_namespace_exists(name: &str) -> Result<bool, RemoteError> {
     let prefix = format!("vault.ssh.{name}.");
     ConfigKv::get_by_prefix(&prefix)
         .await
-        .map(|entries| !entries.is_empty())
+        .map(|entries| {
+            entries.iter().any(|entry| {
+                entry
+                    .key
+                    .strip_prefix("vault.ssh.")
+                    .and_then(|rest| rest.rsplit_once('.'))
+                    .is_some_and(|(parsed_name, _)| parsed_name == name)
+            })
+        })
         .map_err(|error| RemoteError::ConfigRead {
             detail: error.to_string(),
         })
@@ -1568,7 +1844,7 @@ fn render_remote_output(result: &RemoteOutput, output: &OutputConfig) -> CliResu
             }
             Ok(())
         }
-        RemoteOutput::Update { remotes } => {
+        RemoteOutput::Update { remotes, pruned } => {
             // The per-remote fetch already streamed its own progress; emit a
             // short confirmation line per updated remote (or a notice when
             // there were none to update).
@@ -1578,6 +1854,10 @@ fn render_remote_output(result: &RemoteOutput, output: &OutputConfig) -> CliResu
                 for name in remotes {
                     writeln!(writer, "Updated {name}").map_err(write_err)?;
                 }
+            }
+            // `-p`/`--prune`: report any stale remote-tracking branches removed.
+            for entry in pruned {
+                writeln!(writer, " * [pruned] {}", entry.branch).map_err(write_err)?;
             }
             Ok(())
         }

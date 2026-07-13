@@ -4,7 +4,8 @@
 //
 use std::process::Command;
 
-use libra::{CliErrorKind, command::config, exec_async};
+use clap::Parser;
+use libra::{CliErrorKind, CliResult, command::config, utils::output::OutputConfig};
 use serial_test::serial;
 use tempfile::tempdir;
 
@@ -20,6 +21,14 @@ struct EnvVarGuard {
     original: Option<std::ffi::OsString>,
 }
 
+async fn exec_config(args: Vec<&str>) -> CliResult<()> {
+    config::execute_safe(
+        config::ConfigArgs::parse_from(args),
+        &OutputConfig::default(),
+    )
+    .await
+}
+
 #[tokio::test]
 #[serial]
 async fn test_cli_config_global_without_repo() {
@@ -29,10 +38,10 @@ async fn test_cli_config_global_without_repo() {
     let global_db_dir = tempdir().unwrap();
     let _scoped = ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config_cli.db"));
 
-    let result = exec_async(vec!["config", "--global", "user.name", "cli_global_user"]).await;
+    let result = exec_config(vec!["config", "--global", "user.name", "cli_global_user"]).await;
     assert!(result.is_ok());
 
-    let read_result = exec_async(vec!["config", "--global", "--get", "user.name"]).await;
+    let read_result = exec_config(vec!["config", "--global", "--get", "user.name"]).await;
     assert!(read_result.is_ok());
 }
 
@@ -46,29 +55,99 @@ async fn test_cli_config_list_global_without_repo() {
     let _scoped =
         ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config_cli_list.db"));
 
-    let result = exec_async(vec!["config", "--list", "--global"]).await;
+    let result = exec_config(vec!["config", "--list", "--global"]).await;
     assert!(result.is_ok());
 }
 
 #[tokio::test]
 #[serial]
-async fn test_cli_config_system_returns_error() {
+async fn test_cli_config_system_read_write() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
 
-    let global_db_dir = tempdir().unwrap();
-    let _scoped =
-        ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config_cli_sys.db"));
+    // Point the system scope at a temp DB so the test never touches /etc/libra.
+    let system_db_dir = tempdir().unwrap();
+    let _system = EnvVarGuard::set(
+        "LIBRA_CONFIG_SYSTEM_DB",
+        system_db_dir
+            .path()
+            .join("system_config_cli.db")
+            .as_os_str(),
+    );
 
-    // --system scope is removed and should always error
-    let result = exec_async(vec!["config", "--system", "user.name", "cli_system_user"]).await;
-    assert!(result.is_err(), "--system should be rejected");
+    // --system writes and reads back (no repository required, like --global).
+    let result = exec_config(vec!["config", "--system", "user.name", "cli_system_user"]).await;
+    assert!(result.is_ok(), "--system set should succeed: {result:?}");
 
-    let result = exec_async(vec!["config", "--system", "--get", "user.name"]).await;
-    assert!(result.is_err(), "--system --get should be rejected");
+    let read_result = exec_config(vec!["config", "--system", "--get", "user.name"]).await;
+    assert!(read_result.is_ok(), "--system --get should succeed");
 
-    let result = exec_async(vec!["config", "--list", "--system"]).await;
-    assert!(result.is_err(), "--system --list should be rejected");
+    let list_result = exec_config(vec!["config", "--list", "--system"]).await;
+    assert!(list_result.is_ok(), "--system --list should succeed");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_config_cascade_system_is_lowest_precedence() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    // Pin both global and system scopes to writable temp DBs.
+    let global_db = temp_path
+        .path()
+        .join("glob.db")
+        .to_string_lossy()
+        .to_string();
+    let system_db = temp_path
+        .path()
+        .join("sys.db")
+        .to_string_lossy()
+        .to_string();
+    let env: [(&str, &str); 2] = [
+        ("LIBRA_CONFIG_GLOBAL_DB", global_db.as_str()),
+        ("LIBRA_CONFIG_SYSTEM_DB", system_db.as_str()),
+    ];
+
+    // System-only value resolves via the cascade (local/global have no key).
+    let set_sys = run_libra_command_with_stdin_and_env(
+        &["config", "--system", "custom.scopetest", "from-system"],
+        temp_path.path(),
+        "",
+        &env,
+    );
+    assert!(set_sys.status.success(), "set --system");
+    let get = run_libra_command_with_stdin_and_env(
+        &["config", "--get", "custom.scopetest"],
+        temp_path.path(),
+        "",
+        &env,
+    );
+    assert!(
+        String::from_utf8_lossy(&get.stdout).contains("from-system"),
+        "cascade resolves to the system value: {}",
+        String::from_utf8_lossy(&get.stdout)
+    );
+
+    // A global value of the same key overrides system (global > system).
+    let set_glob = run_libra_command_with_stdin_and_env(
+        &["config", "--global", "custom.scopetest", "from-global"],
+        temp_path.path(),
+        "",
+        &env,
+    );
+    assert!(set_glob.status.success(), "set --global");
+    let get2 = run_libra_command_with_stdin_and_env(
+        &["config", "--get", "custom.scopetest"],
+        temp_path.path(),
+        "",
+        &env,
+    );
+    assert!(
+        String::from_utf8_lossy(&get2.stdout).contains("from-global"),
+        "global overrides system in the cascade: {}",
+        String::from_utf8_lossy(&get2.stdout)
+    );
 }
 
 #[tokio::test]
@@ -77,7 +156,7 @@ async fn test_cli_config_local_requires_repo() {
     let temp_dir = tempdir().unwrap();
     let _guard = test::ChangeDirGuard::new(temp_dir.path());
 
-    let result = exec_async(vec!["config", "--local", "--list"]).await;
+    let result = exec_config(vec!["config", "--local", "--list"]).await;
     let err = result.unwrap_err();
     assert_eq!(err.kind(), CliErrorKind::Fatal);
     assert!(err.message().contains("not a libra repository"));
@@ -85,25 +164,65 @@ async fn test_cli_config_local_requires_repo() {
 
 #[tokio::test]
 #[serial]
-async fn test_config_system_scope_is_rejected_as_command_usage_error() {
+async fn test_config_system_scope_roundtrip_and_vault_rejection() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    let output = run_libra_command(&["config", "--system", "list"], temp_path.path());
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("--system scope is not supported"),
-        "stderr should describe the unsupported scope, got: {stderr}"
+    // Redirect the system scope to a writable temp DB (never touch /etc/libra).
+    let sys_db = temp_path.path().join("sys").join("config.db");
+    let sys_db_str = sys_db.to_string_lossy().to_string();
+    let env: [(&str, &str); 1] = [("LIBRA_CONFIG_SYSTEM_DB", sys_db_str.as_str())];
+
+    // `--system` set then get roundtrips through the system DB.
+    let set = run_libra_command_with_stdin_and_env(
+        &["config", "--system", "user.name", "sys user"],
+        temp_path.path(),
+        "",
+        &env,
     );
-    // config.md line 175: classifies as a CLI usage error (exit 2 fine /
-    // 129 coarse). The previous `from_legacy_string` path collapsed this
-    // to a generic failure (exit 128).
-    assert_eq!(
-        output.status.code(),
-        Some(129),
-        "--system rejection must classify as CLI usage (exit 129), got status: {:?}, stderr: {stderr}",
-        output.status,
+    assert!(
+        set.status.success(),
+        "--system set: {}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    assert!(sys_db.exists(), "the system config DB was created");
+
+    let get = run_libra_command_with_stdin_and_env(
+        &["config", "--system", "--get", "user.name"],
+        temp_path.path(),
+        "",
+        &env,
+    );
+    assert!(get.status.success(), "--system --get should succeed");
+    assert!(
+        String::from_utf8_lossy(&get.stdout).contains("sys user"),
+        "system value read back: {}",
+        String::from_utf8_lossy(&get.stdout)
+    );
+
+    // Vault-encrypted secrets are not supported in the system scope.
+    let vault = run_libra_command_with_stdin_and_env(
+        &[
+            "config",
+            "set",
+            "--system",
+            "--encrypt",
+            "custom.secret",
+            "s3cr3t",
+        ],
+        temp_path.path(),
+        "",
+        &env,
+    );
+    assert!(
+        !vault.status.success(),
+        "--system --encrypt must be rejected"
+    );
+    assert!(
+        String::from_utf8_lossy(&vault.stderr).contains("not supported in --system scope"),
+        "vault-rejection message: {}",
+        String::from_utf8_lossy(&vault.stderr)
     );
 }
 
@@ -140,7 +259,7 @@ async fn test_config_import_global_from_git() {
         .unwrap();
     assert!(set_email.status.success());
 
-    let result = exec_async(vec!["config", "--global", "import"]).await;
+    let result = exec_config(vec!["config", "--global", "import"]).await;
     assert!(result.is_ok());
 
     let imported_name = config::ScopedConfig::get(config::ConfigScope::Global, "user.name")
@@ -185,7 +304,7 @@ async fn test_config_import_local_from_git_repository() {
         .unwrap();
     assert!(set_email.status.success());
 
-    let result = exec_async(vec!["config", "import"]).await;
+    let result = exec_config(vec!["config", "import"]).await;
     assert!(result.is_ok());
 
     let imported_names: Vec<String> =
@@ -259,7 +378,7 @@ async fn test_config_get_failed() {
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
     // --default with --add (no --get or --get-all) should error
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "--add",
         "-d",
@@ -282,10 +401,10 @@ async fn test_config_get_all() {
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
     // Add the config first
-    let result = exec_async(vec!["config", "--add", "user.name", "erasernoob"]).await;
+    let result = exec_config(vec!["config", "--add", "user.name", "erasernoob"]).await;
     assert!(result.is_ok());
 
-    let result = exec_async(vec!["config", "--get", "user.name"]).await;
+    let result = exec_config(vec!["config", "--get", "user.name"]).await;
     assert!(result.is_ok());
 }
 
@@ -306,7 +425,7 @@ async fn test_config_get_all_with_default() {
     // set the current working directory to the temporary path
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    let result = exec_async(vec!["config", "--get-all", "-d", "erasernoob", "user.name"]).await;
+    let result = exec_config(vec!["config", "--get-all", "-d", "erasernoob", "user.name"]).await;
     assert!(result.is_ok());
 }
 
@@ -321,10 +440,10 @@ async fn test_config_get() {
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
     // Add the config first
-    let result = exec_async(vec!["config", "--add", "user.name", "erasernoob"]).await;
+    let result = exec_config(vec!["config", "--add", "user.name", "erasernoob"]).await;
     assert!(result.is_ok());
 
-    let result = exec_async(vec!["config", "--get", "user.name"]).await;
+    let result = exec_config(vec!["config", "--get", "user.name"]).await;
     assert!(result.is_ok());
 }
 
@@ -337,7 +456,7 @@ async fn test_config_get_with_default() {
 
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    let result = exec_async(vec!["config", "--get", "-d", "erasernoob", "user.name"]).await;
+    let result = exec_config(vec!["config", "--get", "-d", "erasernoob", "user.name"]).await;
     assert!(result.is_ok());
 }
 
@@ -352,10 +471,10 @@ async fn test_config_list() {
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
     // Add the config first
-    let result = exec_async(vec!["config", "--add", "user.name", "erasernoob"]).await;
+    let result = exec_config(vec!["config", "--add", "user.name", "erasernoob"]).await;
     assert!(result.is_ok());
 
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "--add",
         "user.email",
@@ -365,7 +484,7 @@ async fn test_config_list() {
     assert!(result.is_ok());
 
     // List configs
-    let result = exec_async(vec!["config", "--list"]).await;
+    let result = exec_config(vec!["config", "--list"]).await;
     assert!(result.is_ok());
 }
 
@@ -380,10 +499,10 @@ async fn test_config_list_name_only() {
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
     // Add the config first
-    let result = exec_async(vec!["config", "--add", "user.name", "erasernoob"]).await;
+    let result = exec_config(vec!["config", "--add", "user.name", "erasernoob"]).await;
     assert!(result.is_ok());
 
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "--add",
         "user.email",
@@ -393,7 +512,7 @@ async fn test_config_list_name_only() {
     assert!(result.is_ok());
 
     // List configs with name_only via subcommand
-    let result = exec_async(vec!["config", "list", "--name-only"]).await;
+    let result = exec_config(vec!["config", "list", "--name-only"]).await;
     assert!(result.is_ok());
 }
 
@@ -406,11 +525,11 @@ async fn test_config_scope_local_default() {
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
     // Test that no scope specified defaults to local
-    let result = exec_async(vec!["config", "user.name", "test_user_local_default"]).await;
+    let result = exec_config(vec!["config", "user.name", "test_user_local_default"]).await;
     assert!(result.is_ok());
 
     // Verify the value was written to local scope by reading it back
-    let result = exec_async(vec!["config", "--get", "user.name"]).await;
+    let result = exec_config(vec!["config", "--get", "user.name"]).await;
     assert!(result.is_ok());
 }
 
@@ -426,7 +545,7 @@ async fn test_config_scope_global() {
     let _scoped = ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config.db"));
 
     // Set a value in global scope
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "--global",
         "user.email",
@@ -436,11 +555,11 @@ async fn test_config_scope_global() {
     assert!(result.is_ok());
 
     // Verify the value was written to global scope by reading it back
-    let result = exec_async(vec!["config", "--global", "--get", "user.email"]).await;
+    let result = exec_config(vec!["config", "--global", "--get", "user.email"]).await;
     assert!(result.is_ok());
 
     // Verify that the global value is NOT accessible from local scope
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "--local",
         "--get",
@@ -459,14 +578,184 @@ async fn test_config_scope_system_errors() {
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    // --system scope is removed and should always error
-    let result = exec_async(vec!["config", "--system", "user.name", "system_user"]).await;
-    assert!(result.is_err(), "--system should be rejected");
+    // Redirect the system scope to a temp DB so nothing touches /etc/libra.
+    let system_db_dir = tempdir().unwrap();
+    let _system = EnvVarGuard::set(
+        "LIBRA_CONFIG_SYSTEM_DB",
+        system_db_dir.path().join("system_vault.db").as_os_str(),
+    );
+
+    // Plain `--system` writes succeed, but vault-encrypted secrets are rejected.
+    let ok = exec_config(vec!["config", "--system", "user.name", "system_user"]).await;
+    assert!(ok.is_ok(), "--system plain set should succeed: {ok:?}");
+
+    let result = exec_config(vec![
+        "config",
+        "set",
+        "--system",
+        "--encrypt",
+        "custom.secret",
+        "s3cr3t",
+    ])
+    .await;
+    assert!(result.is_err(), "--system --encrypt should be rejected");
     let err = result.unwrap_err();
     assert!(
-        err.message().contains("--system scope is not supported"),
+        err.message().contains("not supported in --system scope"),
         "unexpected error: {}",
         err.message()
+    );
+
+    // The whole `vault.*` namespace is rejected in system scope, including
+    // non-sensitive pubkey keys that `is_sensitive_key` does not flag, and
+    // mixed-case section names (Git section names are case-insensitive).
+    for key in [
+        "vault.signing",
+        "vault.ssh.origin.pubkey",
+        "Vault.signing",
+        "VAULT.gpg.pubkey",
+    ] {
+        let r = exec_config(vec!["config", "--system", key, "x"]).await;
+        assert!(r.is_err(), "--system {key} should be rejected");
+        assert!(
+            r.unwrap_err()
+                .message()
+                .contains("not supported in --system scope"),
+            "{key} rejection should name the system scope"
+        );
+    }
+
+    // `config import --system` is rejected up front: import auto-encrypts
+    // sensitive keys, which the system scope does not support.
+    let import = exec_config(vec!["config", "import", "--system"]).await;
+    assert!(import.is_err(), "config import --system should be rejected");
+    assert!(
+        import
+            .unwrap_err()
+            .message()
+            .contains("not supported in --system scope"),
+        "import rejection should name the system scope"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_config_system_rejected_vault_write_does_not_create_db() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    // Point the system scope at a path that does NOT yet exist.
+    let fresh_dir = tempdir().unwrap();
+    let sys_db = fresh_dir.path().join("never").join("config.db");
+    let _system = EnvVarGuard::set("LIBRA_CONFIG_SYSTEM_DB", sys_db.as_os_str());
+
+    // A rejected `--system --encrypt` write must short-circuit before touching
+    // the DB, so the system config path is never created.
+    let result = exec_config(vec![
+        "config",
+        "set",
+        "--system",
+        "--encrypt",
+        "custom.secret",
+        "s3cr3t",
+    ])
+    .await;
+    assert!(result.is_err(), "--system --encrypt should be rejected");
+    assert!(
+        !sys_db.exists(),
+        "the rejected vault write must not create the system DB"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_config_system_rename_into_vault_namespace_rejected() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    let system_db_dir = tempdir().unwrap();
+    let _system = EnvVarGuard::set(
+        "LIBRA_CONFIG_SYSTEM_DB",
+        system_db_dir.path().join("system_rename.db").as_os_str(),
+    );
+
+    // Seed a plain (non-sensitive) system key, then try to rename its section
+    // into the vault namespace — which would smuggle a secret key past the
+    // direct-set guard. It must be rejected.
+    let seed = exec_config(vec!["config", "--system", "foo.bar", "value"]).await;
+    assert!(seed.is_ok(), "plain system set should succeed: {seed:?}");
+
+    let rename = exec_config(vec![
+        "config",
+        "--system",
+        "--rename-section",
+        "foo",
+        "vault.env",
+    ])
+    .await;
+    assert!(
+        rename.is_err(),
+        "renaming a system section into vault.env must be rejected"
+    );
+    assert!(
+        rename
+            .unwrap_err()
+            .message()
+            .contains("not supported in --system scope"),
+        "rename rejection should name the system scope"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_config_system_set_rejected_when_existing_row_is_encrypted() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp_path.path());
+
+    // Isolate HOME so the global vault key lands in the temp dir, then build an
+    // encrypted row in a shared DB via the (vault-capable) global scope.
+    let home = tempdir().unwrap();
+    let _home = EnvVarGuard::set("HOME", home.path().as_os_str());
+    let shared_db = temp_path.path().join("shared.db");
+    let _global = EnvVarGuard::set("LIBRA_CONFIG_GLOBAL_DB", shared_db.as_os_str());
+
+    let seed = exec_config(vec![
+        "config",
+        "set",
+        "--global",
+        "--encrypt",
+        "custom.secret",
+        "cipher",
+    ])
+    .await;
+    assert!(seed.is_ok(), "seed encrypted global row: {seed:?}");
+
+    // Reuse that DB as the system DB so it already holds an encrypted row, then
+    // a `--system --plaintext` write to the same key must be rejected (it would
+    // otherwise keep the row's encrypted flag while storing a plaintext value).
+    let _system = EnvVarGuard::set("LIBRA_CONFIG_SYSTEM_DB", shared_db.as_os_str());
+    let result = exec_config(vec![
+        "config",
+        "set",
+        "--system",
+        "--plaintext",
+        "custom.secret",
+        "newval",
+    ])
+    .await;
+    assert!(
+        result.is_err(),
+        "--system --plaintext over an encrypted row must be rejected"
+    );
+    assert!(
+        result
+            .unwrap_err()
+            .message()
+            .contains("not supported in --system scope"),
+        "rejection should name the system scope"
     );
 }
 
@@ -478,7 +767,7 @@ async fn test_config_scope_explicit_local() {
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
     // Set a value explicitly in local scope
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "--local",
         "user.name",
@@ -488,7 +777,7 @@ async fn test_config_scope_explicit_local() {
     assert!(result.is_ok());
 
     // Verify the value was written to local scope by reading it back
-    let result = exec_async(vec!["config", "--local", "--get", "user.name"]).await;
+    let result = exec_config(vec!["config", "--local", "--get", "user.name"]).await;
     assert!(result.is_ok());
 }
 
@@ -504,19 +793,19 @@ async fn test_config_scope_isolation() {
     let _scoped = ScopedConfigPathGuard::new(&global_db_dir.path().join("global_config.db"));
 
     // Set the same key with different values in different scopes
-    let result = exec_async(vec!["config", "--local", "test.isolation", "local_value"]).await;
+    let result = exec_config(vec!["config", "--local", "test.isolation", "local_value"]).await;
     assert!(result.is_ok());
 
-    let result = exec_async(vec!["config", "--global", "test.isolation", "global_value"]).await;
+    let result = exec_config(vec!["config", "--global", "test.isolation", "global_value"]).await;
     assert!(result.is_ok());
 
     // Verify that each scope returns its own value
     println!("Reading from local scope:");
-    let result = exec_async(vec!["config", "--local", "--get", "test.isolation"]).await;
+    let result = exec_config(vec!["config", "--local", "--get", "test.isolation"]).await;
     assert!(result.is_ok());
 
     println!("Reading from global scope:");
-    let result = exec_async(vec!["config", "--global", "--get", "test.isolation"]).await;
+    let result = exec_config(vec!["config", "--global", "--get", "test.isolation"]).await;
     assert!(result.is_ok());
 }
 
@@ -534,7 +823,7 @@ async fn test_config_get_reveal_decrypt_failure_returns_error() {
         .await
         .unwrap();
 
-    let result = exec_async(vec!["config", "get", "--reveal", "vault.env.TEST_SECRET"]).await;
+    let result = exec_config(vec!["config", "get", "--reveal", "vault.env.TEST_SECRET"]).await;
     let err = result.expect_err("decrypt failure should surface as an error");
     assert_eq!(err.kind(), CliErrorKind::Fatal);
     assert_eq!(err.exit_code(), 128);
@@ -555,7 +844,7 @@ async fn test_config_get_cascaded_global_read_failure_returns_error() {
     std::fs::write(&bad_global_db, "definitely-not-a-sqlite-database").unwrap();
     let _scoped = ScopedConfigPathGuard::new(&bad_global_db);
 
-    let result = exec_async(vec!["config", "get", "user.missing"]).await;
+    let result = exec_config(vec!["config", "get", "user.missing"]).await;
     let err = result.expect_err("broken cascaded scope should not be ignored");
     assert_eq!(err.kind(), CliErrorKind::Fatal);
     assert_eq!(err.exit_code(), 128);
@@ -569,7 +858,7 @@ async fn test_config_add_rejects_implicit_encryption_mixed_with_existing_plainte
     test::setup_with_new_libra_in(temp_path.path()).await;
     let _guard = test::ChangeDirGuard::new(temp_path.path());
 
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "set",
         "--plaintext",
@@ -579,7 +868,7 @@ async fn test_config_add_rejects_implicit_encryption_mixed_with_existing_plainte
     .await;
     assert!(result.is_ok());
 
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "set",
         "--add",
@@ -715,7 +1004,7 @@ async fn test_config_set_read_failure_does_not_silently_skip_existing_state_chec
     let _home_guard = EnvVarGuard::set("HOME", fake_home.path().as_os_str());
     let _userprofile_guard = EnvVarGuard::set("USERPROFILE", fake_home.path().as_os_str());
 
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "set",
         "--global",
@@ -752,7 +1041,7 @@ async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is
     // Prevent rpassword::read_password() from blocking on stdin.
     let _test_env = EnvVarGuard::set("LIBRA_TEST", std::ffi::OsStr::new("1"));
 
-    let result = exec_async(vec![
+    let result = exec_config(vec![
         "config",
         "set",
         "--encrypt",
@@ -762,7 +1051,7 @@ async fn test_config_set_missing_value_uses_protected_input_when_existing_key_is
     .await;
     assert!(result.is_ok());
 
-    let result = exec_async(vec!["config", "set", "custom.value"]).await;
+    let result = exec_config(vec!["config", "set", "custom.value"]).await;
     let err = result.expect_err("existing encrypted state should require protected input");
     assert_eq!(err.exit_code(), 2);
     assert!(
@@ -1498,4 +1787,449 @@ async fn get_best_effort_reads_value_inside_repository() {
         .await
         .unwrap();
     assert_eq!(entry.map(|e| e.value).as_deref(), Some("yes"));
+}
+
+/// `--remove-section` / `--rename-section` operate on whole sections: rename
+/// moves every `old.*` key to `new.*` (siblings untouched), remove deletes all
+/// keys under the section, a missing section is exit 128, and renaming to the
+/// same name is rejected (exit 2) so the move cannot delete what it just wrote.
+#[tokio::test]
+#[serial]
+async fn test_config_remove_and_rename_section() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp.path());
+    let p = temp.path();
+
+    let set = |k: &str, v: &str| {
+        assert_cli_success(
+            &run_libra_command(&["config", "--local", k, v], p),
+            "config set",
+        );
+    };
+    set("branch.feature.remote", "origin");
+    set("branch.feature.merge", "refs/heads/feature");
+    set("branch.other.remote", "upstream");
+
+    // Rename branch.feature -> branch.renamed.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "config",
+                "--local",
+                "--rename-section",
+                "branch.feature",
+                "branch.renamed",
+            ],
+            p,
+        ),
+        "rename-section",
+    );
+
+    // New keys carry the original values.
+    let r1 = run_libra_command(&["config", "--local", "--get", "branch.renamed.remote"], p);
+    assert_cli_success(&r1, "get renamed.remote");
+    assert!(String::from_utf8_lossy(&r1.stdout).contains("origin"));
+    let r2 = run_libra_command(&["config", "--local", "--get", "branch.renamed.merge"], p);
+    assert!(String::from_utf8_lossy(&r2.stdout).contains("refs/heads/feature"));
+
+    // The old section is gone; the sibling section is untouched.
+    assert!(
+        !run_libra_command(&["config", "--local", "--get", "branch.feature.remote"], p)
+            .status
+            .success(),
+        "old section key must be removed by rename"
+    );
+    let sib = run_libra_command(&["config", "--local", "--get", "branch.other.remote"], p);
+    assert_cli_success(&sib, "sibling untouched");
+    assert!(String::from_utf8_lossy(&sib.stdout).contains("upstream"));
+
+    // Remove the renamed section.
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "--remove-section", "branch.renamed"],
+            p,
+        ),
+        "remove-section",
+    );
+    assert!(
+        !run_libra_command(&["config", "--local", "--get", "branch.renamed.remote"], p)
+            .status
+            .success(),
+        "removed section key must be gone"
+    );
+
+    // Removing a non-existent section is "No such section" (exit 128).
+    assert_eq!(
+        run_libra_command(&["config", "--local", "--remove-section", "nope"], p)
+            .status
+            .code(),
+        Some(128),
+        "removing a missing section must exit 128"
+    );
+
+    // Renaming a section onto itself is rejected (exit 2).
+    assert_eq!(
+        run_libra_command(
+            &[
+                "config",
+                "--local",
+                "--rename-section",
+                "branch.other",
+                "branch.other"
+            ],
+            p,
+        )
+        .status
+        .code(),
+        Some(2),
+        "identical rename must be rejected with exit 2"
+    );
+}
+
+/// Section ops use Git's exact section/subsection identity, not a raw prefix:
+/// `--remove-section branch` removes only the bare-section key `branch.x`, not
+/// the subsection key `branch.feature.remote`. Renaming onto a destination
+/// section that already has keys is rejected (exit 128) so no merge/flag
+/// ambiguity can occur.
+#[tokio::test]
+#[serial]
+async fn test_config_section_ops_exact_git_semantics() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp.path());
+    let p = temp.path();
+    let set = |k: &str, v: &str| {
+        assert_cli_success(&run_libra_command(&["config", "--local", k, v], p), "set");
+    };
+
+    set("branch.autosetupmerge", "always"); // bare section `branch`
+    set("branch.feature.remote", "origin"); // subsection `branch.feature`
+
+    // Removing the bare section must NOT touch the subsection.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--remove-section", "branch"], p),
+        "remove bare section",
+    );
+    assert!(
+        !run_libra_command(&["config", "--local", "--get", "branch.autosetupmerge"], p)
+            .status
+            .success(),
+        "the bare-section key must be removed"
+    );
+    let kept = run_libra_command(&["config", "--local", "--get", "branch.feature.remote"], p);
+    assert_cli_success(
+        &kept,
+        "subsection key must survive removing the bare section",
+    );
+    assert!(String::from_utf8_lossy(&kept.stdout).contains("origin"));
+
+    // Renaming onto an existing destination section is rejected; source survives.
+    set("dst.x", "1");
+    set("src.y", "2");
+    assert_eq!(
+        run_libra_command(&["config", "--local", "--rename-section", "src", "dst"], p)
+            .status
+            .code(),
+        Some(128),
+        "rename onto an existing destination section must be rejected (128)"
+    );
+    assert!(
+        run_libra_command(&["config", "--local", "--get", "src.y"], p)
+            .status
+            .success(),
+        "source must be preserved after a rejected rename"
+    );
+}
+
+/// `--rename-section` preserves multi-value order (each value is re-added under
+/// the new key in its original insertion order).
+#[tokio::test]
+#[serial]
+async fn test_config_rename_section_preserves_multivalue_order() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp.path());
+    let p = temp.path();
+
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--add", "mvtest.list", "first"], p),
+        "add first",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--add", "mvtest.list", "second"], p),
+        "add second",
+    );
+
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "--rename-section", "mvtest", "moved"],
+            p,
+        ),
+        "rename multi-value section",
+    );
+
+    let g = run_libra_command(&["config", "--local", "--get-all", "moved.list"], p);
+    assert_cli_success(&g, "get-all moved.list");
+    let out = String::from_utf8_lossy(&g.stdout);
+    let first = out.find("first");
+    let second = out.find("second");
+    assert!(
+        first.is_some() && second.is_some() && first < second,
+        "multi-value insertion order must be preserved (first before second): {out}"
+    );
+    // `--get-all` on a now-missing key exits 0 with empty output, so assert the
+    // old values are gone rather than expecting a non-zero exit.
+    let old = run_libra_command(&["config", "--local", "--get-all", "mvtest.list"], p);
+    let old_out = String::from_utf8_lossy(&old.stdout);
+    assert!(
+        !old_out.contains("first") && !old_out.contains("second"),
+        "the old multi-value key must be removed, got: {old_out}"
+    );
+}
+
+/// `-z` / `--null` NUL-terminates output (`git config -z`): values for
+/// `--get`/`--get-all`, and `key\nvalue\0` records for `--get-regexp`/`--list`
+/// (`key\0` with `--name-only`).
+#[tokio::test]
+#[serial]
+async fn test_config_null_terminated_output() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp.path());
+    let p = temp.path();
+    let set = |k: &str, v: &str| {
+        assert_cli_success(&run_libra_command(&["config", "--local", k, v], p), "set");
+    };
+    set("alpha.one", "v1");
+    set("alpha.two", "v2");
+
+    // --get -z : value\0 (exact bytes).
+    let g = run_libra_command(&["config", "--local", "-z", "--get", "alpha.one"], p);
+    assert_cli_success(&g, "get -z");
+    assert_eq!(
+        g.stdout, b"v1\0",
+        "get -z must emit value + NUL, got {:?}",
+        g.stdout
+    );
+
+    // --get-regexp -z : key\nvalue\0 per entry.
+    let gr = run_libra_command(&["config", "--local", "-z", "--get-regexp", "^alpha\\."], p);
+    assert_cli_success(&gr, "get-regexp -z");
+    let grs = String::from_utf8_lossy(&gr.stdout);
+    assert!(
+        grs.contains("alpha.one\nv1\0") && grs.contains("alpha.two\nv2\0"),
+        "get-regexp -z must emit key\\nvalue\\0, got {:?}",
+        gr.stdout
+    );
+
+    // --list -z : key\nvalue\0 (no '=' separator).
+    let l = run_libra_command(&["config", "--local", "-z", "--list"], p);
+    assert_cli_success(&l, "list -z");
+    let ls = String::from_utf8_lossy(&l.stdout);
+    assert!(
+        ls.contains("alpha.one\nv1\0")
+            && ls.contains("alpha.two\nv2\0")
+            && !ls.contains("alpha.one=v1"),
+        "list -z must emit key\\nvalue\\0 (no '='), got {:?}",
+        l.stdout
+    );
+
+    // --name-only -z (subcommand form, -z is a global flag): key\0, no values.
+    let ln = run_libra_command(&["config", "--local", "list", "--name-only", "-z"], p);
+    assert_cli_success(&ln, "list --name-only -z");
+    let lns = String::from_utf8_lossy(&ln.stdout);
+    assert!(
+        lns.contains("alpha.one\0") && lns.contains("alpha.two\0") && !lns.contains("v1"),
+        "list --name-only -z must emit key\\0 with no values, got {:?}",
+        ln.stdout
+    );
+
+    // `-z` applies to standard config output only: combining it with the
+    // Libra-only --ssh-keys/--gpg-keys/--vault views is a usage error (129).
+    assert_eq!(
+        run_libra_command(&["config", "--local", "list", "--ssh-keys", "-z"], p)
+            .status
+            .code(),
+        Some(129),
+        "-z with --ssh-keys must be rejected as a usage error"
+    );
+}
+
+/// `--type=<bool|int|path>` and the `--bool`/`--int`/`--path` shortcuts
+/// canonicalize a value when reading (`git config --type`): bool variants,
+/// int k/m/g multipliers, and `~` path expansion. Invalid values error, and
+/// the flags are rejected outside get modes / for an unknown type.
+#[tokio::test]
+#[serial]
+async fn test_config_typed_get() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp.path());
+    let p = temp.path();
+    let set = |k: &str, v: &str| {
+        assert_cli_success(&run_libra_command(&["config", "--local", k, v], p), "set");
+    };
+    set("flag.on", "yes");
+    set("flag.off", "0");
+    set("num.size", "1k");
+    set("num.bad", "notanint");
+    set("p.home", "~/work");
+
+    // --bool: yes → true, 0 → false.
+    let b = run_libra_command(&["config", "--local", "--bool", "--get", "flag.on"], p);
+    assert_cli_success(&b, "--bool get");
+    assert_eq!(String::from_utf8_lossy(&b.stdout).trim(), "true");
+    let b2 = run_libra_command(&["config", "--local", "--bool", "--get", "flag.off"], p);
+    assert_eq!(String::from_utf8_lossy(&b2.stdout).trim(), "false");
+
+    // --int and --type=int both apply the k multiplier: 1k → 1024.
+    let i = run_libra_command(&["config", "--local", "--int", "--get", "num.size"], p);
+    assert_cli_success(&i, "--int get");
+    assert_eq!(String::from_utf8_lossy(&i.stdout).trim(), "1024");
+    let it = run_libra_command(
+        &["config", "--local", "--type", "int", "--get", "num.size"],
+        p,
+    );
+    assert_cli_success(&it, "--type int get");
+    assert_eq!(String::from_utf8_lossy(&it.stdout).trim(), "1024");
+
+    // A non-int value with --int errors.
+    assert!(
+        !run_libra_command(&["config", "--local", "--int", "--get", "num.bad"], p)
+            .status
+            .success(),
+        "non-int value with --int must error"
+    );
+
+    // --path expands a leading ~/.
+    let pa = run_libra_command(&["config", "--local", "--path", "--get", "p.home"], p);
+    assert_cli_success(&pa, "--path get");
+    let pout = String::from_utf8_lossy(&pa.stdout);
+    assert!(
+        !pout.trim().starts_with('~') && pout.trim().ends_with("/work"),
+        "--path must expand a leading ~/: {pout}"
+    );
+
+    // The type flags are rejected outside get modes and for an unknown type.
+    assert_eq!(
+        run_libra_command(&["config", "--local", "--bool", "--list"], p)
+            .status
+            .code(),
+        Some(129),
+        "--bool with --list must be rejected (129)"
+    );
+    assert_eq!(
+        run_libra_command(
+            &["config", "--local", "--type", "frob", "--get", "flag.on"],
+            p
+        )
+        .status
+        .code(),
+        Some(129),
+        "unknown --type must be rejected (129)"
+    );
+
+    // Two type selectors at once are mutually exclusive (clap rejects).
+    assert!(
+        !run_libra_command(
+            &["config", "--local", "--bool", "--int", "--get", "flag.on"],
+            p
+        )
+        .status
+        .success(),
+        "--bool --int together must be rejected"
+    );
+
+    // No whitespace trimming: a padded value is not a valid bool (matches Git).
+    set("flag.padded", " true ");
+    assert!(
+        !run_libra_command(&["config", "--local", "--bool", "--get", "flag.padded"], p)
+            .status
+            .success(),
+        "a whitespace-padded bool value must be rejected"
+    );
+
+    // An explicit empty value canonicalizes to false (git: `if (!*value) return
+    // 0`; only a valueless key is true, which Libra's string storage never has).
+    set("flag.empty", "");
+    let e = run_libra_command(&["config", "--local", "--bool", "--get", "flag.empty"], p);
+    assert_cli_success(&e, "--bool get empty");
+    assert_eq!(String::from_utf8_lossy(&e.stdout).trim(), "false");
+}
+
+/// `--type=<bool|int|path>` (and the `--bool`/`--int`/`--path` shortcuts) also
+/// apply when SETTING: the value is validated and canonicalized before storage,
+/// matching `git config --type` (e.g. `yes` → `true`, `1k` → `1024`). An
+/// invalid value errors without storing, and `--type` with a non-get/non-set
+/// mode is still rejected.
+#[tokio::test]
+#[serial]
+async fn test_config_typed_set() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let _guard = test::ChangeDirGuard::new(temp.path());
+    let p = temp.path();
+
+    let get = |k: &str| -> String {
+        let out = run_libra_command(&["config", "--local", "--get", k], p);
+        assert_cli_success(&out, "get");
+        String::from_utf8_lossy(&out.stdout).trim().to_string()
+    };
+
+    // bool canonicalizes on set (yes → true).
+    assert_cli_success(
+        &run_libra_command(
+            &["config", "--local", "--type", "bool", "flag.on", "yes"],
+            p,
+        ),
+        "typed bool set",
+    );
+    assert_eq!(get("flag.on"), "true");
+
+    // --bool shortcut likewise (ON → true).
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--bool", "flag.up", "ON"], p),
+        "--bool set",
+    );
+    assert_eq!(get("flag.up"), "true");
+
+    // int with a k multiplier canonicalizes (1k → 1024).
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--type", "int", "num.size", "1k"], p),
+        "typed int set",
+    );
+    assert_eq!(get("num.size"), "1024");
+
+    // path expands ~/ on set.
+    assert_cli_success(
+        &run_libra_command(&["config", "--local", "--path", "dir.home", "~/work"], p),
+        "typed path set",
+    );
+    assert!(
+        get("dir.home").ends_with("/work") && !get("dir.home").starts_with('~'),
+        "path is home-expanded: {}",
+        get("dir.home")
+    );
+
+    // An invalid typed value errors and does NOT store the key.
+    let bad = run_libra_command(&["config", "--local", "--type", "int", "n.bad", "abc"], p);
+    assert!(!bad.status.success(), "invalid int must error");
+    let missing = run_libra_command(&["config", "--local", "--get", "n.bad"], p);
+    assert!(
+        !missing.status.success(),
+        "the invalid value must not be stored"
+    );
+
+    // `--type` with a non-get/non-set mode (here `--unset`) is still a usage error.
+    let unset = run_libra_command(
+        &["config", "--local", "--type", "int", "--unset", "num.size"],
+        p,
+    );
+    assert_eq!(
+        unset.status.code(),
+        Some(129),
+        "--type with --unset is a usage error: {}",
+        String::from_utf8_lossy(&unset.stderr)
+    );
 }

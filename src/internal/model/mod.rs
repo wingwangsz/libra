@@ -21,7 +21,11 @@ pub mod ai_thread_provider_metadata;
 pub mod ai_validation_report;
 pub mod config;
 pub mod config_kv;
+pub mod layer;
+pub mod layer_path;
+pub mod metadata_kv;
 pub mod object_index;
+pub mod object_obliteration;
 pub mod operation;
 pub mod operation_parent;
 pub mod operation_view;
@@ -29,8 +33,13 @@ pub mod operation_view_ref;
 pub mod operation_view_workspace;
 pub mod reference;
 pub mod reflog;
+pub mod revision_ordinal;
+pub mod revision_ordinal_meta;
 pub mod schema_version;
 pub mod source_call_log;
+pub mod sparse_view;
+pub mod working_dirty;
+pub mod working_dirty_meta;
 
 #[cfg(test)]
 mod reference_test;

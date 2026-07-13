@@ -29,12 +29,15 @@ use std::{
 
 use clap::{Parser, Subcommand, ValueEnum};
 use git_internal::{
-    hash::{HashKind, ObjectHash},
-    internal::object::{commit::Commit, tree::Tree, types::ObjectType},
+    hash::{HashKind, ObjectHash, get_hash_kind},
+    internal::object::{commit::Commit, tag::Tag as GitTag, tree::Tree, types::ObjectType},
 };
 use sea_orm::EntityTrait;
 use serde::Serialize;
 use sha1::Digest;
+// Brought into scope (anonymously) so `sha2::Sha256::digest` resolves; sha1 and
+// sha2 use different `digest` trait versions here, so both must be in scope.
+use sha2::Digest as _;
 
 use crate::{
     command::{fetch::fetch_repository_safe, load_object, log::get_reachable_commits},
@@ -43,10 +46,11 @@ use crate::{
         config::ConfigKv,
         db,
         model::{reference, reflog},
+        pack_writer,
     },
     utils::{
         client_storage::ClientStorage,
-        error::{CliError, CliResult},
+        error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         path,
         util::try_get_storage_path,
@@ -130,6 +134,10 @@ pub enum MaintenanceTask {
     CommitGraph,
     /// Prefetch remote refs without updating local branches.
     Prefetch,
+    /// Evict verified-durable large objects from the local cache (lore.md
+    /// 2.9). NOT in the default task set — select it explicitly (or schedule
+    /// it) so `maintenance run` never surprise-deletes cache entries.
+    CacheEvict,
 }
 
 impl std::fmt::Display for MaintenanceTask {
@@ -141,6 +149,7 @@ impl std::fmt::Display for MaintenanceTask {
             MaintenanceTask::IncrementalRepack => write!(f, "incremental-repack"),
             MaintenanceTask::CommitGraph => write!(f, "commit-graph"),
             MaintenanceTask::Prefetch => write!(f, "prefetch"),
+            MaintenanceTask::CacheEvict => write!(f, "cache-evict"),
         }
     }
 }
@@ -217,6 +226,7 @@ async fn run_tasks(
 
     let mut results = Vec::with_capacity(selected.len());
     let mut overall_success = true;
+    let mut first_task_error = None;
 
     for task in selected {
         if !quiet {
@@ -235,6 +245,7 @@ async fn run_tasks(
                 run_commit_graph(&repo_path, dry_run, quiet, output).await
             }
             MaintenanceTask::Prefetch => run_prefetch(&repo_path, dry_run, quiet, output).await,
+            MaintenanceTask::CacheEvict => run_cache_evict(dry_run).await,
         };
         match result {
             Ok(r) => {
@@ -245,6 +256,9 @@ async fn run_tasks(
             }
             Err(e) => {
                 overall_success = false;
+                if first_task_error.is_none() {
+                    first_task_error = Some(e.clone());
+                }
                 results.push(TaskResult {
                     task: task.to_string(),
                     success: false,
@@ -287,6 +301,9 @@ async fn run_tasks(
     }
 
     if !overall_success {
+        if let Some(error) = first_task_error {
+            return Err(error);
+        }
         return Err(CliError::failure("one or more maintenance tasks failed").with_exit_code(1));
     }
     Ok(())
@@ -296,6 +313,50 @@ async fn run_tasks(
 // GC task
 // ---------------------------------------------------------------------------
 
+/// `cache-evict` task (lore.md 2.9): delegate to the same engine as
+/// `libra cache evict`, with the resolved budget and the default age floor.
+async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
+    use crate::utils::storage::EvictRequest;
+    let budget = crate::utils::client_storage::resolve_cache_config()
+        .map_err(|error| CliError::fatal(format!("cannot resolve the cache budget: {error}")))?
+        .cache_size_bytes as u64;
+    let storage = crate::utils::client_storage::ClientStorage::init(crate::utils::path::objects());
+    let report = storage
+        .evict_local(EvictRequest {
+            budget_bytes: budget,
+            min_age_secs: 600,
+            dry_run,
+        })
+        .await
+        .map_err(|error| CliError::fatal(format!("cache eviction failed: {error}")))?;
+    let (removed, message) = match report {
+        None => (
+            0,
+            "no durable tier configured — nothing evictable".to_string(),
+        ),
+        Some(report) => (
+            report.evicted,
+            format!(
+                "evicted {} object(s), {} bytes (skipped: {} absent, {} probe errors, {} recent)",
+                report.evicted,
+                report.reclaimed_bytes,
+                report.skipped_absent,
+                report.skipped_probe_error,
+                report.skipped_recent
+            ),
+        ),
+    };
+    Ok(TaskResult {
+        task: "cache-evict".to_string(),
+        success: true,
+        objects_removed: removed,
+        objects_packed: 0,
+        refs_packed: 0,
+        packs_repacked: 0,
+        message,
+    })
+}
+
 async fn run_gc(
     repo_path: &Path,
     dry_run: bool,
@@ -303,6 +364,24 @@ async fn run_gc(
     output: &OutputConfig,
 ) -> CliResult<TaskResult> {
     let storage = ClientStorage::init(path::objects());
+    // lore.md 2.3 deletion safety: if another repo borrows FROM this store, a
+    // prune could delete an object it still needs (this store's reachability
+    // does not include the borrower's refs). Refuse to prune loose objects
+    // while any live borrower exists — the borrower must `alternates remove`
+    // (or dissociate) first. This makes the base's gc "never delete a
+    // borrowed object" AIRTIGHT.
+    if !dry_run && crate::internal::alternates::has_live_borrowers(&path::objects()) {
+        return Ok(TaskResult {
+            task: "gc".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: 0,
+            refs_packed: 0,
+            packs_repacked: 0,
+            message: "skipped loose-object prune: this store is shared (other repos borrow from                       it via alternates); have borrowers run 'libra alternates remove' first"
+                .to_string(),
+        });
+    }
     let reachable = collect_reachable_objects(&storage).await?;
     let all_loose = list_loose_objects(repo_path)
         .map_err(|e| CliError::fatal(format!("failed to list loose objects: {e}")))?;
@@ -321,10 +400,14 @@ async fn run_gc(
                 }
             } else {
                 if let Err(e) = fs::remove_file(obj_path) {
-                    return Err(CliError::fatal(format!(
-                        "failed to remove unreachable object {}: {e}",
-                        hash_str
-                    )));
+                    // A concurrent cache eviction may have removed it first —
+                    // the goal state (file gone) is reached either way.
+                    if e.kind() != std::io::ErrorKind::NotFound {
+                        return Err(CliError::fatal(format!(
+                            "failed to remove unreachable object {}: {e}",
+                            hash_str
+                        )));
+                    }
                 }
                 removed += 1;
             }
@@ -382,6 +465,15 @@ async fn run_loose_objects(
         });
     }
 
+    // Under a configured durable tier, large (>= threshold) loose objects are
+    // CACHE residents managed by the 2.9 evictor — packing them would move
+    // them into local packs where the evictor never reaches, permanently
+    // defeating the cache budget. Exclude them from packing.
+    let cache_config = crate::utils::client_storage::resolve_cache_config().ok();
+    let large_cache_floor = cache_config
+        .as_ref()
+        .filter(|config| config.tiered)
+        .map(|config| config.threshold_bytes as u64);
     let old_loose: Vec<_> = loose
         .into_iter()
         .filter(|(_, p)| {
@@ -394,6 +486,16 @@ async fn run_loose_objects(
                         .unwrap_or(false)
                 })
                 .unwrap_or(false)
+        })
+        .filter(|(_, p)| match large_cache_floor {
+            // Classify by UNCOMPRESSED size (partial header decode) — the
+            // same signal the evictor and the LRU use; compressed on-disk
+            // size would let highly-compressible large residents slip into
+            // packs (Codex improvement note).
+            Some(floor) => crate::utils::storage::local::LocalStorage::peek_uncompressed_size(p)
+                .map(|size| size < floor)
+                .unwrap_or(true),
+            None => true,
         })
         .collect();
 
@@ -421,40 +523,53 @@ async fn run_loose_objects(
         });
     }
 
-    // Create a new pack file from old loose objects
+    // Encode the old loose objects into one valid pack via the shared writer.
     let pack_dir = repo_path.join("objects").join("pack");
-    if let Err(e) = fs::create_dir_all(&pack_dir) {
-        return Err(CliError::fatal(format!(
-            "failed to create pack directory: {e}"
-        )));
-    }
+    let storage = ClientStorage::init(path::objects());
+    let hashes: Vec<ObjectHash> = old_loose
+        .iter()
+        .filter_map(|(hash_str, _)| parse_object_hash(hash_str))
+        .collect();
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let pack_name = format!("pack-maintenance-{timestamp}");
-    let pack_path = pack_dir.join(&pack_name);
-
-    let packed = match create_pack_from_loose_objects(&old_loose, &pack_path).await {
-        Ok(count) => {
-            let packed = count;
-            // Remove successfully packed loose objects
-            for (hash_str, obj_path) in &old_loose {
-                if let Err(e) = fs::remove_file(obj_path) {
-                    return Err(CliError::fatal(format!(
-                        "failed to remove packed loose object {}: {e}",
-                        hash_str
-                    )));
-                }
+    let pack_path =
+        match pack_writer::write_pack_with_index(&storage, &hashes, &pack_dir, get_hash_kind())
+            .await
+        {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                return Ok(TaskResult {
+                    task: "loose-objects".to_string(),
+                    success: true,
+                    objects_removed: 0,
+                    objects_packed: 0,
+                    refs_packed: 0,
+                    packs_repacked: 0,
+                    message: "no old loose objects to pack".to_string(),
+                });
             }
-            let _ = cleanup_empty_dirs(&path::objects());
-            packed
+            Err(e) => {
+                return Err(CliError::fatal(format!("failed to create pack file: {e}")));
+            }
+        };
+
+    // Remove the loose objects now that they live in the pack.
+    for (hash_str, obj_path) in &old_loose {
+        if let Err(e) = fs::remove_file(obj_path) {
+            // Tolerate a concurrent eviction (the object is already packed).
+            if e.kind() != std::io::ErrorKind::NotFound {
+                return Err(CliError::fatal(format!(
+                    "failed to remove packed loose object {}: {e}",
+                    hash_str
+                )));
+            }
         }
-        Err(e) => {
-            return Err(CliError::fatal(format!("failed to create pack file: {e}")));
-        }
-    };
+    }
+    let _ = cleanup_empty_dirs(&path::objects());
+    let packed = hashes.len();
+    let pack_name = pack_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "the new pack".to_string());
 
     if !quiet {
         info_println(
@@ -640,34 +755,53 @@ async fn run_incremental_repack(
         });
     }
 
-    // For incremental repack, we combine all existing pack files into one new pack.
+    // Consolidate into a single new pack. The set MUST include objects that
+    // currently live only inside the existing packs — `list_all_objects_in_storage`
+    // scans only loose shards, so packing that alone and then deleting the old
+    // packs would drop every packed-only object. `collect_reachable_objects`
+    // walks refs/reflogs/index through storage (which reads the packs too), so
+    // the new pack contains all reachable objects before the old packs go.
     let storage = ClientStorage::init(path::objects());
-    let all_hashes = list_all_objects_in_storage(&storage)
-        .map_err(|e| CliError::fatal(format!("failed to list objects: {e}")))?;
+    let all_hashes: Vec<ObjectHash> = collect_reachable_objects(&storage)
+        .await?
+        .into_iter()
+        .collect();
 
-    let timestamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
-    let new_pack_name = format!("pack-consolidated-{timestamp}");
-    let new_pack_path = pack_dir.join(&new_pack_name);
-
-    let repacked = match create_pack_from_hashes(&all_hashes, &new_pack_path).await {
-        Ok(count) => {
-            // Remove old pack and idx files
-            for old_pack in &packs {
-                let _ = fs::remove_file(old_pack);
-                let idx_path = old_pack.with_extension("idx");
-                let _ = fs::remove_file(idx_path);
+    let new_pack_path =
+        match pack_writer::write_pack_with_index(&storage, &all_hashes, &pack_dir, get_hash_kind())
+            .await
+        {
+            Ok(Some(path)) => path,
+            Ok(None) => {
+                return Ok(TaskResult {
+                    task: "incremental-repack".to_string(),
+                    success: true,
+                    objects_removed: 0,
+                    objects_packed: 0,
+                    refs_packed: 0,
+                    packs_repacked: 0,
+                    message: "no objects to repack".to_string(),
+                });
             }
-            count
-        }
-        Err(e) => {
-            return Err(CliError::fatal(format!(
-                "failed to create consolidated pack: {e}"
-            )));
-        }
-    };
+            Err(e) => {
+                return Err(CliError::fatal(format!(
+                    "failed to create consolidated pack: {e}"
+                )));
+            }
+        };
+
+    // Remove the old packs (their objects now live in the consolidated pack).
+    // `packs` was captured before the new pack was written, so it never names it.
+    for old_pack in &packs {
+        let _ = fs::remove_file(old_pack);
+        let idx_path = old_pack.with_extension("idx");
+        let _ = fs::remove_file(idx_path);
+    }
+    let repacked = all_hashes.len();
+    let new_pack_name = new_pack_path
+        .file_name()
+        .map(|name| name.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "the consolidated pack".to_string());
 
     if !quiet {
         info_println(
@@ -725,16 +859,9 @@ async fn run_commit_graph(
     if commits.is_empty() {
         return Ok(skip("no commits to index; skipped"));
     }
-    if commits.values().any(|c| c.parent_commit_ids.len() > 2) {
-        return Ok(skip(
-            "octopus merges (>2 parents) are not yet supported by the commit-graph writer; skipped",
-        ));
-    }
-    if commits.keys().next().map(ObjectHash::kind) == Some(HashKind::Sha256) {
-        return Ok(skip(
-            "commit-graph for SHA-256 repositories is not yet supported; skipped",
-        ));
-    }
+    // Octopus merges (>2 parents) are written via the EDGE chunk and SHA-256
+    // repositories via the wider OIDs + a SHA-256 header version/trailer, both
+    // handled by `build_commit_graph`.
 
     let count = commits.len();
     if dry_run {
@@ -786,11 +913,18 @@ fn compute_generations(commits: &HashMap<ObjectHash, Commit>) -> HashMap<ObjectH
     generations
 }
 
-/// Encode a v1 commit-graph file (SHA-1, ≤2 parents per commit) with the OIDF,
-/// OIDL, and CDAT chunks and a trailing SHA-1 checksum, matching Git's format.
+/// Encode a v1 commit-graph file with the OIDF, OIDL, and CDAT chunks — plus an
+/// EDGE chunk when any commit has more than two parents (octopus merges) — and a
+/// trailing checksum, matching Git's format. The OID width, header hash version,
+/// and trailer digest follow the repository's hash kind (SHA-1 or SHA-256).
 fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> {
     /// Sentinel parent slot meaning "no parent" (GRAPH_PARENT_NONE).
     const GRAPH_PARENT_NONE: u32 = 0x7000_0000;
+    /// In a CDAT second-parent slot, this high bit means "more than two parents:
+    /// the low 31 bits are an index into the EDGE chunk" (GRAPH_EXTRA_EDGES_NEEDED).
+    const GRAPH_EXTRA_EDGES_NEEDED: u32 = 0x8000_0000;
+    /// In the EDGE chunk, this high bit marks a commit's final extra parent.
+    const GRAPH_LAST_EDGE: u32 = 0x8000_0000;
     if commits.is_empty() {
         return None;
     }
@@ -806,6 +940,42 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
     let n = oids.len();
     let generations = compute_generations(commits);
 
+    // Pre-compute each commit's two CDAT parent slots and, for octopus merges
+    // (>2 parents), the EDGE chunk holding parents 2..N. A commit with >2
+    // parents stores `GRAPH_EXTRA_EDGES_NEEDED | <edge index>` in its second
+    // slot; the EDGE chunk then lists those parents' positions, the last one
+    // OR-ed with `GRAPH_LAST_EDGE`.
+    let mut parent_slots: Vec<(u32, u32)> = Vec::with_capacity(n);
+    let mut edge_data: Vec<u32> = Vec::new();
+    for o in &oids {
+        let parents = &commits[o].parent_commit_ids;
+        let p1 = parents
+            .first()
+            .and_then(|p| pos.get(p))
+            .copied()
+            .unwrap_or(GRAPH_PARENT_NONE);
+        let p2 = if parents.len() <= 2 {
+            parents
+                .get(1)
+                .and_then(|p| pos.get(p))
+                .copied()
+                .unwrap_or(GRAPH_PARENT_NONE)
+        } else {
+            let edge_index = edge_data.len() as u32;
+            let extra = &parents[1..];
+            for (i, par) in extra.iter().enumerate() {
+                let mut slot = pos.get(par).copied().unwrap_or(GRAPH_PARENT_NONE);
+                if i + 1 == extra.len() {
+                    slot |= GRAPH_LAST_EDGE;
+                }
+                edge_data.push(slot);
+            }
+            GRAPH_EXTRA_EDGES_NEEDED | edge_index
+        };
+        parent_slots.push((p1, p2));
+    }
+    let has_edges = !edge_data.is_empty();
+
     // Cumulative OID fanout over the first OID byte.
     let mut fanout = [0u32; 256];
     for o in &oids {
@@ -817,16 +987,33 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
         *slot = acc;
     }
 
-    let toc_len = 4u64 * 12; // OIDF, OIDL, CDAT + terminator
+    // The EDGE chunk (when present) follows CDAT; the chunk count and offsets
+    // grow accordingly.
+    let num_chunks: u8 = if has_edges { 4 } else { 3 };
+    let toc_len = (num_chunks as u64 + 1) * 12; // chunks + terminator entry
     let oidf_off = 8 + toc_len;
     let oidl_off = oidf_off + 1024;
     let cdat_off = oidl_off + (n as u64) * (hash_len as u64);
-    let trailer_off = cdat_off + (n as u64) * (hash_len as u64 + 16);
+    let edge_off = cdat_off + (n as u64) * (hash_len as u64 + 16);
+    let edge_bytes = edge_data.len() as u64 * 4;
+    let trailer_off = if has_edges {
+        edge_off + edge_bytes
+    } else {
+        cdat_off + (n as u64) * (hash_len as u64 + 16)
+    };
+
+    // Hash version: 1 for SHA-1, 2 for SHA-256 (matches the OID width already
+    // used by the OIDL/CDAT chunks via `hash_len`).
+    let hash_version: u8 = if oids[0].kind() == HashKind::Sha256 {
+        2
+    } else {
+        1
+    };
 
     let mut buf: Vec<u8> = Vec::with_capacity(trailer_off as usize + hash_len);
-    // Header: "CGPH", version 1, hash version 1 (SHA-1), 3 chunks, 0 base graphs.
+    // Header: "CGPH", version 1, hash version, N chunks, 0 base graphs.
     buf.extend_from_slice(b"CGPH");
-    buf.extend_from_slice(&[1, 1, 3, 0]);
+    buf.extend_from_slice(&[1, hash_version, num_chunks, 0]);
     // Chunk table of contents.
     buf.extend_from_slice(b"OIDF");
     buf.extend_from_slice(&oidf_off.to_be_bytes());
@@ -834,6 +1021,10 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
     buf.extend_from_slice(&oidl_off.to_be_bytes());
     buf.extend_from_slice(b"CDAT");
     buf.extend_from_slice(&cdat_off.to_be_bytes());
+    if has_edges {
+        buf.extend_from_slice(b"EDGE");
+        buf.extend_from_slice(&edge_off.to_be_bytes());
+    }
     buf.extend_from_slice(&[0u8; 4]);
     buf.extend_from_slice(&trailer_off.to_be_bytes());
     // OIDF.
@@ -845,20 +1036,9 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
         buf.extend_from_slice(o.as_ref());
     }
     // CDAT.
-    for o in &oids {
+    for (o, (p1, p2)) in oids.iter().zip(&parent_slots) {
         let commit = &commits[o];
         buf.extend_from_slice(commit.tree_id.as_ref());
-        let parents = &commit.parent_commit_ids;
-        let p1 = parents
-            .first()
-            .and_then(|p| pos.get(p))
-            .copied()
-            .unwrap_or(GRAPH_PARENT_NONE);
-        let p2 = parents
-            .get(1)
-            .and_then(|p| pos.get(p))
-            .copied()
-            .unwrap_or(GRAPH_PARENT_NONE);
         buf.extend_from_slice(&p1.to_be_bytes());
         buf.extend_from_slice(&p2.to_be_bytes());
         // Last 8 bytes pack generation (top 30 bits) + commit time (34 bits).
@@ -869,8 +1049,18 @@ fn build_commit_graph(commits: &HashMap<ObjectHash, Commit>) -> Option<Vec<u8>> 
         buf.extend_from_slice(&first.to_be_bytes());
         buf.extend_from_slice(&second.to_be_bytes());
     }
-    // Trailer: SHA-1 checksum of everything written so far.
-    let digest = sha1::Sha1::digest(&buf);
+    // EDGE (octopus extra parents), when present.
+    if has_edges {
+        for slot in &edge_data {
+            buf.extend_from_slice(&slot.to_be_bytes());
+        }
+    }
+    // Trailer: checksum of everything written so far, in the repository's hash
+    // algorithm (SHA-1 or SHA-256), matching the OID width used above.
+    let digest: Vec<u8> = match oids[0].kind() {
+        HashKind::Sha256 => sha2::Sha256::digest(&buf).to_vec(),
+        HashKind::Sha1 => sha1::Sha1::digest(&buf).to_vec(),
+    };
     buf.extend_from_slice(&digest);
     Some(buf)
 }
@@ -1215,7 +1405,9 @@ async fn stop(output: &OutputConfig) -> CliResult<()> {
 // ---------------------------------------------------------------------------
 
 /// Collect all reachable objects from refs, index, and reflogs.
-async fn collect_reachable_objects(storage: &ClientStorage) -> CliResult<HashSet<ObjectHash>> {
+pub(crate) async fn collect_reachable_objects(
+    storage: &ClientStorage,
+) -> CliResult<HashSet<ObjectHash>> {
     let mut reachable: HashSet<ObjectHash> = HashSet::new();
     let db_conn = db::get_db_conn_instance().await;
 
@@ -1226,10 +1418,19 @@ async fn collect_reachable_objects(storage: &ClientStorage) -> CliResult<HashSet
         .map_err(|e| CliError::fatal(format!("failed to load refs: {e}")))?;
 
     for ref_entry in refs {
-        if let Some(commit_hash_str) = &ref_entry.commit
-            && let Some(hash) = parse_object_hash(commit_hash_str)
-        {
-            reachable.insert(hash);
+        if let Some(commit_hash_str) = &ref_entry.commit {
+            let hash = parse_object_hash(commit_hash_str).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "reference '{}' contains invalid object id '{}'",
+                    ref_entry.name.as_deref().unwrap_or("<unnamed>"),
+                    commit_hash_str
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            // Do NOT pre-insert `hash`: `walk_reachable` returns early when the
+            // hash is already in the set, so pre-inserting would stop it from
+            // descending into the commit's tree — leaving reachable trees/blobs
+            // looking unreachable (gc could then prune live objects).
             walk_reachable(&hash, storage, &mut reachable)?;
         }
     }
@@ -1242,21 +1443,81 @@ async fn collect_reachable_objects(storage: &ClientStorage) -> CliResult<HashSet
 
     let is_null_oid = |oid: &str| oid.chars().all(|c| c == '0');
     for entry in reflogs {
-        if !is_null_oid(&entry.new_oid)
-            && let Some(hash) = parse_object_hash(&entry.new_oid)
-        {
-            reachable.insert(hash);
+        for (field, oid) in [("old", &entry.old_oid), ("new", &entry.new_oid)] {
+            if is_null_oid(oid) {
+                continue;
+            }
+            let hash = parse_object_hash(oid).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "reflog entry {} contains invalid {field} object id '{}'",
+                    entry.id, oid
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            // As above: let `walk_reachable` perform the insert so it descends
+            // into the commit's tree instead of returning early. Both sides of
+            // every reflog entry are roots: the oldest retained `old_oid` need
+            // not occur as another row's `new_oid`.
             walk_reachable(&hash, storage, &mut reachable)?;
         }
     }
 
-    // Collect from index
+    // Held autostashes deliberately do not enter refs/stash while a merge or
+    // rebase is in progress. Their fsynced sidecars are therefore first-class
+    // GC roots; omitting them can irreversibly delete the user's dirty state.
+    let merge_autostash = crate::command::merge::MergeAutostash::load_optional_sync()
+        .map_err(|error| {
+            CliError::fatal(format!("failed to load merge autostash GC root: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+        .map(|held| {
+            parse_object_hash(&held.stash_commit).ok_or_else(|| {
+                CliError::fatal(format!(
+                    "merge-autostash.json contains invalid object id '{}'",
+                    held.stash_commit
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })
+        })
+        .transpose()?;
+    let rebase_autostash = crate::command::rebase::held_autostash_oid()?;
+    for held in [merge_autostash, rebase_autostash].into_iter().flatten() {
+        walk_reachable(&held, storage, &mut reachable)?;
+    }
+
+    // Ordinary stashes are file-backed rather than SQLite reference rows, and
+    // older entries live only in logs/refs/stash. Trace the full reflog, not
+    // just refs/stash, so stash@{1} and later remain recoverable.
+    let stash_roots = crate::command::stash::gc_roots().map_err(|error| {
+        CliError::fatal(format!("failed to load stash GC roots: {error}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    for oid in stash_roots {
+        walk_reachable(&oid, storage, &mut reachable)?;
+    }
+
+    // Collect from index — every stage, not just stage 0, so a blob referenced
+    // only by an unmerged conflict stage (1/2/3) is not treated as garbage.
     let index_path = path::index();
-    if index_path.exists()
-        && let Ok(index) = git_internal::internal::index::Index::load(&index_path)
-    {
-        for entry in index.tracked_entries(0) {
-            reachable.insert(entry.hash);
+    let index_exists = index_path.try_exists().map_err(|error| {
+        CliError::fatal(format!(
+            "failed to inspect index GC root '{}': {error}",
+            index_path.display()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+    })?;
+    if index_exists {
+        let index = git_internal::internal::index::Index::load(&index_path).map_err(|error| {
+            CliError::fatal(format!(
+                "failed to read index GC root '{}': {error}",
+                index_path.display()
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        for stage in 0..=3 {
+            for entry in index.tracked_entries(stage) {
+                reachable.insert(entry.hash);
+            }
         }
     }
 
@@ -1273,34 +1534,60 @@ fn walk_reachable(
         return Ok(()); // Already visited
     }
 
-    let Ok(obj_type) = storage.get_object_type(hash) else {
-        return Ok(());
-    };
+    let obj_type = storage.get_object_type(hash).map_err(|error| {
+        CliError::fatal(format!(
+            "reachable object {hash} cannot be read while computing GC roots: {error}"
+        ))
+        .with_stable_code(StableErrorCode::RepoCorrupt)
+    })?;
 
     match obj_type {
         ObjectType::Commit => {
-            if let Ok(commit) = load_object::<Commit>(hash) {
-                walk_reachable(&commit.tree_id, storage, reachable)?;
-                for parent in &commit.parent_commit_ids {
-                    walk_reachable(parent, storage, reachable)?;
-                }
+            let commit = load_object::<Commit>(hash).map_err(|error| {
+                CliError::fatal(format!(
+                    "reachable commit {hash} is corrupt while computing GC roots: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&commit.tree_id, storage, reachable)?;
+            for parent in &commit.parent_commit_ids {
+                walk_reachable(parent, storage, reachable)?;
             }
         }
         ObjectType::Tree => {
-            if let Ok(tree) = load_object::<Tree>(hash) {
-                for item in &tree.tree_items {
-                    walk_reachable(&item.id, storage, reachable)?;
-                }
+            let tree = load_object::<Tree>(hash).map_err(|error| {
+                CliError::fatal(format!(
+                    "reachable tree {hash} is corrupt while computing GC roots: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            for item in &tree.tree_items {
+                walk_reachable(&item.id, storage, reachable)?;
             }
         }
-        _ => {}
+        ObjectType::Tag => {
+            let tag = load_object::<GitTag>(hash).map_err(|error| {
+                CliError::fatal(format!(
+                    "reachable tag {hash} is corrupt while computing GC roots: {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })?;
+            walk_reachable(&tag.object_hash, storage, reachable)?;
+        }
+        ObjectType::Blob => {}
+        other => {
+            return Err(CliError::fatal(format!(
+                "reachable object {hash} has unsupported stored type {other:?}"
+            ))
+            .with_stable_code(StableErrorCode::RepoCorrupt));
+        }
     }
 
     Ok(())
 }
 
 /// List all loose objects in the repository, returning (hash, path) pairs.
-fn list_loose_objects(repo_path: &Path) -> io::Result<Vec<(String, PathBuf)>> {
+pub(crate) fn list_loose_objects(repo_path: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     let objects_dir = repo_path.join("objects");
     let mut result = Vec::new();
 
@@ -1333,49 +1620,19 @@ fn list_loose_objects(repo_path: &Path) -> io::Result<Vec<(String, PathBuf)>> {
     Ok(result)
 }
 
-/// List all objects in storage (both loose and packed).
-fn list_all_objects_in_storage(storage: &ClientStorage) -> io::Result<Vec<ObjectHash>> {
-    let objects_dir = storage.base_path();
-    let mut hashes = Vec::new();
-
-    for entry in fs::read_dir(objects_dir)? {
-        let entry = entry?;
-        let path = entry.path();
-        if !path.is_dir() {
-            continue;
-        }
-        let Some(dir_name) = path.file_name().and_then(|n| n.to_str()) else {
-            continue;
-        };
-        if dir_name.len() != 2 {
-            continue;
-        }
-
-        for sub in fs::read_dir(&path)? {
-            let sub = sub?;
-            let sub_path = sub.path();
-            if sub_path.is_file() {
-                let Some(file_name) = sub_path.file_name().and_then(|n| n.to_str()) else {
-                    continue;
-                };
-                let full_hash = format!("{dir_name}{file_name}");
-                if let Some(hash) = parse_object_hash(&full_hash) {
-                    hashes.push(hash);
-                }
-            }
-        }
-    }
-
-    Ok(hashes)
-}
-
 /// Parse a hex string into an ObjectHash.
-fn parse_object_hash(hex_str: &str) -> Option<ObjectHash> {
+///
+/// The hash kind is inferred from the decoded byte length (20 → SHA-1, 32 →
+/// SHA-256) rather than from `ObjectHash::from_bytes`, which reads the
+/// thread-local hash kind and would reject a SHA-256 id (or misread it) if this
+/// runs on a Tokio worker thread that never had the repository's kind set.
+pub(crate) fn parse_object_hash(hex_str: &str) -> Option<ObjectHash> {
     let bytes = hex::decode(hex_str).ok()?;
-    if bytes.is_empty() {
-        return None;
+    match bytes.len() {
+        20 => Some(ObjectHash::Sha1(bytes.try_into().ok()?)),
+        32 => Some(ObjectHash::Sha256(bytes.try_into().ok()?)),
+        _ => None,
     }
-    ObjectHash::from_bytes(&bytes).ok()
 }
 
 /// Remove empty directories under the given path.
@@ -1436,203 +1693,6 @@ fn remove_packed_refs(base: &Path, current: &Path, count: &mut usize) -> io::Res
     Ok(())
 }
 
-/// Create a pack file from loose objects. Returns the number of objects packed.
-///
-/// This is a simplified pack creation that writes each object as an undeltified
-/// entry. A production implementation would use delta compression.
-async fn create_pack_from_loose_objects(
-    objects: &[(String, PathBuf)],
-    pack_path: &Path,
-) -> io::Result<usize> {
-    let pack_file = fs::File::create(pack_path)?;
-    let mut writer = io::BufWriter::new(pack_file);
-
-    // Write pack header: "PACK" + version(2) + object count
-    writer.write_all(b"PACK")?;
-    writer.write_all(&2_u32.to_be_bytes())?;
-    writer.write_all(&(objects.len() as u32).to_be_bytes())?;
-
-    let mut hasher = sha1::Sha1::new();
-    hasher.update(b"PACK");
-    hasher.update(2_u32.to_be_bytes());
-    hasher.update((objects.len() as u32).to_be_bytes());
-
-    for (hash_str, obj_path) in objects {
-        let data = fs::read(obj_path)?;
-        let decompressed = ClientStorage::decompress_zlib(&data)?;
-
-        // Parse header to get type and size
-        let (otype, _size) = parse_loose_object_header(&decompressed)?;
-        let header_end = decompressed.iter().position(|&b| b == 0).unwrap_or(0);
-        let body = &decompressed[header_end + 1..];
-
-        // Write object entry header (size-encoded)
-        let type_num = match otype {
-            ObjectType::Commit => 1,
-            ObjectType::Tree => 2,
-            ObjectType::Blob => 3,
-            ObjectType::Tag => 4,
-            _ => 0,
-        };
-        write_size_encoded(&mut writer, body.len(), type_num)?;
-
-        // Write deflated body
-        let compressed = ClientStorage::compress_zlib(body)?;
-        writer.write_all(&compressed)?;
-
-        // Update hash
-        let mut entry_hasher = sha1::Sha1::new();
-        let header = format!("{} {}\0", otype, body.len());
-        entry_hasher.update(header.as_bytes());
-        entry_hasher.update(body);
-        let entry_hash = entry_hasher.finalize();
-        hasher.update(entry_hash);
-
-        let _ = hash_str; // hash_str used for iteration but not needed for pack format
-    }
-
-    // Write trailing hash
-    let final_hash = hasher.finalize();
-    writer.write_all(&final_hash)?;
-    writer.flush()?;
-
-    // Create index file
-    build_index_for_pack(pack_path, objects.len()).await?;
-
-    Ok(objects.len())
-}
-
-/// Create a pack file from a list of object hashes.
-async fn create_pack_from_hashes(hashes: &[ObjectHash], pack_path: &Path) -> io::Result<usize> {
-    let storage = ClientStorage::init(path::objects());
-    let mut objects = Vec::with_capacity(hashes.len());
-
-    for hash in hashes {
-        let hash_str = hash.to_string();
-        let data = match storage.get(hash) {
-            Ok(d) => d,
-            Err(_) => continue,
-        };
-        objects.push((hash_str, data));
-    }
-
-    let pack_file = fs::File::create(pack_path)?;
-    let mut writer = io::BufWriter::new(pack_file);
-
-    writer.write_all(b"PACK")?;
-    writer.write_all(&2_u32.to_be_bytes())?;
-    writer.write_all(&(objects.len() as u32).to_be_bytes())?;
-
-    let mut hasher = sha1::Sha1::new();
-    hasher.update(b"PACK");
-    hasher.update(2_u32.to_be_bytes());
-    hasher.update((objects.len() as u32).to_be_bytes());
-
-    for (hash_str, data) in &objects {
-        let obj_type =
-            match storage.get_object_type(&parse_object_hash(hash_str).unwrap_or_default()) {
-                Ok(t) => t,
-                Err(_) => ObjectType::Blob,
-            };
-
-        let body = data.clone();
-        let type_num = match obj_type {
-            ObjectType::Commit => 1,
-            ObjectType::Tree => 2,
-            ObjectType::Blob => 3,
-            ObjectType::Tag => 4,
-            _ => 0,
-        };
-
-        write_size_encoded(&mut writer, body.len(), type_num)?;
-        let compressed = ClientStorage::compress_zlib(&body)?;
-        writer.write_all(&compressed)?;
-
-        let mut entry_hasher = sha1::Sha1::new();
-        let header = format!("{} {}\0", obj_type, body.len());
-        entry_hasher.update(header.as_bytes());
-        entry_hasher.update(&body);
-        let entry_hash = entry_hasher.finalize();
-        hasher.update(entry_hash);
-    }
-
-    let final_hash = hasher.finalize();
-    writer.write_all(&final_hash)?;
-    writer.flush()?;
-
-    build_index_for_pack(pack_path, objects.len()).await?;
-
-    Ok(objects.len())
-}
-
-/// Parse the header of a decompressed loose object, returning (type, size).
-fn parse_loose_object_header(data: &[u8]) -> io::Result<(ObjectType, usize)> {
-    let header_end = data.iter().position(|&b| b == 0).unwrap_or(0);
-    let header = std::str::from_utf8(&data[..header_end])
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let Some((type_str, size_str)) = header.split_once(' ') else {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "invalid loose object header",
-        ));
-    };
-    let size = size_str
-        .parse::<usize>()
-        .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-    let obj_type = match type_str {
-        "commit" => ObjectType::Commit,
-        "tree" => ObjectType::Tree,
-        "blob" => ObjectType::Blob,
-        "tag" => ObjectType::Tag,
-        _ => {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("unknown object type: {type_str}"),
-            ));
-        }
-    };
-    Ok((obj_type, size))
-}
-
-/// Write a size-encoded integer as used in pack file object headers.
-fn write_size_encoded<W: Write>(writer: &mut W, size: usize, type_num: u8) -> io::Result<()> {
-    let mut byte = (type_num & 0x7) << 4;
-    let mut remaining = size;
-    byte |= (remaining & 0x0F) as u8;
-    remaining >>= 4;
-    while remaining > 0 {
-        writer.write_all(&[byte | 0x80])?;
-        byte = (remaining & 0x7F) as u8;
-        remaining >>= 7;
-    }
-    writer.write_all(&[byte])?;
-    Ok(())
-}
-
-/// Build a minimal version-1 index file for a pack.
-async fn build_index_for_pack(pack_path: &Path, object_count: usize) -> io::Result<()> {
-    let idx_path = pack_path.with_extension("idx");
-    let mut file = fs::File::create(idx_path)?;
-
-    // Version 1 index: 256 fanout entries + object_count * (20 bytes hash + 4 bytes offset)
-    // This is a minimal implementation that stores objects in insertion order.
-    let mut fanout = vec![0u32; 256];
-    for item in fanout.iter_mut() {
-        *item = object_count as u32;
-    }
-    for value in fanout {
-        file.write_all(&value.to_be_bytes())?;
-    }
-
-    // For a minimal index we don't store actual hash-to-offset mappings.
-    // A real implementation would parse the pack and build the full index.
-    // This is sufficient for Libra's storage layer to recognize the pack exists.
-    let _ = object_count;
-
-    file.flush()?;
-    Ok(())
-}
-
 /// Print an informational message unless output is quiet or JSON mode.
 fn info_println(output: &OutputConfig, message: &str) {
     if !output.quiet && !output.is_json() {
@@ -1682,47 +1742,11 @@ mod tests {
     }
 
     #[test]
-    fn test_size_encoding_basic() {
-        let mut buf = Vec::new();
-        write_size_encoded(&mut buf, 10, 1).unwrap();
-        assert!(!buf.is_empty());
-    }
-
-    #[test]
-    fn test_size_encoding_large() {
-        let mut buf = Vec::new();
-        write_size_encoded(&mut buf, 10000, 2).unwrap();
-        assert!(!buf.is_empty());
-    }
-
-    #[test]
     fn test_cleanup_empty_dirs_nonexistent() {
         // Should not panic on non-existent directory
         let temp = tempfile::tempdir().unwrap();
         let result = cleanup_empty_dirs(temp.path());
         assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_parse_loose_object_header_commit() {
-        let data = b"commit 123\0content";
-        let (obj_type, size) = parse_loose_object_header(data).unwrap();
-        assert_eq!(obj_type, ObjectType::Commit);
-        assert_eq!(size, 123);
-    }
-
-    #[test]
-    fn test_parse_loose_object_header_tree() {
-        let data = b"tree 456\0content";
-        let (obj_type, size) = parse_loose_object_header(data).unwrap();
-        assert_eq!(obj_type, ObjectType::Tree);
-        assert_eq!(size, 456);
-    }
-
-    #[test]
-    fn test_parse_loose_object_header_invalid() {
-        let data = b"invalid";
-        assert!(parse_loose_object_header(data).is_err());
     }
 
     #[test]
@@ -1844,5 +1868,145 @@ mod tests {
                 assert_eq!(genhi >> 2, 1, "root generation is 1");
             }
         }
+    }
+
+    #[test]
+    fn commit_graph_build_writes_octopus_edge_chunk() {
+        use std::str::FromStr;
+
+        use git_internal::internal::object::signature::Signature;
+
+        git_internal::hash::set_hash_kind(HashKind::Sha1);
+
+        let tree = ObjectHash::from_str("2222222222222222222222222222222222222222").unwrap();
+        let sig =
+            Signature::from_data(b"committer t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
+        // Three distinct roots (distinct messages → distinct ids) and a merge
+        // that has all three as parents (an octopus merge, >2 parents).
+        let p1 = Commit::new(sig.clone(), sig.clone(), tree, vec![], "p1");
+        let p2 = Commit::new(sig.clone(), sig.clone(), tree, vec![], "p2");
+        let p3 = Commit::new(sig.clone(), sig.clone(), tree, vec![], "p3");
+        let (p1id, p2id, p3id) = (p1.id, p2.id, p3.id);
+        let merge = Commit::new(
+            sig.clone(),
+            sig.clone(),
+            tree,
+            vec![p1id, p2id, p3id],
+            "octopus",
+        );
+        let merge_id = merge.id;
+
+        let mut commits = HashMap::new();
+        for c in [p1, p2, p3, merge] {
+            commits.insert(c.id, c);
+        }
+        let bytes = build_commit_graph(&commits).expect("commit-graph bytes");
+
+        // Octopus merges add the EDGE chunk, so the header now has 4 chunks.
+        assert_eq!(&bytes[0..4], b"CGPH");
+        assert_eq!(&bytes[4..8], &[1, 1, 4, 0]);
+
+        // The TOC (after the 8-byte header) lists OIDF/OIDL/CDAT/EDGE; read the
+        // CDAT and EDGE offsets from it.
+        let chunk_off = |id: &[u8; 4]| -> usize {
+            let mut i = 8;
+            loop {
+                let tag = &bytes[i..i + 4];
+                let off = u64::from_be_bytes(bytes[i + 4..i + 12].try_into().unwrap()) as usize;
+                if tag == id {
+                    return off;
+                }
+                assert_ne!(tag, &[0, 0, 0, 0], "chunk {id:?} present");
+                i += 12;
+            }
+        };
+        let cdat_off = chunk_off(b"CDAT");
+        let edge_off = chunk_off(b"EDGE");
+
+        let mut oids: Vec<ObjectHash> = commits.keys().copied().collect();
+        oids.sort_by(|a, b| a.as_ref().cmp(b.as_ref()));
+        let position = |id: &ObjectHash| oids.iter().position(|o| o == id).unwrap() as u32;
+        let merge_idx = oids.iter().position(|o| *o == merge_id).unwrap();
+
+        // The merge's CDAT entry: first parent is p1's position; the second slot
+        // has the EXTRA_EDGES_NEEDED high bit set, with an index into EDGE.
+        let stride = 20 + 16;
+        let base = cdat_off + merge_idx * stride;
+        let mp1 = u32::from_be_bytes(bytes[base + 20..base + 24].try_into().unwrap());
+        let mp2 = u32::from_be_bytes(bytes[base + 24..base + 28].try_into().unwrap());
+        assert_eq!(mp1, position(&p1id), "octopus first parent is p1");
+        assert_eq!(mp2 & 0x8000_0000, 0x8000_0000, "EXTRA_EDGES_NEEDED bit set");
+        let edge_index = (mp2 & 0x7fff_ffff) as usize;
+
+        // The EDGE chunk holds parents 2..N (p2, p3); the last entry has the
+        // GRAPH_LAST_EDGE high bit set.
+        let e0 = u32::from_be_bytes(
+            bytes[edge_off + edge_index * 4..edge_off + edge_index * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        let e1 = u32::from_be_bytes(
+            bytes[edge_off + (edge_index + 1) * 4..edge_off + (edge_index + 1) * 4 + 4]
+                .try_into()
+                .unwrap(),
+        );
+        assert_eq!(
+            e0,
+            position(&p2id),
+            "first extra edge is p2 (no terminator)"
+        );
+        assert_eq!(e1 & 0x7fff_ffff, position(&p3id), "second extra edge is p3");
+        assert_eq!(e1 & 0x8000_0000, 0x8000_0000, "last extra edge terminated");
+
+        // Trailer still covers the whole body including the EDGE chunk.
+        let body = &bytes[..bytes.len() - 20];
+        assert_eq!(&sha1::Sha1::digest(body)[..], &bytes[bytes.len() - 20..]);
+    }
+
+    #[test]
+    fn commit_graph_build_handles_sha256_repository() {
+        use git_internal::internal::object::signature::Signature;
+
+        let sig =
+            Signature::from_data(b"committer t <t@example.com> 1000000000 +0000".to_vec()).unwrap();
+        // Craft SHA-256 OIDs directly (overriding the ids/tree/parents) so the
+        // graph is built for a SHA-256 repository without touching the global
+        // hash kind — `build_commit_graph` keys everything off the OID width and
+        // kind, not the process-wide setting.
+        let sha256 = |b: u8| ObjectHash::Sha256([b; 32]);
+        let mut root = Commit::new(sig.clone(), sig.clone(), sha256(0x10), vec![], "root");
+        root.id = sha256(0xA1);
+        let mut child = Commit::new(
+            sig.clone(),
+            sig.clone(),
+            sha256(0x11),
+            vec![root.id],
+            "child",
+        );
+        child.id = sha256(0xB2);
+
+        let mut commits = HashMap::new();
+        commits.insert(root.id, root);
+        commits.insert(child.id, child);
+        let bytes = build_commit_graph(&commits).expect("commit-graph bytes");
+
+        // Header hash version is 2 (SHA-256); chunk count is 3 (no octopus).
+        assert_eq!(&bytes[0..4], b"CGPH");
+        assert_eq!(&bytes[4..8], &[1, 2, 3, 0]);
+
+        // OIDL stores 32-byte object ids; the OIDF chunk follows the header+TOC.
+        let oidf_off = u64::from_be_bytes(bytes[12..20].try_into().unwrap()) as usize;
+        let oidl_off = u64::from_be_bytes(bytes[24..32].try_into().unwrap()) as usize;
+        assert_eq!(
+            oidl_off - (oidf_off + 1024),
+            0,
+            "OIDL right after OIDF+fanout"
+        );
+        let cdat_off = u64::from_be_bytes(bytes[36..44].try_into().unwrap()) as usize;
+        assert_eq!(cdat_off - oidl_off, 2 * 32, "two 32-byte OIDs in OIDL");
+
+        // Trailer is the SHA-256 of the body (32 bytes), not SHA-1.
+        let body = &bytes[..bytes.len() - 32];
+        assert_eq!(&sha2::Sha256::digest(body)[..], &bytes[bytes.len() - 32..]);
     }
 }

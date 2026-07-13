@@ -1,7 +1,7 @@
 //! Stages changes for the next commit (`libra add`).
 //!
 //! Implements the `add` subcommand: parses pathspecs and mode flags, applies
-//! ignore policy (`.libraignore`), classifies each path against the working
+//! ignore policy, classifies each path against the working
 //! tree and the on-disk index, writes new blob objects under the repository's
 //! object storage, and finally persists the updated index.
 //!
@@ -35,14 +35,18 @@ use git_internal::{
 use serde::Serialize;
 
 use crate::{
-    command::status::{self, Changes},
+    command::{
+        read_worktree_blob_bytes,
+        status::{self, Changes},
+    },
     internal::ai::automation::{VCS_EVENT_POST_ADD, dispatch_current_repo_vcs_event_to_history},
     utils::{
         error::{CliError, CliResult, StableErrorCode},
-        lfs,
         object_ext::BlobExt,
         output::{self, OutputConfig},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -112,6 +116,23 @@ pub struct AddArgs {
     /// Use NUL as the pathspec separator when reading from --pathspec-from-file.
     #[clap(long = "pathspec-file-nul", requires = "pathspec_from_file")]
     pub pathspec_file_nul: bool,
+
+    /// Override the executable bit recorded in the index for the matched paths:
+    /// `+x` makes them executable (mode `100755`), `-x` clears it (`100644`).
+    /// Mirrors Git's `add --chmod=(+|-)x`.
+    #[clap(long = "chmod", value_name = "(+|-)x")]
+    pub chmod: Option<String>,
+
+    /// Re-stage tracked files from scratch, rewriting their blobs even when the
+    /// content is unchanged (Git's `--renormalize`). Implies `-u`: only tracked
+    /// files are processed, never untracked ones.
+    #[clap(long)]
+    pub renormalize: bool,
+
+    /// Under `--dry-run`, silently skip pathspecs that match no file instead of
+    /// failing. Mirrors Git's `add --ignore-missing`, which requires `--dry-run`.
+    #[clap(long = "ignore-missing", requires = "dry_run")]
+    pub ignore_missing: bool,
 }
 
 /// Domain error for `libra add`.
@@ -126,6 +147,14 @@ pub enum AddError {
     /// [`StableErrorCode::RepoNotFound`].
     #[error("not a libra repository (or any of the parent directories): .libra")]
     NotInRepo,
+    /// The `lfs.lockEnforce` gate refused the operation (lore.md 2.8); the
+    /// carried [`CliError`] already has its stable code and hints.
+    #[error("{0}")]
+    LockPolicy(CliError),
+    /// A layer-owned overlay path was requested for staging (lore.md 2.4).
+    /// Layers are purely local and must never enter a commit.
+    #[error("'{path}' is a layer overlay path and cannot be staged ({count} such path(s))")]
+    LayerPath { path: String, count: usize },
     /// A user-supplied pathspec matched neither tracked files, working-tree
     /// changes, nor an ignored entry — typically a typo. Mapped to
     /// [`StableErrorCode::CliInvalidTarget`].
@@ -163,11 +192,18 @@ pub enum AddError {
     /// [`status::StatusError`] is preserved as a source.
     #[error("failed to inspect repository status: {source}")]
     Status { source: status::StatusError },
+    /// The shared Git-style pathspec parser rejected the user input.
+    #[error("{source}")]
+    Pathspec { source: PathspecError },
 }
 
 impl From<AddError> for CliError {
     fn from(error: AddError) -> Self {
         match &error {
+            AddError::LockPolicy(inner) => inner.clone(),
+            AddError::LayerPath { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::LayerConflict)
+                .with_hint("layer overlays are local-only; 'libra layer unapply' to remove them"),
             AddError::NotInRepo => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoNotFound)
                 .with_hint("run 'libra init' to create a repository"),
@@ -205,6 +241,9 @@ impl From<AddError> for CliError {
             AddError::Status { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoCorrupt)
                 .with_hint("failed to compute working tree status"),
+            AddError::Pathspec { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidTarget)
+                .with_hint("use supported pathspec magic: top, exclude, icase, literal, glob"),
         }
     }
 }
@@ -236,10 +275,15 @@ pub struct AddOutput {
     pub removed: Vec<String>,
     /// Files whose metadata was refreshed (--refresh mode)
     pub refreshed: Vec<String>,
-    /// Paths ignored by .libraignore (only when pathspec matches ignored files)
+    /// Paths ignored by configured ignore sources (only when pathspec matches ignored files)
     pub ignored: Vec<String>,
     /// Paths that failed under --ignore-errors
     pub failed: Vec<AddFailure>,
+    /// Pathspecs skipped under `--ignore-missing` (dry-run only). Surfaced as
+    /// stderr warnings in text mode and as a machine-readable list in the JSON
+    /// payload so agent callers can see what was skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub missing: Vec<String>,
     /// Whether this was a dry-run (no actual changes made)
     pub dry_run: bool,
 }
@@ -255,6 +299,7 @@ impl AddOutput {
             refreshed: Vec::new(),
             ignored: Vec::new(),
             failed: Vec::new(),
+            missing: Vec::new(),
             dry_run,
         }
     }
@@ -299,11 +344,21 @@ enum StagedAction {
 
 /// Result of [`validate_pathspecs`]: the canonicalised set of pathspecs that
 /// should drive staging, plus any pathspecs that only matched
-/// `.libraignore`d entries (reported as warnings).
-#[derive(Default)]
+/// ignored entries (reported as warnings).
 struct ValidatedPathspecs {
-    files: Vec<PathBuf>,
+    pathspecs: PathspecSet,
     ignored: Vec<String>,
+    /// Pathspecs skipped under `--ignore-missing` because they matched no add
+    /// candidate (dry-run only). Reported as stderr warnings and the JSON
+    /// payload.
+    missing: Vec<String>,
+}
+
+#[derive(Clone, Copy)]
+struct PathspecMatchContext<'a> {
+    workdir: &'a Path,
+    current_dir: &'a Path,
+    ignore_case: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,8 +437,8 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
     // --- Render output ---
     render_add_output(&result, output, verbose, dry_run)?;
 
-    // --- Warning tracking for ignored / partial failures ---
-    if !result.ignored.is_empty() || !result.failed.is_empty() {
+    // --- Warning tracking for ignored / partial failures / skipped pathspecs ---
+    if !result.ignored.is_empty() || !result.failed.is_empty() || !result.missing.is_empty() {
         output::record_warning();
     }
     if result.wrote_index() {
@@ -419,6 +474,9 @@ pub async fn execute_safe(mut args: AddArgs, output: &OutputConfig) -> CliResult
 /// See: tests::test_add_all_flag in tests/command/add_test.rs:100;
 /// tests::test_add_force_tracks_ignored_file in tests/command/add_test.rs:319.
 pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
+    // lore.md 2.4: load the layer-overlay exclusion snapshot so the sync
+    // ignore resolver skips layer-owned paths (a no-op with no layers).
+    crate::internal::layer::refresh_exclusion_snapshot().await;
     let workdir = util::try_working_dir().map_err(|source| {
         if source.kind() == io::ErrorKind::NotFound {
             AddError::NotInRepo
@@ -441,28 +499,43 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         }
     })?;
 
-    // Resolve pathspecs
-    let requested_paths: Vec<PathBuf> = if args.pathspec.is_empty() {
-        if !args.all && !args.update && !args.refresh {
-            return Err(CliError::command_usage("nothing specified, nothing added")
-                .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint("maybe you wanted to say 'libra add .'?"));
-        }
-        vec![workdir.clone()]
-    } else {
-        args.pathspec.iter().map(PathBuf::from).collect()
+    // `--chmod=(+|-)x` -> the index mode to force on the matched regular files.
+    // Validated up front so an invalid value fails before any staging work.
+    let chmod_mode = match args.chmod.as_deref() {
+        Some(value) => Some(parse_chmod(value)?),
+        None => None,
     };
+
+    // Resolve pathspecs. `--renormalize` implies `-u` (tracked-only), so it also
+    // permits an empty pathspec (operate on the whole tracked set).
+    if args.pathspec.is_empty() && !args.all && !args.update && !args.refresh && !args.renormalize {
+        return Err(CliError::command_usage("nothing specified, nothing added")
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("maybe you wanted to say 'libra add .'?"));
+    }
 
     let mut index = Index::load(&index_path).map_err(|source| AddError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
     let current_dir = env::current_dir().map_err(|source| AddError::Workdir { source })?;
+    let ignore_case = crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+    let pathspec_ctx = PathspecMatchContext {
+        workdir: &workdir,
+        current_dir: &current_dir,
+        ignore_case,
+    };
 
     let (mut visible_changes, mut ignored_changes) = if args.force {
-        status::changes_to_be_staged_split_force().map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+            .map_err(|source| AddError::Status { source })?
     } else {
-        status::changes_to_be_staged_split_safe().map_err(|source| AddError::Status { source })?
+        status::changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
+            .map_err(|source| AddError::Status { source })?
     };
     if args.force {
         visible_changes.extend(ignored_changes.clone());
@@ -471,12 +544,11 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 
     let validated = validate_pathspecs(
         &args.pathspec,
-        &requested_paths,
-        &workdir,
-        &current_dir,
+        pathspec_ctx,
         &visible_changes,
         &ignored_changes,
         &index,
+        args.ignore_missing,
     )?;
 
     let mut add_output = AddOutput::empty(args.dry_run);
@@ -488,15 +560,13 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         sorted_ignored.dedup();
         add_output.ignored = sorted_ignored;
     }
+    // Pathspecs skipped by `--ignore-missing` are surfaced as stderr warnings.
+    add_output.missing = validated.missing.clone();
 
     // --- Refresh mode ---
     if args.refresh {
-        let tracked_modified = filter_refresh_candidates(
-            &visible_changes.modified,
-            &validated.files,
-            &workdir,
-            &current_dir,
-        );
+        let tracked_modified =
+            filter_refresh_candidates(&visible_changes.modified, &validated.pathspecs);
         if args.dry_run {
             add_output.refreshed = tracked_modified
                 .iter()
@@ -517,21 +587,88 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
     }
 
     // --- Normal add mode ---
-    let mut files = visible_changes.modified;
-    files.extend(visible_changes.deleted);
-    if !args.update {
-        files.extend(visible_changes.new);
-    }
-    files = filter_candidates(&files, &validated.files, &workdir, &current_dir);
+    // `--renormalize` operates on the tracked set (implies `-u`) and force-rewrites
+    // each matched blob; the regular path collects working-tree changes.
+    let mut files = if args.renormalize {
+        filter_candidates(&index.tracked_files(), &validated.pathspecs)
+    } else {
+        let mut f = visible_changes.modified;
+        f.extend(visible_changes.deleted);
+        if !args.update {
+            f.extend(visible_changes.new);
+        }
+        filter_candidates(&f, &validated.pathspecs)
+    };
     filter_out_current_executable(&mut files);
     files.sort();
     files.dedup();
 
+    // Layer never-enters-commit guard (lore.md 2.4): a layer-owned overlay
+    // path must NEVER be staged, EVEN under --force (which bypasses ignore
+    // filtering — the ignore-exclusion chokepoint alone is not airtight).
+    // Under Respect, layer paths are already ignore-excluded so `files` is
+    // empty of them (this loop is a no-op — zero overhead with no layers).
+    {
+        // Fail-CLOSED (Codex P1): a real DB read failure here must NOT allow
+        // staging (the invariant is never-enters-commit). `materialized_paths`
+        // is absence-tolerant for a missing table (fresh repo) but propagates
+        // any other error.
+        let owned: std::collections::HashSet<String> =
+            crate::internal::layer::LayerStore::materialized_paths()
+                .await
+                .map_err(|e| {
+                    CliError::fatal(format!(
+                        "cannot verify layer-owned paths before staging: {e}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .into_iter()
+                .map(|p| p.path)
+                .collect();
+        if !owned.is_empty() {
+            let blocked: Vec<String> = files
+                .iter()
+                .filter_map(|file| crate::internal::layer::normalize_key(file))
+                .filter(|key| owned.contains(key))
+                .collect();
+            if let Some(first) = blocked.first() {
+                return Err(CliError::from(AddError::LayerPath {
+                    path: first.clone(),
+                    count: blocked.len(),
+                }));
+            }
+        }
+    }
+
+    // `lfs.lockEnforce` gate (lore.md 2.8): before ANY blob/index write, and
+    // never on --dry-run (previews must not touch the network). `--refresh`
+    // returned above (stat-only rewrite — no content change to gate).
+    if !args.dry_run {
+        let candidates: Vec<String> = files
+            .iter()
+            .map(|file| file.display().to_string())
+            .collect();
+        crate::command::lfs::enforce_lock_policy(&candidates)
+            .await
+            .map_err(AddError::LockPolicy)?;
+    }
+
     if args.dry_run {
-        // Classify files for dry-run preview
+        // Classify files for dry-run preview.
         for file in &files {
-            let status = check_file_status(file, &index, &workdir)?;
             let path_str = file.display().to_string();
+            if args.renormalize {
+                // Mirror `renormalize_entry` exactly (via `symlink_metadata`, which
+                // does not follow links): gone -> staged deletion, directory ->
+                // skipped, regular file or symlink -> force-rewritten (modified).
+                match std::fs::symlink_metadata(workdir.join(file)) {
+                    Err(_) => add_output.removed.push(path_str),
+                    Ok(meta) if meta.is_dir() => {}
+                    Ok(_) => add_output.modified.push(path_str),
+                }
+                continue;
+            }
+            let status = check_file_status(file, &index, &workdir)?;
             match status {
                 FileStatus::New => add_output.added.push(path_str),
                 FileStatus::Modified => add_output.modified.push(path_str),
@@ -539,12 +676,101 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
                 FileStatus::Unchanged | FileStatus::NotFound => {}
             }
         }
+        if let Some(target_mode) = chmod_mode {
+            apply_chmod(
+                &mut index,
+                target_mode,
+                &validated.pathspecs,
+                true,
+                &mut add_output,
+            )?;
+        }
         return check_ignored_only_error(add_output);
     }
 
-    // Stage each file
+    // Case-collision guard (lore.md 1.14): on a case-insensitive view, a
+    // candidate whose FOLD matches a DIFFERENT-cased tracked entry must never
+    // create an index twin (`Foo` + `foo`). Under the conservative default
+    // (`core.casehandling=error`) the whole add refuses BEFORE mutating the
+    // index; `warn`/`allow` skip the colliding candidates (staging under the
+    // existing casing is the engine's job — v1 skips, documented).
+    let files = if ignore_case {
+        let policy = crate::utils::path_case::case_handling_from_config()
+            .await
+            .map_err(|error| {
+                CliError::fatal(error.to_string())
+                    .with_stable_code(StableErrorCode::RepoStateInvalid)
+            })?;
+        let tracked_fold: std::collections::HashMap<String, String> = index
+            .tracked_files()
+            .iter()
+            .map(|path| {
+                let text = crate::utils::util::path_to_string(path);
+                (crate::utils::path_case::fold_path_key(&text), text)
+            })
+            .collect();
+        let mut kept = Vec::with_capacity(files.len());
+        let mut collisions: Vec<(String, String)> = Vec::new();
+        for file in files {
+            let text = crate::utils::util::path_to_string(&file);
+            match tracked_fold.get(&crate::utils::path_case::fold_path_key(&text)) {
+                Some(existing) if existing != &text => {
+                    let existing_path = PathBuf::from(existing);
+                    if crate::utils::path_case::is_same_file_case_alias(
+                        &workdir,
+                        &file,
+                        &existing_path,
+                    ) {
+                        continue;
+                    }
+                    collisions.push((text, existing.clone()));
+                }
+                _ => kept.push(file),
+            }
+        }
+        if !collisions.is_empty() {
+            match policy {
+                crate::utils::path_case::CaseHandling::Error => {
+                    let listing = collisions
+                        .iter()
+                        .map(|(candidate, tracked)| {
+                            format!("'{candidate}' collides with tracked '{tracked}'")
+                        })
+                        .collect::<Vec<_>>()
+                        .join("; ");
+                    return Err(
+                        CliError::failure(format!("case-fold path collision: {listing}"))
+                            .with_stable_code(StableErrorCode::ConflictCaseCollision)
+                            .with_hint(
+                                "rename deliberately with 'libra mv <Tracked> <tracked>', or set \
+                         core.casehandling=warn to proceed",
+                            ),
+                    );
+                }
+                crate::utils::path_case::CaseHandling::Warn => {
+                    for (candidate, tracked) in &collisions {
+                        crate::utils::error::emit_warning(format!(
+                            "case-fold collision: '{candidate}' matches tracked '{tracked}' \
+                             (skipped; use 'libra mv' for a deliberate case rename)"
+                        ));
+                    }
+                }
+                crate::utils::path_case::CaseHandling::Allow => {}
+            }
+        }
+        kept
+    } else {
+        files
+    };
+
+    // Stage each file (`--renormalize` force-rewrites instead of diffing).
     for file in &files {
-        match stage_a_file(file, &mut index, &workdir, &storage_path).await {
+        let staged = if args.renormalize {
+            renormalize_entry(file, &mut index, &workdir)
+        } else {
+            stage_a_file(file, &mut index, &workdir, &storage_path).await
+        };
+        match staged {
             Ok(action) => {
                 let path_str = file.display().to_string();
                 match action {
@@ -566,6 +792,18 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         }
     }
 
+    // `--chmod=(+|-)x`: force the executable bit on the matched regular files'
+    // index entries, even ones with no content change (Git's `--chmod`).
+    if let Some(target_mode) = chmod_mode {
+        apply_chmod(
+            &mut index,
+            target_mode,
+            &validated.pathspecs,
+            false,
+            &mut add_output,
+        )?;
+    }
+
     index
         .save(&index_path)
         .map_err(|source| AddError::IndexSave {
@@ -574,6 +812,121 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
         })?;
 
     check_ignored_only_error(add_output)
+}
+
+/// Parse a `--chmod=(+|-)x` value into the index mode to record: `+x` ->
+/// `100755` (executable), `-x` -> `100644`.
+fn parse_chmod(value: &str) -> CliResult<u32> {
+    match value {
+        "+x" => Ok(0o100755),
+        "-x" => Ok(0o100644),
+        other => Err(CliError::command_usage(format!(
+            "invalid --chmod value '{other}' (expected +x or -x)"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint("use --chmod=+x to set the executable bit or --chmod=-x to clear it")),
+    }
+}
+
+/// Force the executable bit on every matched, tracked **regular** file. Symlinks
+/// and gitlinks are skipped (they have no executable bit). A path whose mode
+/// already matches is left untouched; a real change is reported as `modified`.
+/// In `dry_run` the index is not mutated, only the report.
+fn apply_chmod(
+    index: &mut Index,
+    target_mode: u32,
+    pathspecs: &PathspecSet,
+    dry_run: bool,
+    out: &mut AddOutput,
+) -> Result<(), AddError> {
+    let workdir = util::working_dir();
+    let matched = filter_candidates(&index.tracked_files(), pathspecs);
+    for file in &matched {
+        let file_str = file
+            .to_str()
+            .ok_or_else(|| AddError::InvalidPathEncoding { path: file.clone() })?;
+        // Read the current mode + blob id without holding the index borrow
+        // (`IndexEntry` is not `Clone`).
+        let Some((current_mode, hash)) = index.get(file_str, 0).map(|e| (e.mode, e.hash)) else {
+            continue;
+        };
+        // Only regular blobs carry an executable bit; a path already at the
+        // target mode needs no change.
+        if current_mode & 0o170000 != 0o100000 || current_mode == target_mode {
+            continue;
+        }
+        let file_abs = workdir.join(file);
+        let Ok(metadata) = std::fs::symlink_metadata(&file_abs) else {
+            // The tracked path is gone: nothing to chmod.
+            continue;
+        };
+        if metadata.file_type().is_symlink() || !metadata.is_file() {
+            // Only real regular files carry an executable bit.
+            continue;
+        }
+        if !dry_run {
+            // Rebuild the entry from the working-tree stat, keeping the existing
+            // blob (no content change) and forcing the requested mode.
+            let mut updated =
+                IndexEntry::new_from_file(file, hash, &workdir).map_err(|source| {
+                    AddError::CreateIndexEntry {
+                        path: file.to_path_buf(),
+                        source,
+                    }
+                })?;
+            updated.mode = target_mode;
+            index.update(updated);
+        }
+        let path_str = file.display().to_string();
+        if !out.added.contains(&path_str) && !out.modified.contains(&path_str) {
+            out.modified.push(path_str);
+        }
+    }
+    Ok(())
+}
+
+/// Force-rewrite an already-tracked entry for `--renormalize`.
+///
+/// Re-reads the working-tree file, writes a fresh blob, and updates the index
+/// entry — even when the content is unchanged (the point of `--renormalize`).
+/// A tracked file that is gone from the working tree has its deletion staged; a
+/// directory is a no-op.
+fn renormalize_entry(
+    file: &Path,
+    index: &mut Index,
+    workdir: &Path,
+) -> Result<StagedAction, AddError> {
+    let file_str = file.to_str().ok_or_else(|| AddError::InvalidPathEncoding {
+        path: file.to_path_buf(),
+    })?;
+    let file_abs = workdir.join(file);
+    // `symlink_metadata` does not follow symlinks, so a dangling symlink is still
+    // detected as present (and not mistaken for a deleted file).
+    let meta = match std::fs::symlink_metadata(&file_abs) {
+        Ok(meta) => meta,
+        Err(_) => {
+            // Tracked but truly gone from the working tree: stage the deletion.
+            index.remove(file_str, 0);
+            return Ok(StagedAction::Removed);
+        }
+    };
+    if meta.is_dir() {
+        return Ok(StagedAction::Unchanged);
+    }
+    let blob = gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+        path: file.to_path_buf(),
+        source,
+    })?;
+    blob.save();
+    index.update(
+        IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
+            AddError::CreateIndexEntry {
+                path: file.to_path_buf(),
+                source,
+            }
+        })?,
+    );
+    Ok(StagedAction::Modified)
 }
 
 /// Convert "all paths ignored, nothing staged" into a hard error.
@@ -591,7 +944,7 @@ pub async fn run_add(args: &AddArgs) -> CliResult<AddOutput> {
 fn check_ignored_only_error(output: AddOutput) -> CliResult<AddOutput> {
     if !output.ignored.is_empty() && output.is_empty() {
         let mut message =
-            String::from("the following paths are ignored by one of your .libraignore files:");
+            String::from("the following paths are ignored by configured ignore rules:");
         for path in &output.ignored {
             message.push('\n');
             message.push_str(path);
@@ -754,7 +1107,7 @@ fn render_normal(w: &mut impl Write, result: &AddOutput, verbose: bool) -> CliRe
 /// stdout redirection.
 fn render_warnings_stderr(result: &AddOutput) {
     if !result.ignored.is_empty() {
-        eprintln!("warning: the following paths are ignored by one of your .libraignore files:");
+        eprintln!("warning: the following paths are ignored by configured ignore rules:");
         for path in &result.ignored {
             eprintln!("{path}");
         }
@@ -770,6 +1123,11 @@ fn render_warnings_stderr(result: &AddOutput) {
         for failure in &result.failed {
             eprintln!("  {}: {}", failure.path, failure.message);
         }
+    }
+    for pathspec in &result.missing {
+        eprintln!(
+            "warning: pathspec '{pathspec}' did not match any files and was skipped (--ignore-missing)"
+        );
     }
 }
 
@@ -800,56 +1158,62 @@ fn write_err(e: io::Error) -> CliError {
 /// - Returns [`AddError::PathspecNotMatched`] for the first pathspec that
 ///   matches no candidate at all — `--ignore-errors` does not affect this
 ///   pre-flight stage.
+#[allow(clippy::too_many_arguments)]
 fn validate_pathspecs(
     raw_pathspecs: &[String],
-    requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
+    pathspec_ctx: PathspecMatchContext<'_>,
     visible_changes: &Changes,
     ignored_changes: &Changes,
     index: &Index,
+    ignore_missing: bool,
 ) -> Result<ValidatedPathspecs, AddError> {
-    if raw_pathspecs.is_empty() {
-        return Ok(ValidatedPathspecs {
-            files: requested_paths.to_vec(),
-            ignored: Vec::new(),
-        });
-    }
+    let pathspecs = PathspecSet::from_workdir_with_default_icase(
+        raw_pathspecs,
+        pathspec_ctx.current_dir,
+        pathspec_ctx.workdir,
+        pathspec_ctx.ignore_case,
+    )
+    .map_err(|source| AddError::Pathspec { source })?;
 
     let tracked_files = index.tracked_files();
     let change_candidates = collect_change_candidates(visible_changes);
     let ignored_candidates = collect_change_candidates(ignored_changes);
+    let selectable_candidates = pathspec_candidates(&change_candidates, &tracked_files);
+    let all_candidates = pathspec_candidates(&selectable_candidates, &ignored_candidates);
 
     let mut ignored = Vec::new();
-    let mut files = Vec::new();
-    for (raw, requested_path) in raw_pathspecs.iter().zip(requested_paths.iter()) {
-        let requested_abs = resolve_pathspec(requested_path, current_dir);
-        if !util::is_sub_path(&requested_abs, workdir) {
-            return Err(AddError::PathOutsideRepo {
-                path: raw.clone(),
-                repo_root: workdir.to_path_buf(),
+    let mut missing = Vec::new();
+
+    let unmatched_selectable = pathspecs.unmatched_positive_specs(&selectable_candidates);
+    if !unmatched_selectable.is_empty() {
+        let unmatched_all = pathspecs.unmatched_positive_specs(&all_candidates);
+        for raw in unmatched_selectable {
+            if !unmatched_all.contains(&raw) {
+                ignored.push(raw.to_string());
+                continue;
+            }
+            if ignore_missing {
+                missing.push(raw.to_string());
+                continue;
+            }
+            return Err(AddError::PathspecNotMatched {
+                pathspec: raw.to_string(),
             });
         }
-
-        let matches_changes = pathspec_matches_any(&requested_abs, &change_candidates, workdir);
-        let matches_tracked = pathspec_matches_any(&requested_abs, &tracked_files, workdir);
-        let matches_ignored = pathspec_matches_any(&requested_abs, &ignored_candidates, workdir);
-
-        if matches_changes || matches_tracked {
-            files.push(requested_path.clone());
-            continue;
-        }
-        if matches_ignored {
-            ignored.push(raw.clone());
-            continue;
-        }
-
-        return Err(AddError::PathspecNotMatched {
-            pathspec: raw.clone(),
-        });
     }
 
-    Ok(ValidatedPathspecs { files, ignored })
+    Ok(ValidatedPathspecs {
+        pathspecs,
+        ignored,
+        missing,
+    })
+}
+
+fn pathspec_candidates(left: &[PathBuf], right: &[PathBuf]) -> Vec<PathBuf> {
+    let mut candidates = Vec::with_capacity(left.len() + right.len());
+    candidates.extend(left.iter().cloned());
+    candidates.extend(right.iter().cloned());
+    candidates
 }
 
 /// Flatten the three change buckets (`new`, `modified`, `deleted`) into a
@@ -865,42 +1229,13 @@ fn collect_change_candidates(changes: &Changes) -> Vec<PathBuf> {
 /// Make a user-supplied pathspec absolute by joining onto `current_dir` when
 /// it is relative. Mirrors how Git's pathspec parser anchors specs to the
 /// invoking shell's CWD rather than to the worktree root.
-fn resolve_pathspec(pathspec: &Path, current_dir: &Path) -> PathBuf {
-    if pathspec.is_absolute() {
-        pathspec.to_path_buf()
-    } else {
-        current_dir.join(pathspec)
-    }
-}
-
-/// True iff any path in `candidates` (interpreted relative to `workdir`) is a
-/// subpath of `requested_abs`. Used both for tracked-file matching and for
-/// status-change matching.
-fn pathspec_matches_any(requested_abs: &Path, candidates: &[PathBuf], workdir: &Path) -> bool {
-    candidates.iter().any(|candidate| {
-        let candidate_abs = workdir.join(candidate);
-        util::is_sub_path(&candidate_abs, requested_abs)
-    })
-}
-
 /// Restrict `files` (workdir-relative) to entries that fall under at least
 /// one of the user's pathspecs. Used to scope `-A`/`-u`-derived candidate
 /// sets to the explicit positional arguments.
-fn filter_candidates(
-    files: &[PathBuf],
-    requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
-) -> Vec<PathBuf> {
+fn filter_candidates(files: &[PathBuf], pathspecs: &PathspecSet) -> Vec<PathBuf> {
     files
         .iter()
-        .filter(|file| {
-            let file_abs = workdir.join(file.as_path());
-            requested_paths.iter().any(|pathspec| {
-                let requested_abs = resolve_pathspec(pathspec, current_dir);
-                util::is_sub_path(&file_abs, &requested_abs)
-            })
-        })
+        .filter(|file| pathspecs.matches_path(file.as_path()))
         .cloned()
         .collect()
 }
@@ -908,13 +1243,8 @@ fn filter_candidates(
 /// Alias of [`filter_candidates`] used in `--refresh` mode. Kept separate so
 /// future divergence in semantics (e.g. submodule handling) only needs to
 /// touch one branch.
-fn filter_refresh_candidates(
-    files: &[PathBuf],
-    requested_paths: &[PathBuf],
-    workdir: &Path,
-    current_dir: &Path,
-) -> Vec<PathBuf> {
-    filter_candidates(files, requested_paths, workdir, current_dir)
+fn filter_refresh_candidates(files: &[PathBuf], pathspecs: &PathspecSet) -> Vec<PathBuf> {
+    filter_candidates(files, pathspecs)
 }
 
 /// Remove the running `libra` binary from the candidate list.
@@ -1011,15 +1341,23 @@ async fn stage_a_file(
         path: file.to_path_buf(),
     })?;
 
-    // Skip directories - they cannot be staged as blobs
-    if file_abs.is_dir() {
+    // Skip real directories - symlinks to directories are staged as link blobs.
+    if file_abs
+        .symlink_metadata()
+        .map(|metadata| metadata.is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
         return Ok(StagedAction::Unchanged);
     }
 
     let file_status = check_file_status(file, index, workdir)?;
     match file_status {
         FileStatus::New => {
-            let blob = gen_blob_from_file(&file_abs);
+            let blob =
+                gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+                    path: file.to_path_buf(),
+                    source,
+                })?;
             blob.save();
             index.add(
                 IndexEntry::new_from_file(file, blob.id, workdir).map_err(|source| {
@@ -1033,7 +1371,11 @@ async fn stage_a_file(
         }
         FileStatus::Modified => {
             if index.is_modified(file_str, 0, workdir) {
-                let blob = gen_blob_from_file(&file_abs);
+                let blob =
+                    gen_blob_from_file(&file_abs).map_err(|source| AddError::CreateIndexEntry {
+                        path: file.to_path_buf(),
+                        source,
+                    })?;
                 if !index.verify_hash(file_str, 0, &blob.id) {
                     blob.save();
                     index.update(IndexEntry::new_from_file(file, blob.id, workdir).map_err(
@@ -1088,7 +1430,7 @@ fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileS
         path: file.to_path_buf(),
     })?;
     let file_abs = workdir.join(file);
-    if !file_abs.exists() {
+    if file_abs.symlink_metadata().is_err() {
         if index.tracked(file_str, 0) {
             Ok(FileStatus::Deleted)
         } else {
@@ -1106,15 +1448,10 @@ fn check_file_status(file: &Path, index: &Index, workdir: &Path) -> Result<FileS
 /// Generate a `Blob` from a file.
 ///
 /// Functional scope:
-/// - When the file matches a `.libra_attributes` LFS filter, returns a pointer
-///   blob via [`Blob::from_lfs_file`]; otherwise reads the file content
-///   verbatim into a regular blob.
-fn gen_blob_from_file(path: impl AsRef<Path>) -> Blob {
-    if lfs::is_lfs_tracked(&path) {
-        Blob::from_lfs_file(&path)
-    } else {
-        Blob::from_file(&path)
-    }
+/// - Reads the exact bytes Git would store for a worktree blob: regular file
+///   content, generated LFS pointer content, or symlink target bytes.
+fn gen_blob_from_file(path: impl AsRef<Path>) -> io::Result<Blob> {
+    read_worktree_blob_bytes(path).map(Blob::from_content_bytes)
 }
 
 #[cfg(test)]

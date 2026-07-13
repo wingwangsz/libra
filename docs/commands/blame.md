@@ -30,28 +30,37 @@ For large files, the `-L` option restricts output to a specific line range, redu
 | Raw time | `-t` | | Show the raw author timestamp (epoch seconds) instead of a formatted date. |
 | Abbrev | | `--abbrev <N>` | Use N hex digits for the abbreviated commit hash (ignored with `-l`). |
 | Root | | `--root` | Do not treat root commits as boundaries. Accepted no-op: Libra's blame never prefixes boundary/root commits with `^`, so root commits already appear as normal commits. |
+| Ignore whitespace | `-w` | `--ignore-whitespace` | Ignore whitespace when comparing the parent's and child's versions of a line, so a whitespace-only change is attributed to the older commit. Matches Git's `-w` (ignore-all-whitespace) semantics. |
 | Porcelain | `-p` | `--porcelain` | Machine-readable porcelain output (commit metadata once per commit). |
 | JSON | | `--json` | Emit structured JSON output. |
 | Quiet | | `--quiet` | Validate inputs but suppress all blame output. |
 
 ### Line Range Formats (`-L`)
 
-The `-L` flag supports three formats:
+Each endpoint of `-L` may be a line number or a `/regex/`; a single endpoint spans to
+the end of the file (matching Git):
 
 | Format | Meaning | Example |
 |--------|---------|---------|
-| `N` | Single line N | `-L 10` |
+| `N` | From line N to the end of the file | `-L 10` |
 | `N,M` | Lines N through M (inclusive) | `-L 10,20` |
 | `N,+C` | C lines starting at line N | `-L 10,+5` (lines 10-14) |
+| `/regex/` | From the first line matching the regex to the end of the file | `-L '/fn main/'` |
+| `/start/,/end/` | From the first `/start/` match to the first `/end/` match at or after it | `-L '/fn main/,/^}/'` |
+| `/start/,M` or `N,/end/` | Mix a regex endpoint with a line number | `-L 10,/^}/` |
 
-Line numbers are 1-based. Out-of-range values produce an error.
+Line numbers are 1-based. Out-of-range values, and a `/regex/` that matches no line,
+produce an error.
 
 ```bash
-# Blame a single line
+# Blame from line 42 to the end of the file
 libra blame -L 42 src/main.rs
 
 # Blame a range
 libra blame -L 10,20 src/main.rs
+
+# Blame from a regex match to a regex match
+libra blame -L '/fn main/,/^}/' src/main.rs
 
 # Blame 5 lines starting at line 100
 libra blame -L 100,+5 src/main.rs
@@ -71,6 +80,9 @@ libra blame -L 10,20 src/main.rs
 
 # Blame 5 lines from line 10
 libra blame -L 10,+5 src/main.rs
+
+# Ignore whitespace-only changes when attributing lines
+libra blame -w src/main.rs
 
 # JSON output for agents
 libra --json blame src/main.rs
@@ -128,9 +140,9 @@ When the file is empty, the `lines` array is empty and human output shows "File 
 
 Git's `blame --reverse` shows the last revision in which a line existed, walking forward in history instead of backward. This is useful for finding when a line was *removed*, but it requires forward-history traversal which is computationally expensive and architecturally different from normal blame. Libra omits this to keep the blame implementation simple and fast. To find when a line was removed, use `libra log -p -- <file>` and search for the deletion.
 
-### Why a simplified line range format?
+### Line range formats
 
-Git's `-L` supports complex formats including regex-based function matching (`-L :<funcname>`) and `/regex/` line selection. These are powerful but depend on language-specific configuration (`.gitattributes` `diff` driver) and are rarely used correctly. Libra supports only numeric ranges (`N`, `N,M`, `N,+C`), which are unambiguous and sufficient for the vast majority of blame operations. AI agents can easily determine line numbers from file content without needing regex-based function matching.
+Libra's `-L` supports numeric ranges (`N`, `N,M`, `N,+C`) and `/regex/` endpoints (`/regex/`, `/start/,/end/`, and regex mixed with line numbers), matching Git; a single endpoint spans to the end of the file. Git's `-L :<funcname>` function-name selection is not yet supported, as it depends on language-specific configuration (the `.gitattributes` `diff` driver).
 
 ### Why default to HEAD instead of working tree?
 
@@ -147,7 +159,8 @@ The commit argument is positional (second argument after the file path) rather t
 | File | `<file>` (positional, required) | `<file>` (positional, required) | N/A (jj has no blame; use `jj annotate`) |
 | Revision | `<commit>` (positional, default HEAD) | `<rev>` (positional, default HEAD) | `-r <revision>` (in `jj annotate`) |
 | Line range (numeric) | `-L N,M` / `-L N,+C` / `-L N` | `-L <start>,<end>` | N/A |
-| Line range (regex) | Not supported | `-L :<funcname>` / `-L /regex/` | N/A |
+| Line range (regex) | `-L /regex/` / `-L /start/,/end/` | `-L /regex/` | N/A |
+| Line range (funcname) | Not supported | `-L :<funcname>` | N/A |
 | Reverse blame | Not supported | `--reverse` | N/A |
 | Show email | `-e` / `--show-email` (default human output) | `-e` / `--show-email` | N/A |
 | Long hash | `-l` | `-l` | N/A |
@@ -156,6 +169,7 @@ The commit argument is positional (second argument after the file path) rather t
 | Show timestamp | `-t` (raw epoch; formatted by default) | `-t` (raw timestamp) | N/A |
 | Abbrev length | `--abbrev <N>` | `--abbrev=<N>` | N/A |
 | Don't treat root as boundary | `--root` (no-op; root already shown as normal) | `--root` | N/A |
+| Ignore whitespace | `-w` / `--ignore-whitespace` (ignore-all-whitespace) | `-w` | N/A |
 | Porcelain format | `-p` / `--porcelain` / `--line-porcelain` (no original line numbers, `boundary`, or `previous` metadata) | `-p` / `--porcelain` / `--line-porcelain` | N/A |
 | Incremental output | Not supported | `--incremental` | N/A |
 | Score threshold | Not supported | `-M` / `-C` (move/copy detection) | N/A |

@@ -303,6 +303,14 @@ pub async fn setup_with_new_libra_in(temp_path: impl AsRef<Path>) {
     util::reset_objects_storage_cache_for_path(
         &temp_path.as_ref().join(util::ROOT_DIR).join("objects"),
     );
+    // Hold the process-wide cwd lock for the WHOLE setup, `init` included:
+    // `init` resolves `init.defaultBranch` with cwd-anchored repository
+    // discovery (local scope = repository enclosing the current directory,
+    // matching Git). Without the lock, a concurrent test that has parked the
+    // process cwd inside ITS OWN repository leaks that repository's local
+    // config — or its busy connection pool — into this init (observed as
+    // full-suite-only `Connection pool timed out` panics here).
+    let _guard = ChangeDirGuard::new(temp_path.as_ref());
     let args = command::init::InitArgs {
         bare: false,
         initial_branch: None,
@@ -322,7 +330,6 @@ pub async fn setup_with_new_libra_in(temp_path: impl AsRef<Path>) {
 
     // Most tests don't exercise identity flows. Seed a deterministic identity so
     // commit-related tests don't depend on host-level config.
-    let _guard = ChangeDirGuard::new(temp_path.as_ref());
     let _ = ConfigKv::set("user.name", "Libra Test User", false).await;
     let _ = ConfigKv::set("user.email", "libra-test@example.com", false).await;
 }

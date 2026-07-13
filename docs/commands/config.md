@@ -9,12 +9,12 @@
 
 ```
 libra config <subcommand> [options]
-libra config set [--global] [--add] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
-libra config get [--global] [--all] [--reveal] [--regexp] [-d <default>] <key>
-libra config list [--global] [--name-only] [--show-origin] [--vault] [--ssh-keys] [--gpg-keys]
-libra config unset [--global] [--all] <key>
+libra config set [--global | --system] [--add] [--encrypt] [--plaintext] [--stdin] <key> [<value>]
+libra config get [--global | --system] [--all] [--reveal] [--regexp] [-d <default>] <key>
+libra config list [--global | --system] [--name-only] [--show-origin] [--vault] [--ssh-keys] [--gpg-keys]
+libra config unset [--global | --system] [--all] <key>
 libra config import [--global]
-libra config path [--global]
+libra config path [--global | --system]
 libra config generate-ssh-key --remote <name>
 libra config generate-gpg-key [--name <name>] [--email <email>] [--usage <usage>]
 ```
@@ -22,12 +22,14 @@ libra config generate-gpg-key [--name <name>] [--email <email>] [--usage <usage>
 Git-compatible flag style is also supported (hidden from help):
 
 ```
-libra config [--get | --get-all | --unset | --unset-all | -l | --add | --import | --get-regexp | --show-origin] [--local | --global] [key] [value] [-d <default>]
+libra config [--get | --get-all | --unset | --unset-all | -l | --add | --import | --get-regexp | --show-origin] [--local | --global | --system] [-z | --null] [--type <t> | --bool | --int | --path] [key] [value] [-d <default>]
+libra config --remove-section <name>
+libra config --rename-section <old-name> <new-name>
 ```
 
 ## Description
 
-`libra config` reads and writes configuration values across two scopes: **local** (repository-level, stored in `.libra/libra.db`) and **global** (user-level, stored in `~/.libra/config.db`). Both databases use SQLite with a `config_kv` table.
+`libra config` reads and writes configuration values across three scopes: **local** (repository-level, stored in `.libra/libra.db`), **global** (user-level, stored in `~/.libra/config.db`), and **system** (machine-wide, stored in `/etc/libra/config.db`; lowest cascade precedence, plain config only — no vault). Each database uses SQLite with a `config_kv` table.
 
 Unlike Git's plaintext INI files or jj's TOML files, Libra stores configuration in a transactional database with integrated vault encryption. Sensitive values (API keys, tokens, SSH private keys) are automatically encrypted at rest using AES-256-GCM.
 
@@ -214,14 +216,14 @@ These flags are global (apply to any subcommand):
 |------|-------------|
 | `--local` | Use repository config (`.libra/libra.db`). This is the default for writes. |
 | `--global` | Use global user config (`~/.libra/config.db`). |
-| `--system` | **Removed.** Always produces an error. See Design Rationale. |
+| `--system` | Use system-wide config (`/etc/libra/config.db`, overridable via `LIBRA_CONFIG_SYSTEM_DB`). Lowest cascade precedence; writing it usually requires elevated privileges. Vault-encrypted secrets are **not** supported in this scope (see Design Rationale). |
 
 ### Hidden Git-Compatible Flags
 
-These flags provide backward compatibility with `git config` invocation patterns. They are hidden from `--help` and internally translated to the equivalent subcommand.
+These flags provide backward compatibility with `git config` invocation patterns. They are hidden from `--help`. Most translate to the equivalent subcommand; `--remove-section` / `--rename-section` are flag-only section operations with no subcommand form.
 
-| Flag | Equivalent Subcommand |
-|------|----------------------|
+| Flag | Equivalent Subcommand / Behavior |
+|------|----------------------------------|
 | `--get` | `get <key>` |
 | `--get-all` | `get --all <key>` |
 | `--unset` | `unset <key>` |
@@ -231,12 +233,16 @@ These flags provide backward compatibility with `git config` invocation patterns
 | `--import` | `import` |
 | `--get-regexp` | `get --regexp <key>` |
 | `--show-origin` | `list --show-origin` |
+| `--type=<bool\|int\|path>`, `--bool`, `--int`, `--path` | Canonicalize a value when reading (`--get`/`--get-all`/`--get-regexp`) **and when setting**: bool variants → `true`/`false`; int with optional k/m/g (1024-based) multiplier; path expands a leading `~`/`~/`. On a set the value is validated/canonicalized before storage (matching `git config --type`: `yes` → `true`, `1k` → `1024`), and an invalid value errors without storing. A non-get/non-set mode is rejected (exit 129). |
+| `--remove-section <name>` | Delete the keys in section `<name>` in one transaction, using Git's section/subsection identity (so `--remove-section branch` removes `branch.<key>` but not the `branch.feature.*` subsection). Missing section → exit 128. |
+| `--rename-section <old> <new>` | Move section `<old>`'s keys to `<new>`, preserving each value and its encryption flag. Missing source → exit 128; identical names → exit 2; an already-existing destination section is refused → exit 128. |
 
 ### Other Flags
 
 | Flag | Description |
 |------|-------------|
 | `-d`, `--default <value>` | Default value when key is not found (Git-compat positional mode) |
+| `-z`, `--null` | NUL-terminate output records (`git config -z`): `value\0` for `--get`/`--get-all`; `key\nvalue\0` for `--get-regexp`/`--list`; `key\0` with `--name-only`; `origin\0` prefix with `--show-origin`. `--json` takes precedence. Applies to standard config output only; combining it with `--ssh-keys`/`--gpg-keys`/`--vault` is rejected (exit 129). |
 | `--json` | Emit structured JSON output |
 | `--quiet` | Suppress human-readable output |
 
@@ -367,7 +373,7 @@ Supported `--usage` values are `signing` and `encrypt`.
 
 - Default scope is local (`.libra/libra.db`)
 - `--global` uses `~/.libra/config.db`
-- `--system` is removed (see Design Rationale); migrate old usages to `--global`
+- `--system` uses `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`); lowest cascade precedence, writes usually need elevated privileges, and vault-encrypted secrets are rejected in this scope (see Design Rationale)
 
 Resolution order for runtime config-backed environment variables is:
 
@@ -394,9 +400,11 @@ Git uses INI-format text files; jj uses TOML. Libra uses SQLite because:
 
 Git stores configurations in plaintext INI files, which is inherently insecure for storing API keys, access tokens, and SSH/GPG private keys. Libra integrates Vault-backed encrypted storage natively. Sensitive keys (like `vault.env.*`, `*.privkey`, or keys containing substrings like `secret`/`token`) are automatically encrypted at rest using AES-256-GCM in both local and global scopes. This eliminates the "redacted in CLI but plaintext on disk" false sense of security, allowing developers to safely store environment overrides directly within the configuration.
 
-### Why no `--system` scope?
+### Why does `--system` reject vault-encrypted secrets?
 
-System-level configuration (`--system`) is intentionally removed. In a multi-user OS environment, sharing an encrypted vault at the system level introduces severe permission isolation issues. For example, an unseal key readable only by `root` would cause cascaded config reading to fail for regular users, crashing their commands. The operational complexity and security risks far outweigh the benefits. System-wide defaults should be handled at the OS/environment level, while Libra uses `--global` for user-level defaults.
+`--system` reads and writes plain system-wide config at `/etc/libra/config.db` (override with `LIBRA_CONFIG_SYSTEM_DB`), at the lowest cascade precedence — like Git's `/etc/gitconfig`. Writing it usually requires elevated privileges, and a present-but-unreadable system DB is skipped during cascade reads rather than crashing other users' commands.
+
+What it deliberately does **not** support is the vault: storing encrypted secrets (`vault.*` keys or `--encrypt` values) in the system scope is rejected with a usage error. In a multi-user OS environment, a system-level unseal key under root-owned `/etc/libra` would either be unreadable to regular users (breaking decryption) or world-readable (defeating the encryption). System-wide *secrets* should be handled at the OS/environment level; Libra keeps the vault to `--global` (user-level) and `--local` (repository) scopes.
 
 ### Why no `config edit`?
 
@@ -425,14 +433,14 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | Edit in editor | `git config -e` | `jj config edit` | Not supported (SQLite storage) |
 | Regex search | `git config --get-regexp` | No | `libra config get --regexp` |
 | Show origin | `git config --show-origin` | No | `libra config list --show-origin` |
-| Type coercion | `--type=bool\|int\|path` | No (TOML types) | Not supported (this batch) |
+| Type coercion | `--type=bool\|int\|path` | No (TOML types) | `--type=bool\|int\|path` + `--bool`/`--int`/`--path` (canonicalize on both read and set) |
 | Default fallback | `--default value` | No | `--default value` |
-| Null-delimited | `-z` | No | Not supported (this batch) |
-| Rename/remove section | Yes | No | Not supported (this batch) |
+| Null-delimited | `-z` | No | `-z` / `--null` (`value\0` for get/get-all; `key\nvalue\0` for `--get-regexp`/`--list`; `key\0` with `--name-only`) |
+| Rename/remove section | Yes | No | `--remove-section` / `--rename-section` (Git section/subsection semantics; rename refuses an existing destination) |
 | JSON output | No | No | **`--json`** |
 | Secret redaction | No | No | **Auto-detect** |
 | Import from Git | N/A | N/A | **`libra config import`** |
-| Vault encryption | No | No | **AES-256-GCM (all scopes)** |
+| Vault encryption | No | No | **AES-256-GCM (local/global only; rejected in system scope)** |
 | Env var vault | No | No | **`vault.env.*`** |
 | SSH key per remote | No | No | **`generate-ssh-key --remote`** |
 | GPG key generation | No | No | **`generate-gpg-key`** |
@@ -442,7 +450,7 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | Worktree scope | `--worktree` | `--workspace` | Not supported |
 | Arbitrary file | `--file <path>` | No | Not supported |
 | Storage format | INI text files | TOML text files | **SQLite + vault** |
-| Scopes | system/global/local/worktree | user/repo/workspace | **global/local** (system removed) |
+| Scopes | system/global/local/worktree | user/repo/workspace | **system/global/local** (system: plain config only, no vault; no worktree scope) |
 | Name-only listing | `--name-only` | No | **`--name-only`** |
 | Multi-value add | `--add` | No | **`set --add`** |
 | Stdin input | No | No | **`set --stdin`** |
@@ -454,7 +462,7 @@ Git exits with code 1 when a key is not found, which is indistinguishable from o
 | Code | Condition | Hint |
 |------|-----------|------|
 | `LBR-REPO-001` | Not inside a libra repository (for local scope) | Initialize with `libra init` or use `--global` |
-| `LBR-CLI-002` | `--system` scope used (removed) | Use `--global` for user-level defaults |
+| `LBR-CLI-002` | Vault-encrypted secret (`vault.*`/`--encrypt`) in `--system` scope | Use `--global` or `--local` for vault secrets |
 | `LBR-CLI-003` | Key not found and no `--default` provided | Check key name with `libra config list` |
 | `LBR-CLI-002` | `edit` subcommand used (not supported) | Use `set`, `get`, `unset`, `list` subcommands |
 | `LBR-IO-001` | Failed to read config database | Check file permissions on `.libra/libra.db` |

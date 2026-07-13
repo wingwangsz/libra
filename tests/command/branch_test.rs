@@ -536,6 +536,9 @@ async fn test_branch() {
         // create branch with first commit
         let first_branch_name = "first_branch".to_string();
         let args = BranchArgs {
+            subcommand: None,
+            format: None,
+            no_column: false,
             new_branch: Some(first_branch_name.clone()),
             commit_hash: Some(first_commit_id.to_string()),
             list: false,
@@ -543,6 +546,7 @@ async fn test_branch() {
             delete_safe: None,
             set_upstream_to: None,
             unset_upstream: None,
+            edit_description: None,
             show_current: false,
             rename: vec![],
             copy: vec![],
@@ -581,6 +585,9 @@ async fn test_branch() {
         // create second branch with current branch
         let second_branch_name = "second_branch".to_string();
         let args = BranchArgs {
+            subcommand: None,
+            format: None,
+            no_column: false,
             new_branch: Some(second_branch_name.clone()),
             commit_hash: None,
             list: false,
@@ -588,6 +595,7 @@ async fn test_branch() {
             delete_safe: None,
             set_upstream_to: None,
             unset_upstream: None,
+            edit_description: None,
             show_current: false,
             rename: vec![],
             copy: vec![],
@@ -616,6 +624,9 @@ async fn test_branch() {
     // show current branch
     println!("show current branch");
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: false,
@@ -623,6 +634,7 @@ async fn test_branch() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: true,
         rename: vec![],
         copy: vec![],
@@ -679,6 +691,9 @@ async fn test_create_branch_from_remote() {
     assert!(get_target_commit("origin/main").await.is_ok());
 
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("test_new".to_string()),
         commit_hash: Some("origin/main".into()),
         list: false,
@@ -686,6 +701,7 @@ async fn test_create_branch_from_remote() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -743,6 +759,9 @@ async fn test_create_branch_from_remote_tracking_ref() {
     assert!(get_target_commit("origin/main").await.is_ok());
 
     execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("tracking-copy".to_string()),
         commit_hash: Some("origin/main".into()),
         list: false,
@@ -750,6 +769,7 @@ async fn test_create_branch_from_remote_tracking_ref() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -963,6 +983,9 @@ async fn test_branch_rename() {
 
     // Create a test branch
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("old_name".to_string()),
         commit_hash: None,
         list: false,
@@ -970,6 +993,7 @@ async fn test_branch_rename() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -997,6 +1021,9 @@ async fn test_branch_rename() {
 
     // Rename branch from old_name to new_name
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: false,
@@ -1004,6 +1031,7 @@ async fn test_branch_rename() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec!["old_name".to_string(), "new_name".to_string()],
         copy: vec![],
@@ -1078,6 +1106,7 @@ async fn test_rename_current_branch() {
     // Create and switch to a feature branch
     let feature_branch = "feature".to_string();
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some(feature_branch.clone()),
         force_create: None,
@@ -1099,6 +1128,9 @@ async fn test_rename_current_branch() {
     // Rename current branch (feature) to feature_new using single argument
     let feature_new = "feature_new".to_string();
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: false,
@@ -1106,6 +1138,7 @@ async fn test_rename_current_branch() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![feature_new.clone()],
         copy: vec![],
@@ -1177,6 +1210,9 @@ async fn test_rename_to_existing_branch() {
 
     // Create two branches
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("branch1".to_string()),
         commit_hash: None,
         list: false,
@@ -1184,6 +1220,7 @@ async fn test_rename_to_existing_branch() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1203,6 +1240,9 @@ async fn test_rename_to_existing_branch() {
     execute(args).await;
 
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("branch2".to_string()),
         commit_hash: None,
         list: false,
@@ -1210,6 +1250,7 @@ async fn test_rename_to_existing_branch() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1230,6 +1271,9 @@ async fn test_rename_to_existing_branch() {
 
     // Try to rename branch1 to branch2 (should fail)
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: false,
@@ -1237,6 +1281,7 @@ async fn test_rename_to_existing_branch() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec!["branch1".to_string(), "branch2".to_string()],
         copy: vec![],
@@ -1301,6 +1346,9 @@ async fn test_list_all_branches() {
 
     // Create local branch
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("feature_branch".to_string()),
         commit_hash: None,
         list: false,
@@ -1308,6 +1356,7 @@ async fn test_list_all_branches() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1338,6 +1387,9 @@ async fn test_list_all_branches() {
 
     // Test -a parameter - just call execute, don't try to capture output
     let args = BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: false,
@@ -1345,6 +1397,7 @@ async fn test_list_all_branches() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1414,6 +1467,9 @@ async fn test_branch_delete_safe() {
 
     // Create a feature branch
     execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("feature".to_string()),
         commit_hash: None,
         list: false,
@@ -1421,6 +1477,7 @@ async fn test_branch_delete_safe() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1441,6 +1498,7 @@ async fn test_branch_delete_safe() {
 
     // Switch to feature branch and make a commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -1471,6 +1529,7 @@ async fn test_branch_delete_safe() {
 
     // Switch back to master
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -1485,6 +1544,9 @@ async fn test_branch_delete_safe() {
 
     // Try to delete feature branch with -d (should fail - not merged)
     execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: false,
@@ -1492,6 +1554,7 @@ async fn test_branch_delete_safe() {
         delete_safe: Some("feature".to_string()),
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1520,6 +1583,7 @@ async fn test_branch_delete_safe() {
 
     // Now merge feature into master
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -1533,6 +1597,7 @@ async fn test_branch_delete_safe() {
     .await;
 
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -1557,6 +1622,9 @@ async fn test_branch_delete_safe() {
 
     // Now try -d again (should succeed - fully merged)
     execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: false,
@@ -1564,6 +1632,7 @@ async fn test_branch_delete_safe() {
         delete_safe: Some("feature".to_string()),
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1652,6 +1721,9 @@ async fn test_branch_contains_commit_filter() {
 
     // Create dev branch and add two commits
     execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("dev".to_string()),
         commit_hash: None,
         list: false,
@@ -1659,6 +1731,7 @@ async fn test_branch_contains_commit_filter() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1678,6 +1751,7 @@ async fn test_branch_contains_commit_filter() {
     .await;
 
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("dev".to_string()),
         create: None,
         force_create: None,
@@ -1698,6 +1772,7 @@ async fn test_branch_contains_commit_filter() {
 
     // Return to main branch and add two commits
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some(main_branch.clone()),
         create: None,
         force_create: None,
@@ -2236,5 +2311,392 @@ fn branch_vv_shows_upstream_segment() {
     assert!(
         !String::from_utf8_lossy(&v.stdout).contains("[origin/feature]"),
         "-v omits the upstream segment"
+    );
+}
+
+#[test]
+fn branch_no_column_countermands_column() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    run_libra_command(&["branch", "aaaaa"], p);
+    run_libra_command(&["branch", "bbbbb"], p);
+
+    // `--no-column` alone lists one branch per line (the default).
+    let plain = run_libra_command(&["branch", "--no-column"], p);
+    assert!(
+        plain.status.success(),
+        "branch --no-column: {}",
+        String::from_utf8_lossy(&plain.stderr)
+    );
+
+    // `--column=always --no-column` (last wins) countermands `--column`, so the
+    // listing is one-per-line, NOT columnar (no two names share a line).
+    let out = run_libra_command(&["branch", "--column=always", "--no-column"], p);
+    assert!(out.status.success(), "branch --column=always --no-column");
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !listed
+            .lines()
+            .any(|l| l.contains("aaaaa") && l.contains("bbbbb")),
+        "--no-column countermands --column (one per line): {listed}"
+    );
+}
+
+/// End-to-end `branch --edit-description`: an explicitly configured (scripted)
+/// editor sets `branch.<name>.description`, and a comment-only buffer unsets it.
+/// Uses GIT_EDITOR so no TTY is needed (the editor runs regardless of TTY when
+/// explicitly configured).
+#[cfg(unix)]
+#[test]
+fn branch_edit_description_sets_then_unsets_via_editor() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Resolve the current branch name to query its description config key.
+    let cur = run_libra_command(&["branch", "--show-current"], p);
+    assert_cli_success(&cur, "branch --show-current");
+    let branch = String::from_utf8_lossy(&cur.stdout).trim().to_string();
+    assert!(!branch.is_empty(), "expected a current branch name");
+    let key = format!("branch.{branch}.description");
+
+    let write_editor = |name: &str, body: &str| -> String {
+        let path = p.join(name);
+        fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{body}' > \"$1\"\n")).unwrap();
+        let mut perms = fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+
+    // 1) A scripted editor writes a description, which is stored under the key.
+    let set_editor = write_editor("set_editor.sh", "a tidy summary\n# stripped comment\n");
+    let out = run_libra_command_with_stdin_and_env(
+        &["branch", "--edit-description"],
+        p,
+        "",
+        &[("GIT_EDITOR", set_editor.as_str())],
+    );
+    assert_cli_success(&out, "branch --edit-description (set)");
+
+    let got = run_libra_command(&["config", "get", &key], p);
+    assert_cli_success(&got, "config get description after set");
+    assert!(
+        String::from_utf8_lossy(&got.stdout).contains("a tidy summary"),
+        "description should be stored: {}",
+        String::from_utf8_lossy(&got.stdout)
+    );
+
+    // 2) A comment-only buffer cleans to empty, which unsets the key.
+    let clear_editor = write_editor("clear_editor.sh", "# only a comment line\n");
+    let out = run_libra_command_with_stdin_and_env(
+        &["branch", "--edit-description"],
+        p,
+        "",
+        &[("GIT_EDITOR", clear_editor.as_str())],
+    );
+    assert_cli_success(&out, "branch --edit-description (unset)");
+
+    // The previous value must be gone (whether `config get` now fails or prints
+    // nothing, the old description must not survive).
+    let got = run_libra_command(&["config", "get", &key], p);
+    assert!(
+        !String::from_utf8_lossy(&got.stdout).contains("a tidy summary"),
+        "description should be unset: {}",
+        String::from_utf8_lossy(&got.stdout)
+    );
+}
+
+#[test]
+fn test_branch_sort_by_committer_date() {
+    // `--sort=committerdate` orders branches by their tip commit's committer date
+    // (oldest first), distinct from `--sort=refname`. The branch names are chosen
+    // so the date order is the OPPOSITE of the alphabetical order, proving the date
+    // key (not the name) drives the sort. A short sleep gives the two commits
+    // distinct one-second-granularity timestamps.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // First (older) commit -> branch "zzz" (alphabetically last).
+    std::fs::write(p.join("f.txt"), "1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add 1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit 1",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "zzz"], p), "branch zzz");
+
+    std::thread::sleep(std::time::Duration::from_millis(1200));
+
+    // Second (newer) commit -> branch "aaa" (alphabetically first). A long
+    // message makes this commit object materially larger than zzz's, so the
+    // `objectsize` assertions below are driven by size, not the refname
+    // tie-break.
+    std::fs::write(p.join("f.txt"), "1\n2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add 2");
+    let long_msg = format!("c2 {}", "x".repeat(400));
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", &long_msg, "--no-verify"], p),
+        "commit 2",
+    );
+    assert_cli_success(&run_libra_command(&["branch", "aaa"], p), "branch aaa");
+
+    let order = |args: &[&str]| -> Vec<String> {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "branch sort");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_start_matches(['*', ' ']).trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    };
+
+    // `expect` both names so a missing branch fails loudly instead of a `None`
+    // position satisfying a relative-order comparison.
+    let pos = |list: &[String], name: &str| -> usize {
+        list.iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("branch '{name}' missing from {list:?}"))
+    };
+
+    // committerdate ascending: zzz (older) before aaa (newer).
+    let by_date = order(&["branch", "--sort=committerdate"]);
+    assert!(
+        pos(&by_date, "zzz") < pos(&by_date, "aaa"),
+        "committerdate: older zzz must precede newer aaa: {by_date:?}"
+    );
+    // refname ascending: aaa before zzz (the OPPOSITE order — proves date != name).
+    let by_name = order(&["branch", "--sort=refname"]);
+    assert!(
+        pos(&by_name, "aaa") < pos(&by_name, "zzz"),
+        "refname: aaa must precede zzz: {by_name:?}"
+    );
+    // -committerdate reverses: newer aaa before older zzz.
+    let by_date_rev = order(&["branch", "--sort=-committerdate"]);
+    assert!(
+        pos(&by_date_rev, "aaa") < pos(&by_date_rev, "zzz"),
+        "-committerdate: newer aaa must precede older zzz: {by_date_rev:?}"
+    );
+
+    // creatordate uses the same committer-date basis for branches: same ordering.
+    let by_creator = order(&["branch", "--sort=creatordate"]);
+    assert!(
+        pos(&by_creator, "zzz") < pos(&by_creator, "aaa"),
+        "creatordate: older zzz must precede newer aaa: {by_creator:?}"
+    );
+    let by_creator_rev = order(&["branch", "--sort=-creatordate"]);
+    assert!(
+        pos(&by_creator_rev, "aaa") < pos(&by_creator_rev, "zzz"),
+        "-creatordate: newer aaa must precede older zzz: {by_creator_rev:?}"
+    );
+
+    // authordate sorts by the tip commit's author date (oldest first), like
+    // committerdate here: zzz (older) before aaa (newer), reversible.
+    let by_author = order(&["branch", "--sort=authordate"]);
+    assert!(
+        pos(&by_author, "zzz") < pos(&by_author, "aaa"),
+        "authordate: older zzz must precede newer aaa: {by_author:?}"
+    );
+    let by_author_rev = order(&["branch", "--sort=-authordate"]);
+    assert!(
+        pos(&by_author_rev, "aaa") < pos(&by_author_rev, "zzz"),
+        "-authordate: newer aaa must precede older zzz: {by_author_rev:?}"
+    );
+
+    // objectsize sorts by the tip object's byte size: aaa's tip carries the long
+    // message and is therefore larger than zzz's, so ascending object size puts
+    // the smaller zzz before aaa; reversible.
+    let by_size = order(&["branch", "--sort=objectsize"]);
+    assert!(
+        pos(&by_size, "zzz") < pos(&by_size, "aaa"),
+        "objectsize: smaller root-commit zzz must precede larger aaa: {by_size:?}"
+    );
+    let by_size_rev = order(&["branch", "--sort=-objectsize"]);
+    assert!(
+        pos(&by_size_rev, "aaa") < pos(&by_size_rev, "zzz"),
+        "-objectsize: larger aaa must precede smaller zzz: {by_size_rev:?}"
+    );
+
+    // objectname sorts by the tip commit's object id (lexicographic on the hex
+    // hash, matching Git's binary-oid order), with the refname tie-break for
+    // branches sharing a tip. Read the hash alongside each name and assert the
+    // listing matches a hash-sorted expectation derived from the same data, so
+    // the check is deterministic regardless of which hashes are produced.
+    let with_hash = |args: &[&str]| -> Vec<(String, String)> {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "branch sort objectname");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(|l| {
+                let l = l.trim_start_matches(['*', ' ']).trim();
+                let (h, n) = l.split_once(' ')?;
+                Some((h.to_string(), n.to_string()))
+            })
+            .collect()
+    };
+    let asc = with_hash(&[
+        "branch",
+        "--sort=objectname",
+        "--format=%(objectname) %(refname:short)",
+    ]);
+    let mut expect = asc.clone();
+    expect.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| a.1.cmp(&b.1)));
+    assert_eq!(
+        asc, expect,
+        "objectname: branches ordered by ascending tip hash"
+    );
+    let desc = with_hash(&[
+        "branch",
+        "--sort=-objectname",
+        "--format=%(objectname) %(refname:short)",
+    ]);
+    let mut expect_rev = desc.clone();
+    // `-` reverses the primary (hash) key but the refname tie-break stays ascending.
+    expect_rev.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| a.1.cmp(&b.1)));
+    assert_eq!(
+        desc, expect_rev,
+        "-objectname: branches ordered by descending tip hash"
+    );
+
+    // An unknown sort key is a usage error (exit 129).
+    let bad = run_libra_command(&["branch", "--sort=bogus"], p);
+    assert_eq!(bad.status.code(), Some(129), "unknown sort key exits 129");
+}
+
+/// `--sort=authordate` orders by the tip commit's AUTHOR date (not committer
+/// date), and a reversed sort keeps the refname tie-break ascending. Uses two
+/// crafted commits whose author/committer dates are swapped so `authordate` and
+/// `committerdate` produce OPPOSITE orders — proving the author timestamp drives
+/// `authordate`.
+#[test]
+fn test_branch_sort_authordate_uses_author_date_and_keeps_tiebreak() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    let tree = {
+        let cat = run_libra_command(&["cat-file", "-p", "HEAD"], p);
+        String::from_utf8_lossy(&cat.stdout)
+            .lines()
+            .find_map(|l| l.strip_prefix("tree ").map(str::to_string))
+            .expect("HEAD has a tree")
+    };
+    // Craft a commit with explicit (author_ts, committer_ts) and return its oid.
+    let craft = |name: &str, author_ts: u64, committer_ts: u64| -> String {
+        let body = format!(
+            "tree {tree}\nauthor a <a@b> {author_ts} +0000\ncommitter a <a@b> {committer_ts} +0000\n\nmsg {name}\n"
+        );
+        let file = p.join(format!("{name}.commit"));
+        std::fs::write(&file, body).unwrap();
+        let out = run_libra_command(
+            &[
+                "hash-object",
+                "-t",
+                "commit",
+                "--literally",
+                "-w",
+                file.to_str().unwrap(),
+            ],
+            p,
+        );
+        assert_cli_success(&out, "hash-object crafted commit");
+        let oid = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        assert_cli_success(
+            &run_libra_command(&["branch", name, &oid], p),
+            "branch -> crafted",
+        );
+        oid
+    };
+    // ax: author OLD (100), committer NEW (900). ay: the reverse.
+    craft("ax", 100, 900);
+    craft("ay", 900, 100);
+    // tie_a / tie_z share ax's dates (author 100) to exercise the tie-break.
+    craft("tie_a", 100, 900);
+    craft("tie_z", 100, 900);
+
+    let order = |args: &[&str]| -> Vec<String> {
+        let out = run_libra_command(args, p);
+        assert_cli_success(&out, "branch sort");
+        String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.trim_start_matches(['*', ' ']).trim().to_string())
+            .filter(|l| !l.is_empty())
+            .collect()
+    };
+    let pos = |list: &[String], name: &str| -> usize {
+        list.iter()
+            .position(|n| n == name)
+            .unwrap_or_else(|| panic!("branch '{name}' missing from {list:?}"))
+    };
+
+    // authordate: ax (author 100) before ay (author 900).
+    let by_author = order(&["branch", "--sort=authordate"]);
+    assert!(
+        pos(&by_author, "ax") < pos(&by_author, "ay"),
+        "authordate: ax (older author date) before ay: {by_author:?}"
+    );
+    // committerdate: OPPOSITE — ay (committer 100) before ax (committer 900).
+    let by_committer = order(&["branch", "--sort=committerdate"]);
+    assert!(
+        pos(&by_committer, "ay") < pos(&by_committer, "ax"),
+        "committerdate must use committer date (opposite of authordate): {by_committer:?}"
+    );
+
+    // Reversed sort keeps the refname tie-break ASCENDING: among the equal-author
+    // (100) branches, tie_a must still precede tie_z under -authordate.
+    let by_author_rev = order(&["branch", "--sort=-authordate"]);
+    assert!(
+        pos(&by_author_rev, "tie_a") < pos(&by_author_rev, "tie_z"),
+        "-authordate keeps the refname tie-break ascending: {by_author_rev:?}"
+    );
+}
+
+/// `branch --format` renders each branch via the for-each-ref atom engine,
+/// replacing the default `* name` listing. `%(refname:short)`, `%(objectname)`,
+/// `%(HEAD)`, and `%(if)` blocks all resolve.
+#[test]
+fn branch_format_renders_for_each_ref_atoms() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], p),
+        "branch feature",
+    );
+
+    let head = run_libra_command(&["rev-parse", "HEAD"], p);
+    let full_oid = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+    // %(refname) is the full ref; %(objectname) the full hash.
+    let out = run_libra_command(&["branch", "--format=%(refname) %(objectname)"], p);
+    assert_cli_success(&out, "branch --format");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("refs/heads/feature {full_oid}")),
+        "expected full refname + objectname line: {text}"
+    );
+    assert!(
+        text.lines().all(|l| l.starts_with("refs/heads/")),
+        "every line is a formatted ref, no `* ` marker: {text}"
+    );
+
+    // %(HEAD) marks the current branch; %(if)/%(then)/%(end) works.
+    let marked = run_libra_command(
+        &[
+            "branch",
+            "--format=%(refname:short)%(if)%(HEAD)%(then) <-%(end)",
+        ],
+        p,
+    );
+    assert_cli_success(&marked, "branch --format HEAD marker");
+    let marked_text = String::from_utf8_lossy(&marked.stdout);
+    let current =
+        String::from_utf8_lossy(&run_libra_command(&["branch", "--show-current"], p).stdout)
+            .trim()
+            .to_string();
+    assert!(
+        marked_text.lines().any(|l| l == format!("{current} <-")),
+        "current branch should carry the HEAD marker: {marked_text}"
+    );
+    assert!(
+        marked_text.lines().any(|l| l == "feature"),
+        "non-current branch should have no marker: {marked_text}"
     );
 }

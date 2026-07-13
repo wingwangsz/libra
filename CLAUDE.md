@@ -160,6 +160,7 @@ pnpm --dir web install --frozen-lockfile && pnpm --dir web build
 | `test-live-cloud` | Gate L3 tests hitting real D1/R2 endpoints |
 | `test-provider` | Deterministic hidden provider for local TUI automation tests (requires `LIBRA_ENABLE_TEST_PROVIDER=1`) |
 | `subagent-scaffold` | Schema-only sub-agent contract scaffold (CEX-S2-10, gated on CP-4 in production) |
+| `otlp` | OTLP trace export (lore.md 1.7): one vetted command-span to an explicitly configured collector; default binary unaffected |
 
 ### CI Pipeline (`.github/workflows/base.yml`)
 
@@ -288,7 +289,7 @@ docs(readme): update provider table
 
 SQLite database at `.libra/libra.db`. Tables fall into three groups:
 
-- **Git core**: `config`, `config_kv`, `reference`, `reflog`, `rebase_state`, `object_index`, `schema_version`
+- **Git core**: `config`, `config_kv`, `reference`, `reflog`, `rebase_state`, `object_index`, `schema_version`, `metadata_kv` (branch/repo metadata KV, lore.md 1.5), `working_dirty`/`working_dirty_meta` (dirty-set cache, lore.md 1.1)
 - **AI threads & scheduling**: `ai_thread`, `ai_thread_participant`, `ai_thread_intent`, `ai_thread_provider_metadata`, `ai_scheduler_state`, `ai_scheduler_plan_head`, `ai_scheduler_selected_plan`, `ai_live_context_window`
 - **AI runtime contracts**: `ai_index_intent_plan`, `ai_index_intent_task`, `ai_index_intent_context_frame`, `ai_index_plan_step_task`, `ai_index_run_event`, `ai_index_run_patchset`, `ai_index_task_run`, `ai_decision_proposal`, `ai_risk_score_breakdown`, `ai_validation_report`
 
@@ -312,7 +313,7 @@ The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`,
 | `ollama` | — | `OLLAMA_BASE_URL` or `--api-base` |
 
 ### Cloud Storage (S3/R2)
-`LIBRA_STORAGE_TYPE`, `LIBRA_STORAGE_BUCKET`, `LIBRA_STORAGE_ENDPOINT`, `LIBRA_STORAGE_REGION`, `LIBRA_STORAGE_ACCESS_KEY`, `LIBRA_STORAGE_SECRET_KEY`, `LIBRA_STORAGE_THRESHOLD`, `LIBRA_STORAGE_CACHE_SIZE`, `LIBRA_STORAGE_ALLOW_HTTP` (set to `"true"` to permit non-TLS HTTP endpoints, useful for local/dev S3-compatible stores)
+`LIBRA_STORAGE_TYPE`, `LIBRA_STORAGE_BUCKET`, `LIBRA_STORAGE_ENDPOINT`, `LIBRA_STORAGE_REGION`, `LIBRA_STORAGE_ACCESS_KEY`, `LIBRA_STORAGE_SECRET_KEY`, `LIBRA_STORAGE_THRESHOLD`, `LIBRA_STORAGE_CACHE_SIZE`, `LIBRA_STORAGE_ALLOW_HTTP` (set to `"true"` to permit non-TLS HTTP endpoints, useful for local/dev S3-compatible stores). Inspect the resolved tier/threshold/cache-budget with `libra cache info` (`--json`)
 
 ### Cloud Backup (D1/R2)
 `LIBRA_D1_ACCOUNT_ID`, `LIBRA_D1_API_TOKEN`, `LIBRA_D1_DATABASE_ID`
@@ -320,7 +321,11 @@ The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`,
 ### Build & Runtime
 - `LIBRA_SKIP_WEB_BUILD=1` — skip the Next.js web build in `build.rs` (set by every CI job except `compat-web-check`)
 - `LIBRA_LOG`, `RUST_LOG` — `tracing-subscriber` env filter
-- `LIBRA_LOG_FILE` — append-mode tracing sink path
+- `LIBRA_LOG_FILE` — tracing sink path (append-mode by default; time-rolled when `LIBRA_LOG_ROTATION` is set)
+- `LIBRA_LOG_ROTATION` — rolling strategy for `LIBRA_LOG_FILE`: `never` (default) / `minutely` / `hourly` / `daily` (`tracing-appender`, time-split only — no old-file pruning); inspect via `libra logfile info`
+- `LIBRA_SYNC_DATA` — set to `1`/`true`/`yes`/`on` to fsync local object writes for power-loss durability (same as the global `--sync-data` flag)
+- `LIBRA_READ_POLICY` — tiered-storage object read source: `auto` (default, local-first then remote) / `offline` / `local` (local-only) / `remote` (refresh from durable tier). An unrecognized value is a hard error (a typo must not silently re-enable remote reads). The global `--offline` flag overrides this to local-only. No-op for local-only repos
+- `LIBRA_MAX_CONNECTIONS` — max concurrent remote connections/requests (positive integer; default 16), bounding remote fan-out (e.g. `exist_batch`) on large repos/CI. The global `--max-connections` flag overrides it; an invalid value is a hard error. No-op for local-only operations
 - `LIBRA_PAGER` — pager override (falls back to system `PAGER` then `less`)
 - `LIBRA_NO_HIDE_PASSWORD` — show password prompts in plain text (debugging)
 - `LIBRA_CONFIG_GLOBAL_DB` — override the global config SQLite path
@@ -329,6 +334,7 @@ The publish Worker uses its own D1 schema in `sql/publish/` (`0001_publish.sql`,
 - `LIBRA_CODE_LEASE_DURATION_MS` — `libra code` automation lease length
 - `LIBRA_SANDBOX_ENFORCEMENT`, `LIBRA_SANDBOX_NETWORK_DISABLED`, `LIBRA_LINUX_SANDBOX_EXE`, `LIBRA_USE_LINUX_SANDBOX_BWRAP` — sandbox toggles (`docs/development/commands/sandbox.md`)
 - `LIBRA_ERROR_JSON`, `LIBRA_FINE_EXIT_CODES` — stable-error-code surface toggles
+- `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT` / `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_SDK_DISABLED` — OTLP telemetry gate (only with `--features otlp`; no default endpoint — unset means nothing is exported)
 
 The following are baked-in constants (no env-var override) — listed
 here so contributors do not waste time trying to set them at runtime:

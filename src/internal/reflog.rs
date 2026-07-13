@@ -98,23 +98,48 @@ impl Display for ReflogContext {
             ReflogAction::Push => write!(f, "push"),
             ReflogAction::Rebase { state, details } => write!(f, "({state}) {details}"),
             ReflogAction::Clone { from } => write!(f, "from {from}"),
+            ReflogAction::UpdateRef { message } => write!(f, "{message}"),
         }
     }
 }
 
 #[derive(Debug)]
 pub enum ReflogAction {
-    Commit { message: String },
-    Reset { target: String },
-    Checkout { from: String, to: String },
-    Switch { from: String, to: String },
-    Merge { branch: String, policy: String },
-    CherryPick { source_message: String },
-    Rebase { state: String, details: String },
+    Commit {
+        message: String,
+    },
+    Reset {
+        target: String,
+    },
+    Checkout {
+        from: String,
+        to: String,
+    },
+    Switch {
+        from: String,
+        to: String,
+    },
+    Merge {
+        branch: String,
+        policy: String,
+    },
+    CherryPick {
+        source_message: String,
+    },
+    Rebase {
+        state: String,
+        details: String,
+    },
     Fetch,
     Pull,
     Push,
-    Clone { from: String },
+    Clone {
+        from: String,
+    },
+    /// A direct ref update via `update-ref` (carries the optional `-m` reason).
+    UpdateRef {
+        message: String,
+    },
 }
 
 #[derive(Copy, Clone)]
@@ -132,6 +157,7 @@ pub enum ReflogActionKind {
     Pull,
     Push,
     Clone,
+    UpdateRef,
 }
 
 impl Display for ReflogActionKind {
@@ -148,6 +174,7 @@ impl Display for ReflogActionKind {
             Self::Pull => write!(f, "pull"),
             Self::Push => write!(f, "push"),
             Self::Clone => write!(f, "clone"),
+            Self::UpdateRef => write!(f, "update-ref"),
         }
     }
 }
@@ -166,6 +193,7 @@ impl ReflogAction {
             Self::Checkout { .. } => ReflogActionKind::Checkout,
             Self::Fetch => ReflogActionKind::Fetch,
             Self::Push => ReflogActionKind::Push,
+            Self::UpdateRef { .. } => ReflogActionKind::UpdateRef,
         }
     }
 }
@@ -194,6 +222,13 @@ impl Reflog {
             .unwrap_or("admin@mega.org".to_string());
         let message = context.to_string();
 
+        // lore.md 2.1: the HEAD reflog is PER-WORKTREE; branch reflogs
+        // (refs/heads/*) stay shared (worktree_id NULL).
+        let worktree_id = if ref_to_log == HEAD {
+            crate::utils::util::current_worktree_id()
+        } else {
+            None
+        };
         let model = ActiveModel {
             ref_name: Set(ref_to_log.to_string()),
             old_oid: Set(context.old_oid.clone()),
@@ -203,6 +238,7 @@ impl Reflog {
             committer_email: Set(email),
             timestamp: Set(timestamp_seconds()),
             message: Set(message),
+            worktree_id: Set(worktree_id),
             ..Default::default()
         };
 
@@ -246,22 +282,41 @@ impl Reflog {
         db: &C,
         ref_name: &str,
     ) -> Result<Vec<Model>, ReflogError> {
-        Ok(reflog::Entity::find()
-            .filter(reflog::Column::RefName.eq(ref_name))
-            .order_by_desc(reflog::Column::Timestamp)
-            .all(db)
-            .await?)
+        Ok(Self::scope_head(
+            reflog::Entity::find().filter(reflog::Column::RefName.eq(ref_name)),
+            ref_name,
+        )
+        .order_by_desc(reflog::Column::Timestamp)
+        .all(db)
+        .await?)
     }
 
     pub async fn find_one<C: ConnectionTrait>(
         db: &C,
         ref_name: &str,
     ) -> Result<Option<Model>, ReflogError> {
-        Ok(reflog::Entity::find()
-            .filter(reflog::Column::RefName.eq(ref_name))
-            .order_by_desc(reflog::Column::Timestamp)
-            .one(db)
-            .await?)
+        Ok(Self::scope_head(
+            reflog::Entity::find().filter(reflog::Column::RefName.eq(ref_name)),
+            ref_name,
+        )
+        .order_by_desc(reflog::Column::Timestamp)
+        .one(db)
+        .await?)
+    }
+
+    /// lore.md 2.1: scope a HEAD-reflog query to the current worktree (branch
+    /// reflogs are shared, unscoped).
+    fn scope_head(
+        query: sea_orm::Select<reflog::Entity>,
+        ref_name: &str,
+    ) -> sea_orm::Select<reflog::Entity> {
+        if ref_name != HEAD {
+            return query;
+        }
+        match crate::utils::util::current_worktree_id() {
+            Some(id) => query.filter(reflog::Column::WorktreeId.eq(id)),
+            None => query.filter(reflog::Column::WorktreeId.is_null()),
+        }
     }
 }
 

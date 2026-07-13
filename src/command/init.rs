@@ -17,8 +17,12 @@ use serde::Serialize;
 
 use crate::{
     internal::{
-        config::{ConfigKv, LocalIdentityTarget, resolve_user_identity_sources},
+        config::{
+            ConfigKv, LocalIdentityTarget, read_cascaded_config_value_strict,
+            resolve_user_identity_sources,
+        },
         db::{self, get_db_conn_instance_for_path},
+        head::Head,
         model::{config, reference},
     },
     utils::{
@@ -30,7 +34,7 @@ use crate::{
 };
 
 const DEFAULT_BRANCH: &str = "main";
-const ISSUE_URL: &str = "https://github.com/web3infra-foundation/libra/issues";
+const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 const EXAMPLES: &str = r#"EXAMPLES:
     libra init                                 Initialize in current directory
     libra init my-project                      Initialize in a new directory
@@ -78,8 +82,8 @@ pub enum InitError {
         hint: Option<String>,
     },
 
-    #[error("repository already initialized at '{path}'")]
-    AlreadyInitialized { path: PathBuf },
+    #[error("failed to read config '{key}': {detail}")]
+    ConfigRead { key: String, detail: String },
 
     #[error("source git repository '{path}' does not exist")]
     SourcePathNotFound { path: PathBuf },
@@ -126,22 +130,13 @@ impl From<InitError> for CliError {
                 }
                 cli
             }
-            InitError::AlreadyInitialized { path } => {
-                // Intent: this is an invalid repository state, not an I/O
-                // failure. The recovery is to remove the existing Libra state
-                // before retrying.
-                let remove_target = if path.file_name() == Some(std::ffi::OsStr::new(ROOT_DIR)) {
-                    ".libra/".to_string()
-                } else {
-                    path.display().to_string()
-                };
-                CliError::fatal(format!(
-                    "repository already initialized at '{}'",
-                    path.display()
-                ))
-                .with_stable_code(StableErrorCode::RepoStateInvalid)
-                .with_hint(format!("remove {remove_target} to reinitialize."))
-            }
+            InitError::ConfigRead { key, detail } => CliError::fatal(format!(
+                "failed to read config '{key}': {detail}"
+            ))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+            .with_hint(format!(
+                "fix or remove the unreadable config with 'libra config --global {key} <name>'"
+            )),
             InitError::SourcePathNotFound { path } => {
                 // Intent: conversion cannot read the requested source path; the
                 // repository state is unchanged, so classify as a read failure.
@@ -246,6 +241,10 @@ pub struct InitOutput {
     pub converted_from: Option<String>,
     pub ssh_key_detected: Option<String>,
     pub warnings: Vec<String>,
+    /// `true` when this was a Git-style re-initialization of an existing repository
+    /// (layout topped-up, database/config/refs preserved) rather than a fresh init.
+    #[serde(default)]
+    pub reinitialized: bool,
 }
 
 #[derive(Parser, Debug, Clone)]
@@ -259,7 +258,7 @@ pub struct InitArgs {
     #[clap(long = "template", name = "template-directory", required = false)]
     pub template: Option<String>,
 
-    /// Override the initial branch name (default: `main`)
+    /// Override the initial branch name (default: `init.defaultBranch`, then `main`)
     #[clap(short = 'b', long, required = false)]
     pub initial_branch: Option<String>,
 
@@ -271,7 +270,7 @@ pub struct InitArgs {
     #[clap(long, short = 'q', required = false)]
     pub quiet: bool,
 
-    /// Filesystem sharing mode for the repository (placeholder — see `git init --shared`)
+    /// Filesystem sharing mode: false, umask, group/true, all/world/everybody, or traversable octal like 0770
     #[clap(long, required = false, value_name = "MODE")]
     pub shared: Option<String>,
 
@@ -390,6 +389,18 @@ pub async fn execute_safe(args: InitArgs, output: &OutputConfig) -> CliResult<()
 }
 
 fn render_init_result(result: &InitOutput, output: &OutputConfig) -> CliResult<()> {
+    // Handle warnings before any early return: record them so `--exit-code-on-warning`
+    // fires in every output mode, and (in non-JSON modes) print them to stderr — the
+    // `--quiet` contract silences stdout but keeps warnings/errors on stderr. In JSON
+    // mode they travel inside the structured payload instead.
+    if !result.warnings.is_empty() {
+        crate::utils::output::record_warning();
+        if !output.is_json() {
+            for warning in &result.warnings {
+                eprintln!("warning: {warning}");
+            }
+        }
+    }
     if output.is_json() {
         return emit_json_data("init", result, output);
     }
@@ -398,10 +409,17 @@ fn render_init_result(result: &InitOutput, output: &OutputConfig) -> CliResult<(
     }
 
     let repo_type = if result.bare { " bare" } else { "" };
-    println!(
-        "Initialized empty{repo_type} Libra repository in {}",
-        result.path
-    );
+    if result.reinitialized {
+        println!(
+            "Reinitialized existing{repo_type} Libra repository in {}",
+            result.path
+        );
+    } else {
+        println!(
+            "Initialized empty{repo_type} Libra repository in {}",
+            result.path
+        );
+    }
     println!("  branch: {}", result.initial_branch);
     println!(
         "  signing: {}",
@@ -434,10 +452,6 @@ fn render_init_result(result: &InitOutput, output: &OutputConfig) -> CliResult<(
             println!("     generate one with: libra config generate-ssh-key --remote origin");
             println!("     or create a system key: ssh-keygen -t ed25519");
         }
-    }
-
-    for warning in &result.warnings {
-        eprintln!("warning: {warning}");
     }
 
     Ok(())
@@ -479,6 +493,37 @@ pub async fn init(args: InitArgs) -> Result<(), InitError> {
     run_init(args).await.map(|_| ())
 }
 
+async fn resolve_initial_branch_name(
+    cli_value: Option<&str>,
+    ref_format: &RefFormat,
+) -> Result<String, InitError> {
+    if let Some(branch) = cli_value {
+        return Ok(branch.to_string());
+    }
+
+    match read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, "init.defaultBranch")
+        .await
+    {
+        Ok(Some(branch)) => {
+            if let Err(error) = validate_branch_name(&branch, ref_format) {
+                return Err(InitError::InvalidArgument {
+                    message: format!("invalid init.defaultBranch value '{branch}': {error}"),
+                    hint: Some(
+                        "set a valid branch with 'libra config --global init.defaultBranch <name>' or pass --initial-branch"
+                            .to_string(),
+                    ),
+                });
+            }
+            Ok(branch)
+        }
+        Ok(None) => Ok(DEFAULT_BRANCH.to_string()),
+        Err(error) => Err(InitError::ConfigRead {
+            key: "init.defaultBranch".to_string(),
+            detail: format!("{error:#}"),
+        }),
+    }
+}
+
 async fn run_init_internal(
     args: InitArgs,
     progress: &InitProgress,
@@ -486,31 +531,51 @@ async fn run_init_internal(
     let current_dir = cur_dir();
     let target_dir = resolve_cli_path(&current_dir, &args.repo_directory);
     let root_dir = storage_root(&target_dir, args.bare);
-    let from_git = args
-        .from_git_repository
-        .as_ref()
-        .map(|path| resolve_existing_cli_path(&current_dir, path))
-        .transpose()?;
     let template_dir = args
         .template
         .as_ref()
         .map(|path| resolve_template_path(&current_dir, path))
         .transpose()?;
-    let object_format = resolve_object_format(args.object_format.as_deref())?;
-    let ref_format = args.ref_format.clone().unwrap_or(RefFormat::Strict);
-    let initial_branch_name = args
-        .initial_branch
-        .clone()
-        .unwrap_or_else(|| DEFAULT_BRANCH.to_string());
-
-    validate_branch_name(&initial_branch_name, &ref_format)?;
-    validate_shared_mode(args.shared.as_deref())?;
+    let shared_mode = parse_shared_mode(args.shared.as_deref())?;
 
     if is_reinit(&target_dir, args.bare) {
-        return Err(InitError::AlreadyInitialized {
-            path: root_dir.clone(),
-        });
+        // Git-style safe re-initialization: top-up the standard layout and re-apply
+        // `--shared`, but PRESERVE the existing database (config, HEAD, refs, objects,
+        // vault, repo id). Never recreate config/refs here. Reached BEFORE resolving
+        // `--from-git-repository` so that flag is rejected by its raw presence rather
+        // than failing first on a missing source path.
+        return reinitialize_existing(
+            &args,
+            &root_dir,
+            template_dir.as_deref(),
+            shared_mode.as_ref(),
+            progress,
+        )
+        .await;
     }
+
+    let from_git = args
+        .from_git_repository
+        .as_ref()
+        .map(|path| resolve_existing_cli_path(&current_dir, path))
+        .transpose()?;
+    if let Some(source) = from_git.as_deref() {
+        // Conversion validation must precede every target write. Keep the same
+        // validation inside the converter as defense in depth for direct callers.
+        convert::validate_source_head(source)?;
+    }
+    let is_git_conversion = from_git.is_some();
+    let object_format = resolve_object_format(args.object_format.as_deref())?;
+    let ref_format = args.ref_format.clone().unwrap_or(RefFormat::Strict);
+    let initial_branch_name = if is_git_conversion {
+        // Git conversion selects HEAD from the source repository's branch layout;
+        // use a harmless placeholder until `clone::setup_repository` installs it.
+        DEFAULT_BRANCH.to_string()
+    } else {
+        resolve_initial_branch_name(args.initial_branch.as_deref(), &ref_format).await?
+    };
+
+    validate_branch_name(&initial_branch_name, &ref_format)?;
 
     if target_dir.exists() {
         is_writable(&target_dir)?;
@@ -526,7 +591,26 @@ async fn run_init_internal(
     // vault setup run; those later stages persist their durable state through
     // this connection/path and assume schema bootstrap has completed.
     let conn = create_database_connection(&database_path).await?;
-    let repo_id = init_config(&conn, args.bare, &object_format, &ref_format).await?;
+    // Probe the actual filesystem (root_dir already exists at this point):
+    // non-bare repos probe the parent of `.libra`; bare repos have no
+    // worktree, so case handling is moot — record false.
+    let ignore_case = if args.bare {
+        false
+    } else {
+        root_dir
+            .parent()
+            .map(crate::utils::path_case::probe_dir_ignore_case)
+            .unwrap_or(false)
+    };
+    let repo_id = init_config(
+        &conn,
+        args.bare,
+        &object_format,
+        &ref_format,
+        ignore_case,
+        shared_mode.as_ref(),
+    )
+    .await?;
 
     progress.emit("Setting up refs ...");
     // INVARIANT: refs are initialized after core config so HEAD/branch rows are
@@ -535,7 +619,7 @@ async fn run_init_internal(
     initialize_refs(&conn, &initial_branch_name).await?;
 
     set_dir_hidden(&root_dir)?;
-    if let Some(shared_mode) = args.shared.as_deref() {
+    if let Some(shared_mode) = shared_mode.as_ref() {
         apply_shared(&root_dir, shared_mode)?;
     }
 
@@ -563,6 +647,20 @@ async fn run_init_internal(
         Some(report.source_git_dir)
     } else {
         None
+    };
+
+    let initial_branch_name = if converted_from.is_some() {
+        let _guard = CurrentDirGuard::change_to(&target_guard_path)?;
+        match Head::current_result().await.map_err(|error| {
+            InitError::Database(DbErr::Custom(format!(
+                "failed to read converted HEAD: {error}"
+            )))
+        })? {
+            Head::Branch(name) => name,
+            Head::Detached(_) => "HEAD".to_string(),
+        }
+    } else {
+        initial_branch_name
     };
 
     if args.vault {
@@ -598,7 +696,164 @@ async fn run_init_internal(
         converted_from,
         ssh_key_detected: detect_system_ssh_key(),
         warnings,
+        reinitialized: false,
     })
+}
+
+/// Git-style safe re-initialization of an existing repository: top up the standard
+/// layout (re-copy templates, ensure directories), re-apply `--shared`, and report
+/// the EXISTING identity/format read from the preserved database. The database
+/// (config, HEAD, refs, objects, vault, repo id) is never recreated, matching
+/// `git init`'s "Reinitialized existing repository" behavior.
+async fn reinitialize_existing(
+    args: &InitArgs,
+    root_dir: &Path,
+    template_dir: Option<&Path>,
+    shared_mode: Option<&SharedMode>,
+    progress: &InitProgress,
+) -> Result<InitOutput, InitError> {
+    // Validate all flags BEFORE any filesystem side effects, so an invalid invocation
+    // leaves the existing repository's layout and permissions untouched (matching
+    // fresh init, which validates before mutating).
+    //
+    // Converting a Git repository into an ALREADY-initialized Libra repository is not
+    // supported — conversion must target a fresh directory.
+    if args.from_git_repository.is_some() {
+        return Err(InitError::InvalidArgument {
+            message: "cannot use --from-git-repository on an already-initialized repository"
+                .to_string(),
+            hint: Some(
+                "re-initialization only tops up the existing repository; convert into a fresh directory instead"
+                    .to_string(),
+            ),
+        });
+    }
+    if let Some(requested) = args.initial_branch.as_deref() {
+        let requested_ref_format = args.ref_format.clone().unwrap_or(RefFormat::Strict);
+        validate_branch_name(requested, &requested_ref_format)?;
+    }
+    // Normalize/validate the requested object format once; reused for the warning.
+    let requested_object_format = args
+        .object_format
+        .as_deref()
+        .map(|format| resolve_object_format(Some(format)))
+        .transpose()?;
+
+    progress.emit("Reinitializing existing repository ...");
+    fs::create_dir_all(root_dir)?;
+    prepare_repository_layout(root_dir, template_dir)?;
+    set_dir_hidden(root_dir)?;
+    if let Some(shared_mode) = shared_mode {
+        // `apply_shared` skips the vault database/sidecars, so private signing
+        // material keeps its owner-only mode through the chmod sweep.
+        apply_shared(root_dir, shared_mode)?;
+    }
+
+    let database_path = root_dir.join(DATABASE);
+    // Connect to the EXISTING database (schema auto-upgrades on open); never recreate
+    // it — `create_database_connection` would reject an existing file.
+    let conn = get_db_conn_instance_for_path(&database_path)
+        .await
+        .map_err(InitError::Io)?;
+    if let Some(shared_mode) = shared_mode {
+        persist_shared_repository(&conn, shared_mode).await?;
+    }
+
+    let object_format = read_config_string(&conn, "core.objectformat")
+        .await?
+        .unwrap_or_else(|| "sha1".to_string());
+    let ref_format = read_config_string(&conn, "core.initrefformat")
+        .await?
+        .unwrap_or_else(|| RefFormat::Strict.as_str().to_string());
+    let repo_id = read_config_string(&conn, "libra.repoid")
+        .await?
+        .unwrap_or_default();
+    let bare = read_config_string(&conn, "core.bare")
+        .await?
+        .map(|value| value == "true")
+        .unwrap_or(args.bare);
+    let vault_signing = read_config_string(&conn, "vault.signing")
+        .await?
+        .map(|value| value == "true")
+        .unwrap_or(false);
+    // Use the fallible HEAD reader so a missing/corrupt HEAD surfaces a structured
+    // error rather than panicking.
+    let initial_branch = match Head::current_result_with_conn(&conn)
+        .await
+        .map_err(|error| {
+            InitError::Database(DbErr::Custom(format!(
+                "failed to read HEAD during re-initialization: {error}"
+            )))
+        })? {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "HEAD".to_string(),
+    };
+
+    set_hash_kind(match object_format.as_str() {
+        "sha256" => HashKind::Sha256,
+        _ => HashKind::Sha1,
+    });
+
+    // Flags that cannot change an existing repository were validated above; here they
+    // are accepted-but-ignored with a warning when they differ from the stored value
+    // (Git's tolerant top-up), so the user knows the existing value wins.
+    let mut warnings = Vec::new();
+    if let Some(requested) = args.initial_branch.as_deref()
+        && requested != initial_branch
+    {
+        warnings.push(format!(
+            "ignoring --initial-branch '{requested}' on re-initialization; keeping '{initial_branch}'"
+        ));
+    }
+    if let Some(requested) = &requested_object_format
+        && requested != &object_format
+    {
+        warnings.push(format!(
+            "ignoring --object-format '{requested}' on re-initialization; keeping '{object_format}'"
+        ));
+    }
+
+    let path = root_dir
+        .canonicalize()
+        .unwrap_or_else(|_| root_dir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    Ok(InitOutput {
+        path,
+        bare,
+        initial_branch,
+        object_format,
+        ref_format,
+        repo_id,
+        vault_signing,
+        converted_from: None,
+        ssh_key_detected: detect_system_ssh_key(),
+        warnings,
+        reinitialized: true,
+    })
+}
+
+/// Read a single config value from the repository database, mapping store errors to
+/// [`InitError::Database`]. Returns `None` when the key is unset.
+async fn read_config_string(conn: &DbConn, key: &str) -> Result<Option<String>, InitError> {
+    ConfigKv::get_with_conn(conn, key)
+        .await
+        .map(|entry| entry.map(|entry| entry.value))
+        .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))
+}
+
+async fn persist_shared_repository(
+    conn: &DbConn,
+    shared_mode: &SharedMode,
+) -> Result<(), InitError> {
+    ConfigKv::set_with_conn(
+        conn,
+        "core.sharedRepository",
+        shared_mode.config_value(),
+        false,
+    )
+    .await
+    .map_err(|error| InitError::Database(DbErr::Custom(error.to_string())))
 }
 
 fn resolve_cli_path(base: &Path, raw: &str) -> PathBuf {
@@ -695,31 +950,66 @@ fn prepare_repository_layout(root_dir: &Path, template_dir: Option<&Path>) -> io
     if let Some(template_dir) = template_dir {
         copy_template(template_dir, root_dir)?;
     } else {
+        // Refuse to top up through a symlinked layout directory: writing into it would
+        // follow the link and escape the repository. (A legitimately symlinked `.libra`
+        // worktree root still contains REAL `info`/`hooks` directories in its shared
+        // target, so this only rejects a directly symlinked layout dir.)
         for dir in ["info", "hooks"] {
-            fs::create_dir_all(root_dir.join(dir))?;
+            let dir_path = root_dir.join(dir);
+            refuse_symlinked_layout_path(&dir_path)?;
+            fs::create_dir_all(&dir_path)?;
         }
-        fs::write(
-            root_dir.join("info/exclude"),
-            include_str!("../../template/exclude"),
-        )?;
-        fs::write(
-            root_dir.join("hooks").join("pre-commit.sh"),
-            include_str!("../../template/pre-commit.sh"),
-        )?;
-        #[cfg(not(target_os = "windows"))]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let perms = fs::Permissions::from_mode(0o755);
-            fs::set_permissions(root_dir.join("hooks").join("pre-commit.sh"), perms)?;
+        // Write each standard template only when nothing exists at the destination —
+        // `symlink_metadata` does NOT follow links, so a Git-style re-init tops up only
+        // truly-missing files: it never clobbers a customized file and never writes
+        // THROUGH a symlinked destination (which could escape the repository).
+        let exclude_path = root_dir.join("info/exclude");
+        if fs::symlink_metadata(&exclude_path).is_err() {
+            fs::write(&exclude_path, include_str!("../../template/exclude"))?;
         }
-        fs::write(
-            root_dir.join("hooks").join("pre-commit.ps1"),
-            include_str!("../../template/pre-commit.ps1"),
-        )?;
+        let pre_commit_sh = root_dir.join("hooks").join("pre-commit.sh");
+        if fs::symlink_metadata(&pre_commit_sh).is_err() {
+            fs::write(&pre_commit_sh, include_str!("../../template/pre-commit.sh"))?;
+            #[cfg(not(target_os = "windows"))]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let perms = fs::Permissions::from_mode(0o755);
+                fs::set_permissions(&pre_commit_sh, perms)?;
+            }
+        }
+        let pre_commit_ps1 = root_dir.join("hooks").join("pre-commit.ps1");
+        if fs::symlink_metadata(&pre_commit_ps1).is_err() {
+            fs::write(
+                &pre_commit_ps1,
+                include_str!("../../template/pre-commit.ps1"),
+            )?;
+        }
     }
 
+    // Guard the top-level `objects` dir (and its leaves) against symlinks before
+    // creating the pack/info subdirectories.
+    refuse_symlinked_layout_path(&root_dir.join("objects"))?;
     for dir in ["objects/pack", "objects/info"] {
+        refuse_symlinked_layout_path(&root_dir.join(dir))?;
         fs::create_dir_all(root_dir.join(dir))?;
+    }
+    Ok(())
+}
+
+/// Reject a layout path that is itself a symlink, so layout top-up never follows a
+/// link out of the repository. Real directories and truly-absent paths are allowed.
+fn refuse_symlinked_layout_path(path: &Path) -> io::Result<()> {
+    if fs::symlink_metadata(path)
+        .map(|metadata| metadata.file_type().is_symlink())
+        .unwrap_or(false)
+    {
+        return Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "refusing to initialize through symlinked layout path '{}'",
+                path.display()
+            ),
+        ));
     }
     Ok(())
 }
@@ -731,45 +1021,136 @@ fn copy_template(src: &Path, dst: &Path) -> io::Result<()> {
         let dest_path = dst.join(entry.file_name());
 
         if file_type.is_dir() {
+            // Never recurse through a symlinked destination directory: it would follow
+            // the link and write template files outside the repository.
+            refuse_symlinked_layout_path(&dest_path)?;
             fs::create_dir_all(&dest_path)?;
             copy_template(&entry.path(), &dest_path)?;
-        } else if !dest_path.exists() {
+        } else if fs::symlink_metadata(&dest_path).is_err() {
+            // `symlink_metadata` does not follow links, so a symlinked destination is
+            // left untouched rather than written through; only truly-absent files are
+            // copied (Git-style top-up that preserves customized files).
             fs::copy(entry.path(), &dest_path)?;
         }
     }
     Ok(())
 }
 
-fn validate_shared_mode(shared_mode: Option<&str>) -> Result<(), InitError> {
-    let Some(shared_mode) = shared_mode else {
-        return Ok(());
-    };
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SharedMode {
+    False,
+    Umask,
+    Group,
+    All,
+    Numeric { raw: String, bits: u32 },
+}
 
-    match shared_mode {
-        "false" | "true" | "umask" | "group" | "all" | "world" | "everybody" => Ok(()),
-        mode if mode.starts_with('0') && mode.len() == 4 => {
-            u32::from_str_radix(&mode[1..], 8)
-                .map_err(|_| invalid_argument(format!("invalid shared mode '{mode}'"), None))?;
-            Ok(())
+impl SharedMode {
+    fn parse(raw: &str) -> Result<Self, InitError> {
+        match raw {
+            "false" => Ok(Self::False),
+            "umask" => Ok(Self::Umask),
+            "true" | "group" => Ok(Self::Group),
+            "all" | "world" | "everybody" => Ok(Self::All),
+            mode if mode.starts_with('0') && mode.len() == 4 => {
+                let bits = u32::from_str_radix(&mode[1..], 8).map_err(|_| {
+                    invalid_argument(
+                        format!("invalid shared mode '{mode}'"),
+                        Some(
+                            "supported numeric shared modes must be 4-digit octal values like 0770"
+                                .to_string(),
+                        ),
+                    )
+                })?;
+                validate_numeric_shared_mode(mode, bits)?;
+                Ok(Self::Numeric {
+                    raw: mode.to_string(),
+                    bits,
+                })
+            }
+            other => Err(invalid_argument(
+                format!("invalid shared mode '{other}'"),
+                Some(
+                    "supported values: umask, group, all, true, false, or a 4-digit octal mode."
+                        .to_string(),
+                ),
+            )),
         }
-        other => Err(invalid_argument(
-            format!("invalid shared mode '{other}'"),
-            Some(
-                "supported values: umask, group, all, true, false, or a 4-digit octal mode."
-                    .to_string(),
-            ),
-        )),
+    }
+
+    fn config_value(&self) -> &str {
+        match self {
+            Self::False => "false",
+            Self::Umask => "umask",
+            Self::Group => "group",
+            Self::All => "all",
+            Self::Numeric { raw, .. } => raw,
+        }
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    fn permission_bits(&self) -> Option<u32> {
+        match self {
+            Self::False | Self::Umask => None,
+            Self::Group => Some(0o2775),
+            Self::All => Some(0o2777),
+            Self::Numeric { bits, .. } => Some(*bits),
+        }
     }
 }
 
+fn parse_shared_mode(shared_mode: Option<&str>) -> Result<Option<SharedMode>, InitError> {
+    shared_mode.map(SharedMode::parse).transpose()
+}
+
+fn validate_numeric_shared_mode(raw: &str, bits: u32) -> Result<(), InitError> {
+    let mut invalid_classes = Vec::new();
+    if bits & 0o700 != 0o700 {
+        invalid_classes.push("owner rwx");
+    }
+    if bits & 0o060 != 0 && bits & 0o010 == 0 {
+        invalid_classes.push("group execute");
+    }
+    if bits & 0o006 != 0 && bits & 0o001 == 0 {
+        invalid_classes.push("other execute");
+    }
+
+    if invalid_classes.is_empty() {
+        return Ok(());
+    }
+
+    Err(invalid_argument(
+        format!(
+            "invalid shared mode '{raw}': numeric modes must keep repository directories traversable"
+        ),
+        Some(format!(
+            "missing {}; use a directory-safe mode such as 0770 or 0755",
+            invalid_classes.join(", ")
+        )),
+    ))
+}
+
 #[cfg(not(target_os = "windows"))]
-fn apply_shared(root_dir: &Path, shared_mode: &str) -> io::Result<()> {
+fn apply_shared(root_dir: &Path, shared_mode: &SharedMode) -> io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
 
     fn set_recursive(dir: &Path, mode: u32) -> io::Result<()> {
+        // `WalkDir` does not follow symlinks (so it never descends through them), but
+        // `fs::set_permissions` WOULD follow a symlink and chmod its target — which a
+        // re-init on a user-populated `.libra` could exploit to touch a path outside
+        // the repository. Skip symlinks entirely.
         for entry in walkdir::WalkDir::new(dir) {
             let entry = entry?;
+            if entry.file_type().is_symlink() {
+                continue;
+            }
             let path = entry.path();
+            // Never widen the private vault database or its SQLite sidecars: it holds
+            // signing material and must stay owner-only even under `--shared
+            // group/all` (this also avoids a read window during re-initialization).
+            if is_vault_artifact(path) {
+                continue;
+            }
             let metadata = fs::metadata(path)?;
             let mut perms = metadata.permissions();
             perms.set_mode(mode);
@@ -778,23 +1159,26 @@ fn apply_shared(root_dir: &Path, shared_mode: &str) -> io::Result<()> {
         Ok(())
     }
 
-    match shared_mode {
-        "false" | "umask" => {}
-        "true" | "group" => set_recursive(root_dir, 0o2775)?,
-        "all" | "world" | "everybody" => set_recursive(root_dir, 0o2777)?,
-        mode if mode.starts_with('0') && mode.len() == 4 => {
-            if let Ok(bits) = u32::from_str_radix(&mode[1..], 8) {
-                set_recursive(root_dir, bits)?;
-            }
-        }
-        _ => {}
+    if let Some(bits) = shared_mode.permission_bits() {
+        set_recursive(root_dir, bits)?;
     }
     Ok(())
 }
 
 #[cfg(target_os = "windows")]
-fn apply_shared(_root_dir: &Path, _shared_mode: &str) -> io::Result<()> {
+fn apply_shared(_root_dir: &Path, _shared_mode: &SharedMode) -> io::Result<()> {
     Ok(())
+}
+
+/// True for the vault SQLite database and its sidecars (`vault.db`, `-wal`, `-shm`,
+/// `-journal`), which hold private signing material and must never be widened by a
+/// `--shared` chmod sweep.
+#[cfg(not(target_os = "windows"))]
+fn is_vault_artifact(path: &Path) -> bool {
+    matches!(
+        path.file_name().and_then(|name| name.to_str()),
+        Some("vault.db" | "vault.db-wal" | "vault.db-shm" | "vault.db-journal")
+    )
 }
 
 fn validate_branch_name(branch_name: &str, ref_format: &RefFormat) -> Result<(), InitError> {
@@ -963,15 +1347,22 @@ async fn init_config(
     is_bare: bool,
     object_format: &str,
     ref_format: &RefFormat,
+    ignore_case: bool,
+    shared_mode: Option<&SharedMode>,
 ) -> Result<String, DbErr> {
     let txn = conn.begin().await?;
 
+    // `core.ignorecase` is PROBED, not platform-hard-coded (lore.md 1.14):
+    // Linux records false, macOS records what the volume actually is, and a
+    // case-sensitive NTFS volume on Windows records false too.
+    let ignorecase_text = if ignore_case { "true" } else { "false" };
     #[cfg(not(target_os = "windows"))]
     let entries = [
         ("repositoryformatversion", "0"),
         ("filemode", "true"),
         ("bare", if is_bare { "true" } else { "false" }),
         ("logallrefupdates", "true"),
+        ("ignorecase", ignorecase_text),
     ];
 
     #[cfg(target_os = "windows")]
@@ -981,7 +1372,7 @@ async fn init_config(
         ("bare", if is_bare { "true" } else { "false" }),
         ("logallrefupdates", "true"),
         ("symlinks", "false"),
-        ("ignorecase", "true"),
+        ("ignorecase", ignorecase_text),
     ];
 
     let repo_id = uuid::Uuid::new_v4().to_string();
@@ -1000,6 +1391,16 @@ async fn init_config(
     ConfigKv::set_with_conn(&txn, "libra.repoid", &repo_id, false)
         .await
         .map_err(|error| DbErr::Custom(error.to_string()))?;
+    if let Some(shared_mode) = shared_mode {
+        ConfigKv::set_with_conn(
+            &txn,
+            "core.sharedRepository",
+            shared_mode.config_value(),
+            false,
+        )
+        .await
+        .map_err(|error| DbErr::Custom(error.to_string()))?;
+    }
 
     txn.commit().await?;
     Ok(repo_id)
@@ -1131,19 +1532,20 @@ mod tests {
     #[test]
     fn init_error_display_pins_owned_variants() {
         assert_eq!(
+            InitError::ConfigRead {
+                key: "init.defaultBranch".to_string(),
+                detail: "database is unreadable".to_string(),
+            }
+            .to_string(),
+            "failed to read config 'init.defaultBranch': database is unreadable",
+        );
+        assert_eq!(
             InitError::InvalidArgument {
                 message: "missing target".to_string(),
                 hint: Some("provide a path".to_string()),
             }
             .to_string(),
             "missing target",
-        );
-        assert_eq!(
-            InitError::AlreadyInitialized {
-                path: PathBuf::from("/tmp/repo"),
-            }
-            .to_string(),
-            "repository already initialized at '/tmp/repo'",
         );
         assert_eq!(
             InitError::SourcePathNotFound {

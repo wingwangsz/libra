@@ -36,6 +36,20 @@ on either side.
 LFS-tracked files are transparently uploaded during HTTP pushes without requiring a
 separate `lfs push` step.
 
+## Global Config Schema Guard
+
+`libra push` reads the global storage configuration (`~/.libra/config.db`, or
+`LIBRA_CONFIG_GLOBAL_DB`) before trusting remote/tiered object storage settings. If that
+database has a schema version newer than this binary supports, push fails closed with
+`LBR-CONFIG-001` instead of silently ignoring global storage config and falling back to
+local objects. The diagnostic includes the binary path and version, config DB path,
+schema versions, and the update command:
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`.
+
+Use `libra --offline push ...` or `LIBRA_READ_POLICY=offline|local libra push ...` only when
+you intentionally want local-only object access. Libra will warn once and ignore the
+global storage config for that run.
+
 ## Options
 
 | Flag / Argument | Description | Example |
@@ -46,9 +60,10 @@ separate `lfs push` step.
 | `-f`, `--force` | Allow non-fast-forward updates that overwrite remote history. | `libra push --force origin main` |
 | `-d`, `--delete` | Delete the named remote refs (each `<refspec>` is rewritten to a `:<ref>` deletion). Requires at least one ref; conflicts with `--set-upstream`/`--tags`/`--mirror`. | `libra push -d origin feature-x` |
 | `--force-with-lease[=<ref>[:<expect>]]` | Allow a non-fast-forward update only if the remote ref still matches the expected OID (the tracking-ref OID by default, or an explicit `<expect>`). Conflicts with `--force`. | `libra push --force-with-lease origin main` |
-| `--force-if-includes` | Accepted for `git push` compatibility; **no-op** (the lease check uses the tracking-ref OID only). | `libra push --force-with-lease --force-if-includes origin main` |
-| `--thin` / `--no-thin` | Accepted for compatibility; **no-op** (the pack encoder always produces a self-contained pack). | `libra push --thin origin main` |
+| `--force-if-includes` | With `--force-with-lease` (All/Ref forms): additionally require the remote-tracking tip to be integrated locally (reachable from the pushed branch's reflog). Silent no-op with the exact lease form or without a lease (Git parity). |
+| `--thin` | Send REF_DELTA entries against server-known bases (the advertised old tips) — smaller packs on large-blob edits; the server completes them (`index-pack --fix-thin`). Self-contained packs remain the default (unlike git). |
 | `--no-verify` | Bypass the `pre-push` hook. Accepted for compatibility; **no-op** (Libra's push runs no client-side `pre-push` hook, so there is nothing to bypass). | `libra push --no-verify origin main` |
+| `--no-progress` | Suppress the progress meter (the "Compressing objects" / "Writing objects" reporters) on stderr, matching `git push --no-progress`. | `libra push --no-progress origin main` |
 | `--porcelain` | Machine-readable output: a `To <url>` header then `<flag>\t<from>:<to>\t<summary>` per ref. Conflicts with `--json`/`--machine`. | `libra push --porcelain origin main` |
 | `-n`, `--dry-run` | Perform negotiation and object collection but skip the actual upload. Reports what would be pushed. | `libra push --dry-run` |
 | `--tags` | Push all local `refs/tags/*` refs. Existing identical remote tags are skipped. | `libra push --tags origin` |
@@ -405,6 +420,7 @@ or configure a separate LFS tool.
 | Porcelain output | `libra push --porcelain` | `git push --porcelain` | N/A |
 | Thin pack | Accepted, no-op | `git push --thin` | N/A |
 | Skip pre-push hook | Accepted, no-op | `git push --no-verify` | N/A |
+| Suppress progress | `libra push --no-progress` | `git push --no-progress` | N/A |
 | Atomic / signed / push-option / follow-tags | Not yet supported | `git push --atomic` / `--signed` / `-o` / `--follow-tags` | N/A |
 | Dry-run | `libra push --dry-run` | `git push --dry-run` | `jj git push --dry-run` |
 | Refspec mapping | `libra push origin src:dst` | `git push origin src:dst` | N/A |

@@ -76,6 +76,9 @@ async fn test_commit_requires_configured_identity_in_strict_mode() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -261,6 +264,9 @@ async fn test_execute_commit() {
 
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         };
         add::execute(args).await;
     }
@@ -355,6 +361,9 @@ async fn test_commit_with_all_flag_stages_tracked_changes() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -431,6 +440,9 @@ async fn test_commit_with_all_flag_records_deletions() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -532,6 +544,9 @@ async fn test_commit_sha256() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -622,6 +637,9 @@ async fn test_commit_with_custom_author() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -881,6 +899,9 @@ async fn test_commit_with_actual_changes() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     };
     add::execute(add_args).await;
 
@@ -965,6 +986,9 @@ async fn test_commit_signoff_persists_trailer() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1131,6 +1155,9 @@ async fn test_commit_without_identity_fails_by_default() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1221,6 +1248,9 @@ async fn test_commit_cleanup_strips_comments() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1242,6 +1272,154 @@ async fn test_commit_cleanup_strips_comments() {
     assert!(commit_obj.message.contains("body"));
 }
 
+#[test]
+fn test_commit_honors_cleanup_and_verbose_config() {
+    // `commit.cleanup` supplies the default cleanup mode when `--cleanup` is unset,
+    // and `commit.verbose` makes `-v` the default — both matching Git.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // commit.cleanup=verbatim keeps a `#` comment line a default Strip would remove.
+    assert_cli_success(
+        &run_libra_command(&["config", "commit.cleanup", "verbatim"], p),
+        "set commit.cleanup",
+    );
+    std::fs::write(p.join("c.txt"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "c.txt"], p), "add c");
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "-m", "subject\n\n# keep me\nbody", "--no-verify"],
+            p,
+        ),
+        "commit with verbatim cleanup",
+    );
+    let msg = String::from_utf8_lossy(&run_libra_command(&["cat-file", "-p", "HEAD"], p).stdout)
+        .into_owned();
+    assert!(
+        msg.contains("# keep me"),
+        "commit.cleanup=verbatim keeps the comment line:\n{msg}"
+    );
+
+    // commit.verbose=true prints the staged diff to stderr on a plain `-m` commit.
+    assert_cli_success(
+        &run_libra_command(&["config", "commit.verbose", "true"], p),
+        "set commit.verbose",
+    );
+    std::fs::write(p.join("c.txt"), "one\ntwo\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "c.txt"], p), "add c2");
+    let out = run_libra_command(&["commit", "-m", "verbose default", "--no-verify"], p);
+    assert_cli_success(&out, "commit with verbose config");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("@@") || stderr.contains("+two"),
+        "commit.verbose=true prints the staged diff to stderr:\n{stderr}"
+    );
+}
+
+#[test]
+fn test_commit_cleanup_default_on_non_editor_keeps_comments() {
+    // Git's `default` cleanup means strip when the message is edited, otherwise
+    // whitespace. On the non-editor `-m` path it must behave like whitespace, so a
+    // `#` comment line is kept (it is NOT treated as strip).
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("d.txt"), "one\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "d.txt"], p), "add d");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--cleanup=default",
+                "-m",
+                "subject\n\n# keep on default\nbody",
+                "--no-verify",
+            ],
+            p,
+        ),
+        "commit --cleanup=default",
+    );
+    let msg = String::from_utf8_lossy(&run_libra_command(&["cat-file", "-p", "HEAD"], p).stdout)
+        .into_owned();
+    assert!(
+        msg.contains("# keep on default"),
+        "--cleanup=default on a non-editor -m commit keeps comment lines (whitespace semantics):\n{msg}"
+    );
+
+    // `--cleanup=scissors` likewise behaves like whitespace on the non-editor path:
+    // it does NOT truncate at the scissors marker (Git only truncates when edited).
+    std::fs::write(p.join("d.txt"), "two\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "d.txt"], p), "add d2");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--cleanup=scissors",
+                "-m",
+                "subj2\n# ------------------------ >8 ------------------------\nbelow scissors",
+                "--no-verify",
+            ],
+            p,
+        ),
+        "commit --cleanup=scissors",
+    );
+    let scissors_msg =
+        String::from_utf8_lossy(&run_libra_command(&["cat-file", "-p", "HEAD"], p).stdout)
+            .into_owned();
+    assert!(
+        scissors_msg.contains("below scissors"),
+        "--cleanup=scissors on a non-editor -m commit does not truncate at the marker:\n{scissors_msg}"
+    );
+}
+
+#[test]
+fn test_commit_config_invalid_is_fatal_but_flag_overrides() {
+    // An invalid `commit.cleanup` is fatal when no `--cleanup` is given, but an
+    // explicit `--cleanup` flag wins and overrides the bad config; `commit.verbose`
+    // accepts an integer (Git's bool-or-int).
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "commit.cleanup", "bogus"], p),
+        "set invalid commit.cleanup",
+    );
+    std::fs::write(p.join("e.txt"), "1\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "e.txt"], p), "add e");
+
+    // No flag: the invalid configured mode is fatal.
+    let bad = run_libra_command(&["commit", "-m", "x", "--no-verify"], p);
+    assert_ne!(
+        bad.status.code(),
+        Some(0),
+        "invalid commit.cleanup should be fatal: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
+
+    // Explicit `--cleanup` overrides the bad config and succeeds.
+    assert_cli_success(
+        &run_libra_command(&["commit", "--cleanup=strip", "-m", "x", "--no-verify"], p),
+        "explicit --cleanup overrides invalid commit.cleanup",
+    );
+
+    // `commit.verbose=2` (integer) is accepted and enables the verbose diff.
+    assert_cli_success(
+        &run_libra_command(&["config", "--unset", "commit.cleanup"], p),
+        "unset commit.cleanup",
+    );
+    assert_cli_success(
+        &run_libra_command(&["config", "commit.verbose", "2"], p),
+        "set commit.verbose=2",
+    );
+    std::fs::write(p.join("e.txt"), "1\n2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "e.txt"], p), "add e2");
+    let v = run_libra_command(&["commit", "-m", "v", "--no-verify"], p);
+    assert_cli_success(&v, "commit.verbose=2 accepted");
+    let stderr = String::from_utf8_lossy(&v.stderr);
+    assert!(
+        stderr.contains("@@") || stderr.contains("+2"),
+        "commit.verbose=2 enables the staged-diff output:\n{stderr}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_commit_trailer_appended() {
@@ -1261,6 +1439,9 @@ async fn test_commit_trailer_appended() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1296,6 +1477,9 @@ async fn test_commit_dry_run_does_not_create_commit() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1332,6 +1516,9 @@ async fn test_commit_reuse_message() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1355,6 +1542,9 @@ async fn test_commit_reuse_message() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1392,6 +1582,9 @@ async fn test_commit_fixup_sets_subject() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1413,6 +1606,9 @@ async fn test_commit_fixup_sets_subject() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1499,7 +1695,7 @@ fn test_commit_all_porcelain_shows_autostaged_as_staged() {
 
     // `commit -a --porcelain`: `-a` auto-stages the modification for the
     // preview, so the porcelain must show it as STAGED ("M  tracked.txt"), not
-    // unstaged (" M tracked.txt") — the snapshot is taken after auto-staging.
+    // unstaged (" M tracked.txt") — the isolated preview is read after auto-staging.
     let output = run_libra_command(&["commit", "-a", "--porcelain", "-m", "x"], p);
     assert_cli_success(&output, "commit -a --porcelain");
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -1513,7 +1709,7 @@ fn test_commit_all_porcelain_shows_autostaged_as_staged() {
     );
 
     // The preview must NOT mutate the index: the modification is still unstaged
-    // afterwards (the dry-run `-a` auto-stage is rolled back).
+    // afterwards (the dry-run `-a` auto-stage used an isolated index).
     let status = run_libra_command(&["status", "--porcelain"], p);
     assert_cli_success(&status, "status --porcelain after preview");
     let status_out = String::from_utf8_lossy(&status.stdout);
@@ -1524,5 +1720,152 @@ fn test_commit_all_porcelain_shows_autostaged_as_staged() {
     assert!(
         !status_out.contains("M  tracked.txt"),
         "the modification must remain unstaged after the preview: {status_out:?}"
+    );
+}
+
+#[test]
+fn commit_no_status_flag_is_accepted_noop() {
+    let repo = create_committed_repo_via_cli();
+    std::fs::write(repo.path().join("ns.txt"), "x\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "ns.txt"], repo.path())
+            .status
+            .success()
+    );
+    // `--no-status` is accepted and a no-op: Libra's commit editor template
+    // never includes a status section, so the commit proceeds normally.
+    let output = run_libra_command(
+        &[
+            "commit",
+            "--no-status",
+            "-m",
+            "with no-status",
+            "--no-verify",
+        ],
+        repo.path(),
+    );
+    assert!(
+        output.status.success(),
+        "commit --no-status succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+fn commit_no_gpg_sign_produces_unsigned_commit() {
+    let repo = create_committed_repo_via_cli();
+    // `--no-gpg-sign` skips Libra's vault signing path (`gpg_sig = None`) even
+    // with `vault.signing=true`, so the resulting commit carries no `gpgsig`
+    // header. (A full signed-vs-unsigned differential would require a vault
+    // unseal key, which `libra init` does not load in the test harness — a basic
+    // repo's commits are unsigned regardless; this asserts the flag's contract:
+    // the commit is created and is not signed.)
+    assert!(
+        run_libra_command(&["config", "vault.signing", "true"], repo.path())
+            .status
+            .success()
+    );
+    std::fs::write(repo.path().join("gs.txt"), "x\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "gs.txt"], repo.path())
+            .status
+            .success()
+    );
+    let output = run_libra_command(
+        &[
+            "commit",
+            "--no-gpg-sign",
+            "-m",
+            "with no-gpg-sign",
+            "--no-verify",
+        ],
+        repo.path(),
+    );
+    assert!(
+        output.status.success(),
+        "commit --no-gpg-sign succeeds: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let show = run_libra_command(&["cat-file", "-p", "HEAD"], repo.path());
+    assert!(
+        !String::from_utf8_lossy(&show.stdout).contains("gpgsig"),
+        "commit --no-gpg-sign produces an unsigned commit (no gpgsig header)"
+    );
+}
+
+/// Regression: `--amend --no-edit` on a *signed* parent must reuse the parent's
+/// real log message, NOT leak the parent's embedded `gpgsig` signature block.
+///
+/// Libra stores the PGP signature *inside* the commit object's message field
+/// (see `format_commit_msg`), so the amend path has to strip it with
+/// `parse_commit_msg` before reusing the parent's message. Before the fix, the
+/// amended commit's subject/message became "gpgsig -----BEGIN PGP SIGNATURE-----…"
+/// instead of the parent's real subject.
+#[test]
+fn test_commit_amend_no_edit_signed_parent_does_not_leak_gpgsig() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+
+    // `init --vault false` leaves no signing key; `generate-gpg-key` then both
+    // creates the key and turns on `vault.signing`, so the next commit is
+    // GPG-signed and its stored body embeds a `gpgsig` block.
+    assert_cli_success(
+        &run_libra_command(&["init", "--vault", "false"], p),
+        "init --vault false",
+    );
+    configure_identity_via_cli(p);
+    assert_cli_success(
+        &run_libra_command(&["config", "generate-gpg-key"], p),
+        "generate-gpg-key",
+    );
+
+    // Signed base commit whose real subject is "original-subject".
+    std::fs::write(p.join("f.txt"), "a\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add base file");
+    let base = run_libra_command(
+        &["--json", "commit", "-m", "original-subject", "--no-verify"],
+        p,
+    );
+    assert_cli_success(&base, "create signed base commit");
+    assert_eq!(
+        parse_json_stdout(&base)["data"]["signed"].as_bool(),
+        Some(true),
+        "base commit must be signed for this regression to be meaningful"
+    );
+
+    // Amend with --no-edit: the amended commit must carry the parent's real
+    // message, not its signature header.
+    std::fs::write(p.join("f.txt"), "ab\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add amended file");
+    assert_cli_success(
+        &run_libra_command(&["commit", "--amend", "--no-edit", "--no-verify"], p),
+        "amend --no-edit",
+    );
+
+    // The amended subject must equal the parent's real subject — not a leaked
+    // "gpgsig -----BEGIN PGP SIGNATURE-----" header line.
+    let subject_out = run_libra_command(&["log", "-1", "--format=%s"], p);
+    assert_cli_success(&subject_out, "log amended subject");
+    let subject = String::from_utf8_lossy(&subject_out.stdout)
+        .trim()
+        .to_string();
+    assert_eq!(
+        subject, "original-subject",
+        "amended subject must be the parent's real message, not a leaked gpgsig header"
+    );
+
+    // Belt-and-suspenders: Libra's `log` strips a *legitimate* `gpgsig` header
+    // from the displayed message, so any signature-block text appearing in the
+    // amended commit's log means the parent's signature leaked into the body.
+    let log_out = run_libra_command(&["log", "-1"], p);
+    assert_cli_success(&log_out, "log amended commit");
+    let log = String::from_utf8_lossy(&log_out.stdout);
+    assert!(
+        !log.contains("gpgsig"),
+        "amended message leaked a gpgsig header:\n{log}"
+    );
+    assert!(
+        !log.contains("BEGIN PGP SIGNATURE"),
+        "amended message leaked a PGP signature block:\n{log}"
     );
 }

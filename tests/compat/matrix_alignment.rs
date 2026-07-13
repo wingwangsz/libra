@@ -49,7 +49,14 @@ fn command_development_readme_matches_public_cli_surface() {
     );
 
     for command in public_docs.union(&unpublished_docs) {
-        let path = repo_root().join(format!("docs/development/commands/{command}.md"));
+        // agent/code development docs live under docs/development/tracing/ since the
+        // 932c3a0 reorganization; their README rows link there instead of this directory.
+        let relative = if command == "agent" || command == "code" {
+            format!("docs/development/tracing/{command}.md")
+        } else {
+            format!("docs/development/commands/{command}.md")
+        };
+        let path = repo_root().join(&relative);
         assert!(
             path.is_file(),
             "command development README links to missing document: {}",
@@ -100,8 +107,8 @@ fn docs_consistency_covers_code_command_router_contracts() {
     let web_mod = read_repo_file("src/internal/ai/web/mod.rs");
     let code_doc = read_repo_file("docs/commands/code.md");
     let code_control_doc = read_repo_file("docs/commands/code-control.md");
-    let integration_plan = read_repo_file("docs/development/integration-test-plan.md");
-    let agent_doc = read_repo_file("docs/development/commands/agent.md");
+    let integration_plan = read_repo_file("docs/development/integration/integration-test-plan.md");
+    let agent_doc = read_repo_file("docs/development/tracing/agent.md");
     let workflow = read_repo_file(".github/workflows/base.yml");
     let source_and_docs = [
         web_mod.as_str(),
@@ -158,17 +165,17 @@ fn docs_consistency_covers_code_command_router_contracts() {
         (
             integration_plan.as_str(),
             "test-provider",
-            "docs/development/integration-test-plan.md",
+            "docs/development/integration/integration-test-plan.md",
         ),
         (
             integration_plan.as_str(),
             "code_ui_scenarios",
-            "docs/development/integration-test-plan.md",
+            "docs/development/integration/integration-test-plan.md",
         ),
         (
             agent_doc.as_str(),
             "diagnostics_redaction_test",
-            "docs/development/commands/agent.md",
+            "docs/development/tracing/agent.md",
         ),
     ] {
         assert_contains(body, needle, context);
@@ -238,10 +245,10 @@ fn compatibility_governance_roadmap_marks_current_surfaces_without_batch_status(
     let governance = read_repo_file("docs/development/commands/_compatibility.md");
 
     for row in [
-        "| merge | partial | partial | fast-forward and single-head three-way merge supported; octopus/custom strategies/squash deferred |",
-        "| pull | partial | partial | fetch + fast-forward/three-way merge supported; advanced strategy flags still partial |",
+        "| merge | partial | partial | fast-forward, single-head three-way, `-s ours`, `-X ours/theirs`, unrelated-history opt-in, and CLI/config merge shortlogs supported; octopus and other strategies/options deferred |",
+        "| pull | partial | partial | fetch + fast-forward/three-way merge supported; `pull.rebase`/`branch.<name>.rebase`/`pull.ff` defaults are config-aware with local/global decryption, system-scope skip, and explicit unsupported diagnostics for interactive/rebase-merges modes; advanced strategy flags still partial |",
         "| push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |",
-        "| checkout | partial | partial | visible branch compatibility surface plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |",
+        "| checkout | partial | partial | visible branch compatibility surface including `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |",
     ] {
         assert!(
             governance.contains(row),

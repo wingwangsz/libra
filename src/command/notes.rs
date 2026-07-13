@@ -18,10 +18,14 @@ EXAMPLES:
     libra notes append -m \"Deployed-by: CI\"         Append a line to HEAD's note
     libra notes copy <from> <to>                      Copy a note to another object
     libra notes edit -m \"Replaces existing\"          Set (replace) HEAD's note
+    libra notes edit                                  Edit HEAD's note in $EDITOR (pre-filled)
     libra notes show                                  Show the note on HEAD
     libra notes list                                  List all notes
     libra notes remove abc1234                        Remove a note
-    libra notes add -f -m \"Updated\" HEAD            Force-overwrite a note";
+    libra notes add -f -m \"Updated\" HEAD            Force-overwrite a note
+    libra notes merge -s theirs refs/notes/other      Merge another notes ref (theirs on conflict)
+    libra notes prune -v                              Drop notes for objects that no longer exist
+    libra notes get-ref                               Print the active notes ref";
 
 #[derive(Parser, Debug)]
 #[command(about = "Add, show, list, or remove notes attached to commits")]
@@ -113,6 +117,28 @@ pub enum NotesSubcommand {
         #[clap(required = false)]
         objects: Vec<String>,
     },
+    /// Merge notes from another notes ref into the current notes ref
+    Merge {
+        /// The notes ref to merge FROM (e.g. `refs/notes/other`)
+        other_ref: String,
+
+        /// Conflict-resolution strategy: `manual` (default; aborts on a
+        /// conflicting note), `ours`, `theirs`, `union`, or `cat_sort_uniq`
+        #[clap(short = 's', long)]
+        strategy: Option<String>,
+    },
+    /// Remove notes for objects that no longer exist in the object store
+    Prune {
+        /// Report what would be pruned without deleting anything
+        #[clap(short = 'n', long = "dry-run")]
+        dry_run: bool,
+
+        /// Print each pruned object id
+        #[clap(short = 'v', long)]
+        verbose: bool,
+    },
+    /// Print the notes ref that operations act on (honors `--ref`)
+    GetRef,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -169,6 +195,29 @@ pub enum NotesOutput {
         notes_ref: String,
         removed: Vec<NotesRemovedEntry>,
     },
+    #[serde(rename = "merge")]
+    Merge {
+        #[serde(rename = "ref")]
+        notes_ref: String,
+        other_ref: String,
+        merged: usize,
+        skipped: usize,
+        resolved_conflicts: Vec<String>,
+    },
+    #[serde(rename = "prune")]
+    Prune {
+        #[serde(rename = "ref")]
+        notes_ref: String,
+        pruned: Vec<String>,
+        dry_run: bool,
+        #[serde(skip)]
+        verbose: bool,
+    },
+    #[serde(rename = "get-ref")]
+    GetRef {
+        #[serde(rename = "ref")]
+        notes_ref: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -214,15 +263,33 @@ pub async fn execute_safe(
             file: _,
             force,
         } => {
-            let content = build_note_content(argv)?;
-            let result = notes::add(
-                notes_ref,
-                object.as_deref().unwrap_or("HEAD"),
-                &content,
-                force,
-            )
-            .await
-            .map_err(NotesCliError::from)?;
+            let target = object.as_deref().unwrap_or("HEAD");
+            // Without `-m`/`-F`, compose the note in an editor. Like Git, the
+            // existing note (if any) pre-fills the buffer; if one exists and `-f`
+            // was not given, abort early (before opening the editor) just as the
+            // `-m` path would.
+            let content = if note_content_parts_present(argv) {
+                build_note_content(argv)?
+            } else {
+                let initial = match notes::show(notes_ref, Some(target)).await {
+                    Ok((_, object, note)) => {
+                        if !force {
+                            return Err(NotesCliError::from(notes::NotesError::AlreadyExists {
+                                notes_ref: notes_ref.to_string(),
+                                object,
+                            })
+                            .into());
+                        }
+                        note
+                    }
+                    Err(notes::NotesError::NotFound { .. }) => String::new(),
+                    Err(err) => return Err(NotesCliError::from(err).into()),
+                };
+                compose_note_via_editor(&initial, target).await?
+            };
+            let result = notes::add(notes_ref, target, &content, force)
+                .await
+                .map_err(NotesCliError::from)?;
             let out = NotesOutput::Add {
                 notes_ref: result.notes_ref,
                 object: result.object,
@@ -236,7 +303,12 @@ pub async fn execute_safe(
             file: _,
         } => {
             let target = object.as_deref().unwrap_or("HEAD");
-            let new_content = build_note_content(argv)?;
+            // Without `-m`/`-F`, compose the appended text in an editor.
+            let new_content = if note_content_parts_present(argv) {
+                build_note_content(argv)?
+            } else {
+                compose_note_via_editor("", target).await?
+            };
             // Concatenate after the existing note (separated by a blank line),
             // or create a fresh note when the object has none — matching Git.
             let content = match notes::show(notes_ref, Some(target)).await {
@@ -263,17 +335,22 @@ pub async fn execute_safe(
             file: _,
         } => {
             // `edit` sets (replaces) the note unconditionally, creating it if
-            // absent — distinct from `add`, which fails when one exists. The
-            // interactive editor form is not supported, so `-m`/`-F` is required.
-            let content = build_note_content(argv)?;
-            let result = notes::add(
-                notes_ref,
-                object.as_deref().unwrap_or("HEAD"),
-                &content,
-                true,
-            )
-            .await
-            .map_err(NotesCliError::from)?;
+            // absent — distinct from `add`, which fails when one exists. Without
+            // `-m`/`-F`, open an editor pre-filled with the existing note.
+            let target = object.as_deref().unwrap_or("HEAD");
+            let content = if note_content_parts_present(argv) {
+                build_note_content(argv)?
+            } else {
+                let existing = match notes::show(notes_ref, Some(target)).await {
+                    Ok((_, _, note)) => note,
+                    Err(notes::NotesError::NotFound { .. }) => String::new(),
+                    Err(err) => return Err(NotesCliError::from(err).into()),
+                };
+                compose_note_via_editor(&existing, target).await?
+            };
+            let result = notes::add(notes_ref, target, &content, true)
+                .await
+                .map_err(NotesCliError::from)?;
             let out = NotesOutput::Edit {
                 notes_ref: result.notes_ref,
                 object: result.object,
@@ -350,6 +427,44 @@ pub async fn execute_safe(
                         note_hash: hash,
                     })
                     .collect(),
+            };
+            render_output(&out, output)?;
+        }
+        NotesSubcommand::Merge {
+            other_ref,
+            strategy,
+        } => {
+            let other_normalized =
+                notes::normalize_notes_ref(&other_ref).map_err(NotesCliError::from)?;
+            let strat = notes::NoteMergeStrategy::parse(strategy.as_deref())
+                .map_err(NotesCliError::from)?;
+            let result = notes::merge(notes_ref, &other_normalized, strat)
+                .await
+                .map_err(NotesCliError::from)?;
+            let out = NotesOutput::Merge {
+                notes_ref: result.notes_ref,
+                other_ref: result.other_ref,
+                merged: result.merged,
+                skipped: result.skipped,
+                resolved_conflicts: result.resolved_conflicts,
+            };
+            render_output(&out, output)?;
+        }
+        NotesSubcommand::Prune { dry_run, verbose } => {
+            let pruned = notes::prune(notes_ref, dry_run)
+                .await
+                .map_err(NotesCliError::from)?;
+            let out = NotesOutput::Prune {
+                notes_ref: notes_ref.to_string(),
+                pruned,
+                dry_run,
+                verbose,
+            };
+            render_output(&out, output)?;
+        }
+        NotesSubcommand::GetRef => {
+            let out = NotesOutput::GetRef {
+                notes_ref: notes_ref.to_string(),
             };
             render_output(&out, output)?;
         }
@@ -441,6 +556,76 @@ fn build_note_content(argv: &[String]) -> CliResult<String> {
     Ok(content)
 }
 
+/// Whether the invocation supplied note content via `-m`/`--message` or
+/// `-F`/`--file`. When false, `add`/`edit`/`append` fall back to an editor.
+fn note_content_parts_present(argv: &[String]) -> bool {
+    !ordered_content_parts(argv).is_empty()
+}
+
+/// Open an editor to compose a note when no `-m`/`-F` was given (`git notes`
+/// editor form). `initial` seeds the buffer (the existing note for `edit`,
+/// empty for `add`/`append`). Unlike commit/tag messages, a note may legitimately
+/// contain lines starting with `#`, so comment lines are NOT stripped — only
+/// `git stripspace` whitespace cleanup is applied. An empty result aborts.
+async fn compose_note_via_editor(initial: &str, object: &str) -> CliResult<String> {
+    use std::io::IsTerminal;
+
+    // An explicitly configured editor runs even without a TTY (so scripted
+    // editors work in tests/automation); `vi` is only assumed on a terminal.
+    let editor_cmd = match crate::command::editor::resolve_editor().await {
+        Some(cmd) => cmd,
+        None if std::io::stdin().is_terminal() => "vi".to_string(),
+        None => {
+            return Err(CliError::fatal(format!(
+                "no editor configured to compose the note for '{object}'"
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint("set GIT_EDITOR, core.editor, VISUAL, or EDITOR")
+            .with_hint("or pass the note directly with -m/--message or -F/--file."));
+        }
+    };
+
+    let path = crate::utils::util::storage_path().join("NOTES_EDITMSG");
+    let raw = crate::command::editor::edit_message(&path, initial, &editor_cmd, true)
+        .await
+        .map_err(|e| {
+            CliError::io(format!("failed to edit the note: {e}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+
+    let content = clean_note_message(&raw);
+    if content.is_empty() {
+        return Err(CliError::command_usage("aborting note: empty note content")
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint("write some text in the editor, or pass -m/--message."));
+    }
+    Ok(content)
+}
+
+/// Whitespace-only `git stripspace` cleanup for an edited note: trim trailing
+/// whitespace per line and collapse blank-line runs (dropping leading/trailing
+/// blanks). Comment (`#`) lines are preserved — notes may contain them. The
+/// result carries NO trailing newline, matching the `-m`/`-F` content path
+/// (`build_note_content`) so editor- and message-created notes store identically
+/// (a narrowing of Git's stripspace, which appends a final newline).
+fn clean_note_message(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending_blank = false;
+    for line in raw.lines() {
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            pending_blank = !out.is_empty();
+            continue;
+        }
+        if pending_blank {
+            out.push(String::new());
+            pending_blank = false;
+        }
+        out.push(trimmed.to_string());
+    }
+    out.join("\n")
+}
+
 fn render_output(result: &NotesOutput, output: &OutputConfig) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("notes", result, output);
@@ -527,6 +712,43 @@ fn render_output(result: &NotesOutput, output: &OutputConfig) -> CliResult<()> {
                 );
             }
         }
+        NotesOutput::Merge {
+            notes_ref,
+            other_ref,
+            merged,
+            skipped,
+            resolved_conflicts,
+        } => {
+            println!(
+                "Merged notes from {other_ref} into {notes_ref}: {merged} merged, {skipped} unchanged",
+            );
+            if !resolved_conflicts.is_empty() {
+                println!(
+                    "Resolved {} conflict(s) by strategy:",
+                    resolved_conflicts.len()
+                );
+                for object in resolved_conflicts {
+                    println!("  {}", short_display_hash(object));
+                }
+            }
+        }
+        NotesOutput::Prune {
+            notes_ref: _,
+            pruned,
+            dry_run,
+            verbose,
+        } => {
+            // Git's `notes prune` is silent unless `-v`/`-n`; then it prints the
+            // (full) object id of each pruned note, one per line.
+            if *verbose || *dry_run {
+                for object in pruned {
+                    println!("{object}");
+                }
+            }
+        }
+        NotesOutput::GetRef { notes_ref } => {
+            println!("{notes_ref}");
+        }
     }
 
     Ok(())
@@ -571,6 +793,17 @@ impl From<NotesCliError> for CliError {
                 notes::NotesError::StoreBlobFailed(_) => {
                     CliError::fatal(message).with_stable_code(StableErrorCode::IoWriteFailed)
                 }
+                notes::NotesError::MergeConflict { .. } => CliError::failure(message)
+                    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                    .with_hint(
+                        "re-run with --strategy=ours/theirs/union/cat_sort_uniq to resolve the conflicting notes",
+                    ),
+                notes::NotesError::UnsupportedStrategy(_) => CliError::command_usage(message)
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("valid strategies: manual, ours, theirs, union, cat_sort_uniq"),
+                notes::NotesError::MergeRaced { .. } => CliError::failure(message)
+                    .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                    .with_hint("another writer changed the notes during the merge; re-run it"),
             },
         }
     }

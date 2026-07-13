@@ -493,6 +493,152 @@ fn test_fsck_corrupted_object() {
     }
 }
 
+/// Delete the loose object backing `commit_hash`, making it referenced-but-missing.
+fn delete_commit_object(repo: &std::path::Path, commit_hash: &str) -> std::path::PathBuf {
+    let object_path = repo
+        .join(".libra")
+        .join("objects")
+        .join(&commit_hash[0..2])
+        .join(&commit_hash[2..]);
+    fs::remove_file(&object_path).expect("delete commit object");
+    object_path
+}
+
+#[test]
+#[serial]
+/// `fsck --heal` on a repository with a missing object but no durable tier
+/// configured must report the object as unrecoverable, must NOT fabricate it,
+/// and must still exit non-zero (the integrity issue persists).
+fn test_fsck_heal_local_only_reports_unrecoverable() {
+    let repo = create_committed_repo_via_cli();
+
+    let log_output = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    let stdout = String::from_utf8_lossy(&log_output.stdout);
+    let commit_hash = stdout.lines().next().unwrap().trim().to_string();
+    let object_path = delete_commit_object(repo.path(), &commit_hash);
+
+    let output = run_libra_command(&["fsck", "--heal"], repo.path());
+    assert!(
+        !output.status.success(),
+        "a still-missing object must keep fsck exit non-zero"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("heal:"),
+        "should print a heal summary, got: {combined}"
+    );
+    assert!(
+        combined.contains("unrecoverable"),
+        "should report the object as unrecoverable, got: {combined}"
+    );
+    assert!(
+        !object_path.exists(),
+        "heal must not fabricate the missing object"
+    );
+}
+
+#[test]
+#[serial]
+/// Regression: `fsck --heal` must NOT treat *packed* objects as missing.
+/// `collect_heal_candidates` classifies "missing" via `local.exist` (which
+/// consults pack indexes), not the loose-only object inventory. After packing
+/// all objects and dropping the loose copies, a healthy repo must report nothing
+/// to repair and exit 0 — not falsely flag every packed object unrecoverable.
+fn test_fsck_heal_does_not_flag_packed_objects_as_missing() {
+    let repo = create_committed_repo_via_cli();
+
+    // Pack everything and delete the now-redundant loose objects, so every
+    // object lives only inside a pack.
+    let repack = run_libra_command(&["repack", "-a", "-d"], repo.path());
+    assert!(
+        repack.status.success(),
+        "repack should succeed: {}",
+        String::from_utf8_lossy(&repack.stderr)
+    );
+
+    let output = run_libra_command(&["--json", "fsck", "--heal"], repo.path());
+    let json = parse_json_stdout(&output);
+    assert_eq!(
+        json["data"]["heal"]["unrecoverable"]
+            .as_u64()
+            .expect("heal.unrecoverable"),
+        0,
+        "packed objects must not be reported as unrecoverable"
+    );
+    assert_eq!(
+        json["data"]["heal"]["healed"]
+            .as_u64()
+            .expect("heal.healed"),
+        0,
+        "a healthy packed repo needs no repair"
+    );
+    assert!(
+        output.status.success(),
+        "fsck --heal on a healthy packed repo should exit 0; stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
+#[serial]
+/// `fsck --heal <OBJECT>` must attempt to heal the explicitly-named object even
+/// when it is not reachable from refs/reflogs/index. With no durable tier the
+/// object is reported unrecoverable (proving it was seeded and attempted, not
+/// silently ignored).
+fn test_fsck_heal_explicit_absent_object_is_attempted() {
+    let repo = create_committed_repo_via_cli();
+
+    // A well-formed SHA-1 OID that is absent from the repo and unreferenced.
+    let absent = "deadbeef".repeat(5); // 40 hex chars
+
+    let output = run_libra_command(&["--json", "fsck", "--heal", &absent], repo.path());
+    let json = parse_json_stdout(&output);
+    assert!(
+        json["data"]["heal"]["unrecoverable"]
+            .as_u64()
+            .expect("heal.unrecoverable")
+            >= 1,
+        "the explicitly-named absent object should be attempted and reported unrecoverable"
+    );
+    assert!(
+        !output.status.success(),
+        "an unrepaired explicit object keeps fsck exit non-zero"
+    );
+}
+
+#[test]
+#[serial]
+/// `--json fsck --heal` embeds a structured heal report.
+fn test_fsck_heal_json_includes_report() {
+    let repo = create_committed_repo_via_cli();
+
+    let log_output = run_libra_command(&["log", "--pretty=%H"], repo.path());
+    let stdout = String::from_utf8_lossy(&log_output.stdout);
+    let commit_hash = stdout.lines().next().unwrap().trim().to_string();
+    delete_commit_object(repo.path(), &commit_hash);
+
+    let output = run_libra_command(&["--json", "fsck", "--heal"], repo.path());
+    let json = parse_json_stdout(&output);
+    assert!(
+        json["data"]["heal"]["unrecoverable"]
+            .as_u64()
+            .expect("heal.unrecoverable")
+            >= 1,
+        "expected at least one unrecoverable object"
+    );
+    assert_eq!(
+        json["data"]["heal"]["healed"]
+            .as_u64()
+            .expect("heal.healed"),
+        0,
+        "nothing can be healed without a durable tier"
+    );
+}
+
 #[test]
 #[serial]
 /// Tests fsck rejects annotated tag objects that are syntactically valid UTF-8
@@ -887,4 +1033,144 @@ fn test_strict_tree_unsorted() {
         "strict must flag an unsorted tree: {stderr}"
     );
     assert_eq!(strict.status.code(), Some(1));
+}
+
+// ---------------------------------------------------------------------------
+// --full: packfile integrity verification (panic-safe checksum)
+// ---------------------------------------------------------------------------
+
+/// Copy a pack fixture into the repo's `.libra/objects/pack/` and build its idx.
+fn install_pack_fixture(repo: &std::path::Path) -> std::path::PathBuf {
+    let src = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/packs/small-sha1.pack");
+    let pack_dir = repo.join(".libra/objects/pack");
+    fs::create_dir_all(&pack_dir).expect("create pack dir");
+    let pack = pack_dir.join("test.pack");
+    fs::copy(&src, &pack).expect("copy pack fixture");
+    let out = run_libra_command(
+        &["index-pack", pack.to_str().unwrap(), "--index-version", "2"],
+        repo,
+    );
+    assert_cli_success(&out, "index-pack builds the fixture idx");
+    pack
+}
+
+#[test]
+#[serial]
+fn fsck_full_passes_on_a_valid_pack() {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    install_pack_fixture(repo.path());
+
+    // Both the default (full on, like Git) and explicit `--full` accept a valid
+    // pack without error.
+    assert_cli_success(
+        &run_libra_command(&["fsck", "--full"], repo.path()),
+        "fsck --full valid",
+    );
+    assert_cli_success(
+        &run_libra_command(&["fsck"], repo.path()),
+        "fsck default valid",
+    );
+}
+
+#[test]
+#[serial]
+fn fsck_full_reports_corrupt_pack_without_panicking() {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let pack = install_pack_fixture(repo.path());
+
+    // Corrupt a byte in the pack body — `fsck --full` must REPORT it (exit 1),
+    // not crash the pack decoder.
+    let mut bytes = fs::read(&pack).unwrap();
+    bytes[20] ^= 0xff;
+    fs::write(&pack, &bytes).unwrap();
+
+    let full = run_libra_command(&["fsck", "--full"], repo.path());
+    assert_eq!(
+        full.status.code(),
+        Some(1),
+        "corrupt pack fails fsck --full"
+    );
+    let stderr = String::from_utf8_lossy(&full.stderr);
+    assert!(
+        stderr.contains("bad packfile checksum"),
+        "reports the corrupt pack: {stderr}"
+    );
+    assert!(!stderr.contains("panic"), "must not panic: {stderr}");
+
+    // `--no-full` skips the pack check, so the corrupt pack is not flagged.
+    assert_cli_success(
+        &run_libra_command(&["fsck", "--no-full"], repo.path()),
+        "fsck --no-full skips pack verification",
+    );
+}
+
+#[test]
+#[serial]
+fn fsck_full_reports_corrupt_index() {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let pack = install_pack_fixture(repo.path());
+
+    let idx = pack.with_extension("idx");
+    let mut bytes = fs::read(&idx).unwrap();
+    let last = bytes.len() - 1;
+    bytes[last] ^= 0xff; // corrupt the index trailing checksum
+    fs::write(&idx, &bytes).unwrap();
+
+    let full = run_libra_command(&["fsck", "--full"], repo.path());
+    assert_eq!(full.status.code(), Some(1), "corrupt idx fails fsck --full");
+    let stderr = String::from_utf8_lossy(&full.stderr);
+    assert!(
+        stderr.contains("test.idx"),
+        "reports the corrupt idx: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn fsck_full_detects_mismatched_index() {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    let pack = install_pack_fixture(repo.path());
+
+    // Replace the pack with a DIFFERENT valid pack while keeping the original
+    // index: the index's recorded pack checksum no longer matches the pack's
+    // trailer, which the cross-check must catch.
+    let other = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("tests/data/packs/ref-delta-sha1.pack");
+    fs::copy(&other, &pack).expect("swap in a different pack");
+
+    let full = run_libra_command(&["fsck", "--full"], repo.path());
+    assert_eq!(
+        full.status.code(),
+        Some(1),
+        "mismatched index fails fsck --full"
+    );
+    assert!(
+        String::from_utf8_lossy(&full.stderr).contains("does not match the packfile"),
+        "reports the pack/index mismatch"
+    );
+}
+
+#[test]
+#[serial]
+fn fsck_full_json_verbose_emits_clean_json() {
+    let repo = tempdir().expect("repo");
+    init_repo_via_cli(repo.path());
+    configure_identity_via_cli(repo.path());
+    install_pack_fixture(repo.path());
+
+    // `--json --verbose` must not interleave human progress lines into the JSON
+    // stream — stdout has to parse as a single JSON document.
+    let out = run_libra_command(&["--json", "fsck", "--full", "--verbose"], repo.path());
+    assert_cli_success(&out, "fsck --json --full --verbose");
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["command"], "fsck");
 }

@@ -8,6 +8,8 @@ Restore working tree files or index entries from a source.
 
 ```
 libra restore [--source <tree-ish>] [--staged] [--worktree] <pathspec>...
+libra restore (--ours | --theirs | --merge | --conflict <style>) <pathspec>...
+libra restore --ignore-unmerged [--source <tree-ish>] <pathspec>...
 ```
 
 ## Description
@@ -16,21 +18,46 @@ libra restore [--source <tree-ish>] [--staged] [--worktree] <pathspec>...
 
 For new workflows, use `libra restore` directly. `libra checkout -- <path>` and `libra checkout <tree-ish> -- <path>` are accepted only as Git-compatible aliases for this path-restore behavior.
 
-The `<pathspec>` argument is required and accepts one or more file paths or directory paths. The special path `.` restores all files.
+The `<pathspec>` argument is required and accepts one or more file paths or directory paths. The special path `.` restores all files. Pathspecs use Libra's shared Git-style matcher: plain pathspecs match a file or directory prefix, wildcard pathspecs are supported, and the high-value magic forms `:(top)`, `:/`, `:(glob)`, `:(literal)`, `:(icase)`, `:(exclude)`, `:!`, and `:^` are honored. Exclude pathspecs subtract from the positive selection, pathspec matching follows `core.ignorecase` when enabled, and wildcard-looking pathspecs also match an exact path or directory prefix with the same literal text.
 
-When a source commit contains files that do not exist in the current worktree, those files are created. When the current worktree contains files that do not exist in the source, those files are deleted. The output reports both `restored_files` and `deleted_files` separately.
+When a source commit contains files that do not exist in the current worktree, those files are created. In the default (`--no-overlay`) mode, when the current worktree contains tracked files that do not exist in the source, those files are deleted so the target matches the source exactly; with `--overlay` those source-absent tracked paths are left in place instead. The output reports both `restored_files` and `deleted_files` separately.
+
+A materialized gitlink is a directory in the worktree. Restore can remove an
+empty materialized gitlink or replace it with a regular file, symlink, or
+deletion. Conflict-marker rebuilds (`--merge`/`--conflict=diff3`) follow the same
+rule when replacing a directory with a regular marker file. A non-empty
+directory is refused before any selected path is changed, so nested repository
+or user data is never recursively deleted.
 
 LFS-managed files are automatically downloaded from the LFS server when restoring from a commit that references LFS pointers.
+
+Tracked symlinks are restored as symlinks on Unix for source tree, index, and
+conflict-stage restores. The stored blob bytes are used directly as the link
+target and are not interpreted as a path to open during restore, which avoids
+writing through a link that points outside the worktree. `--merge` conflict
+marker rebuilds also replace an existing worktree symlink before writing the
+regular marker file. Platforms that cannot create symlinks return an explicit
+unsupported diagnostic instead of materializing a regular file containing the
+target text.
 
 ## Options
 
 | Option | Short | Long | Description |
 |--------|-------|------|-------------|
-| Pathspec | | positional (required) | One or more files or directories to restore. Use `.` for all files. |
+| Pathspec | | positional (required) | One or more files or directories to restore. Supports shared pathspec magic. Use `.` for all files. |
 | Source | `-s` | `--source <tree-ish>` | Restore from the specified commit or tree-ish instead of the default source. When omitted, the default source depends on the mode: index for worktree restore, HEAD for staged restore. |
 | Staged | `-S` | `--staged` | Restore the index (unstage files). Defaults the source to HEAD if `--source` is not given. |
 | Worktree | `-W` | `--worktree` | Restore the working tree. This is the default when `--staged` is not given. |
+| Ours | `-2` | `--ours` | For an unmerged path, write conflict stage 2 (our side) to the working tree. Mutually exclusive with `--theirs`, `--source`, `--staged`, and `--ignore-unmerged`. |
+| Theirs | `-3` | `--theirs` | For an unmerged path, write conflict stage 3 (their side) to the working tree. Same exclusions as `--ours`. |
+| Merge | | `--merge` | For an unmerged path, rewrite the working tree with the conflict markers rebuilt from the index stages (`ours` from stage 2, `theirs` from stage 3), leaving the index unmerged. Libra writes whole-file `ours`/`theirs` markers (with generic `ours`/`theirs` labels) — not Git's line-level 3-way. (Note: `libra merge`/`cherry-pick` now write line-level markers via the three-way merge engine; restore's index-stage rebuild remains whole-file.) Same exclusions as `--ours`. |
+| Conflict style | | `--conflict <style>` | Implies `--merge`. `merge` (default) writes `ours`/`theirs` blocks; `diff3` also includes the `base` block (stage 1). `zdiff3` is not supported. |
+| Ignore unmerged | | `--ignore-unmerged` | Skip unmerged paths instead of erroring; the remaining paths still restore. |
+| Pathspec from file | | `--pathspec-from-file <FILE>` | Read shared-matcher pathspecs from `<FILE>` (one per line; `-` reads stdin). When given, the file contents replace any positional pathspecs (which then need not be supplied). |
+| Pathspec file NUL | | `--pathspec-file-nul` | Pathspecs read via `--pathspec-from-file` are separated by NUL, not newlines (requires `--pathspec-from-file`). |
 | No progress | | `--no-progress` | Do not show a progress meter. Accepted no-op for Git parity: Libra's restore never renders a progress meter. |
+| Overlay | | `--overlay` | Restore in overlay mode: only create/update paths present in the source; tracked paths absent from the source are left alone instead of removed. Toggle pair with `--no-overlay` (last one wins). |
+| No overlay | | `--no-overlay` | Do not restore in overlay mode (the default): paths absent from the source are removed so the target matches it exactly. Toggle pair with `--overlay` (last one wins). |
 | JSON | | `--json` | Emit structured JSON output. |
 | Quiet | | `--quiet` | Suppress human-readable output. |
 
@@ -69,6 +96,35 @@ Explicitly targets the working tree. This is the default when `--staged` is not 
 libra restore -S -W file.txt
 ```
 
+**Conflict-stage restore: `--ours` / `-2`, `--theirs` / `-3`, `--ignore-unmerged`**
+
+When a merge leaves a path unmerged, the index holds up to three conflict stages: stage 1 (the merge base), stage 2 ("ours" — the current branch), and stage 3 ("theirs" — the branch being merged). After editing a conflict-marked file you can take one whole side back:
+
+```bash
+# Take our side of the conflict
+libra restore --ours file.txt
+
+# Take their side of the conflict
+libra restore --theirs file.txt
+```
+
+These flags read the conflict stages and rewrite **only the working tree** — the index is intentionally left unmerged, so `libra status` still reports the conflict until you stage a resolution with `libra add`. They are worktree-only by design and therefore reject `--source` and `--staged` (and each other) at the CLI layer (`LBR-CLI-002`, exit code 129).
+
+**Modify/delete conflicts.** When the requested side deleted the file (a modify/delete conflict — the requested stage is absent), restoring that side means *removing* the file: in the default (`--no-overlay`) mode `libra restore --theirs <path>` deletes the working-tree file and exits 0 (matching `git restore`). Under `--overlay`, which never removes paths, the same case is instead an error — `path '<file>' does not have their version` (`LBR-CONFLICT-001`, exit 128).
+
+**During a rebase, `--ours`/`--theirs` are swapped** (as in Git): the stages are read verbatim, and a rebase records stage 2 = the branch you are rebasing *onto* (the new base) and stage 3 = the commit being replayed. So mid-rebase `--ours` gives the onto side and `--theirs` the replayed commit — the reverse of a normal merge or cherry-pick (where `--ours` = your `HEAD` and `--theirs` = the incoming side).
+
+`--ours`/`--theirs` act only on unmerged paths. A non-conflicted pathspec is skipped; if *every* pathspec is non-conflicted the command reports no match (`LBR-CONFLICT-001`, exit 128). Libra intentionally does **not** fall through to Git's plain index (stage-0) restore for a clean tracked path here, so a locally modified file is never silently reverted — use a plain `libra restore <path>` for that.
+
+A plain `libra restore` over an unmerged path refuses to act and reports `path '<file>' is unmerged` (`LBR-CONFLICT-001`, exit 128) so a conflict is never silently overwritten or skipped. Pass `--ignore-unmerged` to skip the unmerged paths and restore the rest:
+
+```bash
+# Restore everything from HEAD, skipping still-conflicted paths
+libra restore --ignore-unmerged --source HEAD .
+```
+
+> **Not yet supported:** Git's line-level 3-way conflict markers and the `zdiff3` style (Libra rebuilds whole-file `ours`/`theirs` markers from the index stages — unlike `libra merge`/`cherry-pick`, which now write line-level markers), and `-p` / `--patch`, are deferred. See [COMPATIBILITY.md](../../COMPATIBILITY.md).
+
 ## Common Commands
 
 ```bash
@@ -81,11 +137,27 @@ libra restore --staged file.txt
 # Restore from a specific commit
 libra restore --source HEAD~1 src/main.rs
 
+# Restore Rust files except generated output
+libra restore ':(glob)src/*.rs' ':(exclude)src/generated.rs'
+
 # Restore both working tree and index
 libra restore -S -W file.txt
 
 # Restore everything from HEAD
 libra restore --source HEAD .
+
+# Restore a tracked symlink as a symlink
+libra restore --source HEAD link-to-target
+
+# Take our / their side of a merge conflict
+libra restore --ours file.txt
+libra restore --theirs file.txt
+
+# Restore from HEAD, skipping still-conflicted paths
+libra restore --ignore-unmerged --source HEAD .
+
+# Overlay restore: update files from an older commit without deleting newer ones
+libra restore --overlay --source HEAD~3 .
 
 # JSON output for scripting
 libra restore --json --source HEAD .
@@ -161,8 +233,10 @@ Unlike `git restore` which can operate on the entire worktree with `--worktree`,
 | Target worktree | `-W` / `--worktree` | `-W` / `--worktree` (default) | Default behavior |
 | Target index/staging | `-S` / `--staged` | `-S` / `--staged` | N/A (no staging area) |
 | Both targets | `-S -W` | `-S -W` | N/A |
-| Overlay mode | Not supported | `--overlay` / `--no-overlay` | N/A |
-| Conflict resolution | Not supported | `--ours` / `--theirs` / `--merge` | `--restore-descendants` |
+| Pathspec from file | `--pathspec-from-file <FILE>` / `--pathspec-file-nul` | `--pathspec-from-file` / `--pathspec-file-nul` | N/A |
+| Overlay mode | `--overlay` / `--no-overlay` (last wins; default is no-overlay = remove absent paths) | `--overlay` / `--no-overlay` | N/A |
+| Conflict resolution | `--ours` / `-2`, `--theirs` / `-3`, `--merge`, `--conflict=merge\|diff3` (worktree-only; whole-file markers) | `--ours` / `--theirs` / `--merge` / `--conflict` | `--restore-descendants` |
+| Skip unmerged | `--ignore-unmerged` | `--ignore-unmerged` | N/A |
 | Patch mode | Not supported | `-p` / `--patch` | N/A |
 | No progress meter | `--no-progress` (no-op; never renders one) | `--no-progress` | N/A |
 | Progress meter | Not supported | `--progress` | N/A |
@@ -183,3 +257,6 @@ Note: jj's `restore` operates on revisions rather than a staging area, restoring
 | `LBR-IO-001` | Failed to read index or object |
 | `LBR-IO-002` | Failed to write worktree file |
 | `LBR-NET-001` | LFS download failed |
+| `LBR-CONFLICT-001` | Path is unmerged and no conflict-resolution flag was given, or `--ours`/`--theirs` requested a missing conflict stage (exit 128) |
+
+> `--ours` and `--theirs` are mutually exclusive with each other and with `--source`, `--staged`, and `--ignore-unmerged`; any such combination is rejected as `LBR-CLI-002` with exit code 129. (`--source`, `--staged`, and `--ignore-unmerged` may otherwise be combined — e.g. `--ignore-unmerged --source HEAD`.)

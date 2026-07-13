@@ -28,11 +28,26 @@ const MAX_TRANSCRIPT_BYTES: u64 = 16 * 1024 * 1024;
 
 /// Static description of a Phase 4.4 stable-promoted adapter. Stays
 /// `Copy + 'static` so the registry can hand out cheap references.
-#[derive(Debug, Clone, Copy)]
+#[derive(Clone, Copy)]
 pub struct StablePromotedSpec {
     pub kind: AgentKind,
     pub provider_name: &'static str,
     pub protected_dirs: &'static [&'static str],
+    /// AG-19: hook provider exposed via `ObservedAgent::as_hooks()`.
+    /// `None` for agents without an installable `HookProvider`
+    /// (`declared_capabilities().hooks` derives from this).
+    pub hooks: Option<&'static dyn crate::internal::ai::hooks::provider::HookProvider>,
+}
+
+impl std::fmt::Debug for StablePromotedSpec {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("StablePromotedSpec")
+            .field("kind", &self.kind)
+            .field("provider_name", &self.provider_name)
+            .field("protected_dirs", &self.protected_dirs)
+            .field("hooks", &self.hooks.map(|h| h.provider_name()))
+            .finish()
+    }
 }
 
 /// Concrete `ObservedAgent` over a [`StablePromotedSpec`]. Reports
@@ -76,36 +91,125 @@ impl ObservedAgent for StablePromotedAgent {
     fn protected_dirs(&self) -> &'static [&'static str] {
         self.0.protected_dirs
     }
+    fn as_hooks(&self) -> Option<&dyn crate::internal::ai::hooks::provider::HookProvider> {
+        self.0.hooks
+    }
+
+    // AG-21: best-effort transcript intelligence for the first-batch
+    // promoted agents only (codex/opencode rollout/export formats); the
+    // non-first-batch kinds keep the default `None` so their registry
+    // rows stay all-false (E9).
+    fn as_prompt_extractor(
+        &self,
+    ) -> Option<&dyn crate::internal::ai::observed_agents::capability::PromptExtractor> {
+        matches!(self.0.kind, AgentKind::Codex | AgentKind::OpenCode).then_some(self)
+    }
+    fn as_token_calculator(
+        &self,
+    ) -> Option<&dyn crate::internal::ai::observed_agents::capability::TokenCalculator> {
+        matches!(self.0.kind, AgentKind::Codex | AgentKind::OpenCode).then_some(self)
+    }
+    fn as_model_extractor(
+        &self,
+    ) -> Option<&dyn crate::internal::ai::observed_agents::capability::ModelExtractor> {
+        matches!(self.0.kind, AgentKind::Codex | AgentKind::OpenCode).then_some(self)
+    }
+    fn as_skill_event_extractor(
+        &self,
+    ) -> Option<&dyn crate::internal::ai::observed_agents::capability::SkillEventExtractor> {
+        matches!(self.0.kind, AgentKind::Codex | AgentKind::OpenCode).then_some(self)
+    }
+}
+
+fn promoted_extract(
+    kind: AgentKind,
+    data: &[u8],
+) -> crate::internal::ai::observed_agents::extract::ExtractionSummary {
+    use crate::internal::ai::observed_agents::extract;
+    match kind {
+        AgentKind::OpenCode => extract::extract_opencode(data),
+        // Codex is the only other kind wired through the accessors above.
+        _ => extract::extract_codex(data),
+    }
+}
+
+fn promoted_tail(data: &[u8], from_offset: usize) -> &[u8] {
+    &data[from_offset.min(data.len())..]
+}
+
+impl crate::internal::ai::observed_agents::capability::PromptExtractor for StablePromotedAgent {
+    fn extract_prompts(&self, data: &[u8], from_offset: usize) -> Result<Vec<String>> {
+        Ok(promoted_extract(self.0.kind, promoted_tail(data, from_offset)).prompts)
+    }
+}
+
+impl crate::internal::ai::observed_agents::capability::TokenCalculator for StablePromotedAgent {
+    fn calculate_token_usage(
+        &self,
+        data: &[u8],
+        from_offset: usize,
+    ) -> Result<crate::internal::ai::completion::CompletionUsageSummary> {
+        Ok(
+            promoted_extract(self.0.kind, promoted_tail(data, from_offset))
+                .usage
+                .unwrap_or_default(),
+        )
+    }
+}
+
+impl crate::internal::ai::observed_agents::capability::ModelExtractor for StablePromotedAgent {
+    fn extract_model(&self, data: &[u8]) -> Result<Option<String>> {
+        Ok(promoted_extract(self.0.kind, data).model)
+    }
+}
+
+impl crate::internal::ai::observed_agents::capability::SkillEventExtractor for StablePromotedAgent {
+    fn extract_skill_events(
+        &self,
+        data: &[u8],
+        from_offset: usize,
+    ) -> Result<Vec<crate::internal::ai::observed_agents::capability::SkillEvent>> {
+        Ok(promoted_extract(self.0.kind, promoted_tail(data, from_offset)).skill_events)
+    }
 }
 
 pub static CURSOR_STABLE_PROMOTED_SPEC: StablePromotedSpec = StablePromotedSpec {
     kind: AgentKind::Cursor,
     provider_name: "cursor",
     protected_dirs: &[".cursor"],
+    hooks: None,
 };
 
 pub static CODEX_STABLE_PROMOTED_SPEC: StablePromotedSpec = StablePromotedSpec {
     kind: AgentKind::Codex,
     provider_name: "codex",
     protected_dirs: &[".codex"],
+    // AG-19: Codex HookProvider (user-level hooks.json + [hooks.state]
+    // trust entries; see providers/codex).
+    hooks: Some(&crate::internal::ai::hooks::providers::codex::CODEX_PROVIDER),
 };
 
 pub static OPENCODE_STABLE_PROMOTED_SPEC: StablePromotedSpec = StablePromotedSpec {
     kind: AgentKind::OpenCode,
     provider_name: "opencode",
     protected_dirs: &[".opencode"],
+    // AG-19: OpenCode HookProvider (Libra-managed .opencode/plugin file;
+    // see providers/opencode).
+    hooks: Some(&crate::internal::ai::hooks::providers::opencode::OPENCODE_PROVIDER),
 };
 
 pub static COPILOT_STABLE_PROMOTED_SPEC: StablePromotedSpec = StablePromotedSpec {
     kind: AgentKind::Copilot,
     provider_name: "copilot",
     protected_dirs: &[".copilot"],
+    hooks: None,
 };
 
 pub static FACTORY_AI_STABLE_PROMOTED_SPEC: StablePromotedSpec = StablePromotedSpec {
     kind: AgentKind::FactoryAi,
     provider_name: "factory_ai",
     protected_dirs: &[".factory"],
+    hooks: None,
 };
 
 /// Phase 4.4 stable-promoted adapter table. Mirrors the v1 adapter

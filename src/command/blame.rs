@@ -22,6 +22,7 @@ use git_internal::{
     hash::ObjectHash,
     internal::object::{blob::Blob, commit::Commit, tree::Tree},
 };
+use regex::Regex;
 use serde::Serialize;
 
 use crate::{
@@ -41,8 +42,10 @@ EXAMPLES:
     libra blame src/main.rs abc1234        Blame a file at a specific commit
     libra blame -L 10,20 src/main.rs       Blame lines 10-20
     libra blame -L 10,+5 src/main.rs       Blame 5 lines starting at line 10
+    libra blame -L '/fn main/,/^}/' src/main.rs  Blame from a regex match to a regex match
     libra blame -l src/main.rs             Show full commit hashes
     libra blame -s src/main.rs             Suppress the author and date columns
+    libra blame -w src/main.rs             Ignore whitespace-only changes when attributing lines
     libra --json blame src/main.rs         Structured JSON output for agents";
 
 #[derive(Parser, Debug)]
@@ -98,6 +101,26 @@ pub struct BlameArgs {
     /// does not follow renames/copies, so every line shows the blamed file.
     #[clap(short = 'f', long = "show-name")]
     pub show_name: bool,
+
+    /// Ignore whitespace when comparing the parent's and child's versions of a
+    /// line, so whitespace-only changes are attributed to the older commit.
+    /// Matches Git's `-w` (ignore-all-whitespace) semantics.
+    #[clap(short = 'w', long = "ignore-whitespace")]
+    pub ignore_whitespace: bool,
+}
+
+/// Strip every whitespace character from a line for `-w` comparison, mirroring
+/// Git's ignore-all-whitespace rule (`XDF_IGNORE_WHITESPACE`). The original
+/// line content is preserved for display; only the comparison key is normalized.
+///
+/// Git's whitespace test is C `isspace()` on bytes — ASCII space/tab/newline/
+/// vertical-tab/form-feed/carriage-return only. We deliberately do NOT use
+/// `char::is_whitespace`, which also matches Unicode whitespace (e.g. NBSP), so
+/// a non-ASCII-whitespace edit is still treated as a real change as in Git.
+fn normalize_for_whitespace(line: &str) -> String {
+    line.chars()
+        .filter(|c| !matches!(c, ' ' | '\t' | '\n' | '\x0b' | '\x0c' | '\r'))
+        .collect()
 }
 
 /// Single attributed line of a blame report. Serialised verbatim to JSON.
@@ -159,8 +182,9 @@ enum BlameError {
     #[error("file '{path}' not found in revision '{revision}'")]
     FileNotFound { path: String, revision: String },
 
-    /// `-L` argument did not match `LINE`, `START,END`, or `START,+COUNT`,
-    /// or the numbers were out of range. Mapped to a usage error.
+    /// `-L` argument did not match a supported form (`LINE`, `START,END`,
+    /// `START,+COUNT`, or `/regex/` endpoints), a `/regex/` matched no line, or the
+    /// resolved numbers were out of range. Mapped to a usage error.
     #[error("invalid line range: {0}")]
     InvalidLineRange(String),
 }
@@ -181,7 +205,9 @@ impl From<BlameError> for CliError {
                 .with_hint("check the file path; use 'libra show <rev>:' to list available files"),
             BlameError::InvalidLineRange(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint(r#"supported formats: "10", "10,20", "10,+5""#),
+                .with_hint(
+                    r#"supported formats: "10", "10,20", "10,+5", "/regex/", "/start/,/end/""#,
+                ),
         }
     }
 }
@@ -353,10 +379,20 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
         .collect();
 
     use std::collections::VecDeque;
-    let mut queue: VecDeque<(ObjectHash, Commit, Vec<String>)> = VecDeque::new();
-    queue.push_back((commit_id, commit_obj, target_lines));
+    // One BFS frame: a commit, its version of the file, and the line-number
+    // mapping from that version to the final target file.
+    type WalkFrame = (ObjectHash, Commit, Vec<String>, Vec<Option<usize>>);
+    // Each queue entry carries `cur_to_final`: for every line of that commit's
+    // version of the file, the index of the line it became in the final target
+    // file (or `None` if it does not survive to the target). Diff line numbers
+    // are positions in the *current* commit, so they must be remapped through
+    // this table to reach the right `blame_lines` slot — a direct `new_line - 1`
+    // index is wrong once an intervening commit inserts or deletes lines above.
+    let init_map: Vec<Option<usize>> = (0..target_lines.len()).map(Some).collect();
+    let mut queue: VecDeque<WalkFrame> = VecDeque::new();
+    queue.push_back((commit_id, commit_obj, target_lines, init_map));
 
-    while let Some((current_id, current_commit, current_lines)) = queue.pop_front() {
+    while let Some((current_id, current_commit, current_lines, cur_to_final)) = queue.pop_front() {
         if !blame_lines.iter().any(|b| b.commit_id == current_id) {
             continue;
         }
@@ -373,18 +409,55 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
                 _ => continue,
             };
 
-            let operations = compute_diff(&parent_lines, &current_lines);
+            // Carry the final-line mapping back to the parent: a line that is
+            // `Equal` between parent and current keeps the same final position.
+            let mut parent_to_final: Vec<Option<usize>> = vec![None; parent_lines.len()];
+
+            // With `-w`, diff on whitespace-normalized copies so a line that
+            // differs only in whitespace is treated as unchanged and attributed
+            // to the parent. The default path diffs the borrowed line vectors
+            // directly (no copy); the original lines are always kept for display.
+            let operations = if args.ignore_whitespace {
+                let diff_parent: Vec<String> = parent_lines
+                    .iter()
+                    .map(|l| normalize_for_whitespace(l))
+                    .collect();
+                let diff_current: Vec<String> = current_lines
+                    .iter()
+                    .map(|l| normalize_for_whitespace(l))
+                    .collect();
+                compute_diff(&diff_parent, &diff_current)
+            } else {
+                compute_diff(&parent_lines, &current_lines)
+            };
             for op in operations {
                 use git_internal::diff::DiffOperation;
                 match op {
                     DiffOperation::Insert { .. } | DiffOperation::Delete { .. } => {}
                     DiffOperation::Equal { old_line, new_line } => {
-                        let final_idx = new_line - 1;
+                        // Remap the current-commit line number to the final target
+                        // line via this commit's mapping (identity for the target).
+                        let Some(Some(final_idx)) = cur_to_final.get(new_line - 1).copied() else {
+                            continue;
+                        };
+                        if let Some(slot) = parent_to_final.get_mut(old_line - 1) {
+                            *slot = Some(final_idx);
+                        }
                         if let Some(blame) = blame_lines.get_mut(final_idx)
                             && blame.commit_id == current_id
                         {
-                            let parent_content = parent_lines.get(old_line - 1);
-                            if Some(&blame.content) == parent_content {
+                            // Compare the parent line against the blamed line using
+                            // the same normalization the diff used, so `-w` matches
+                            // whitespace-only differences. The default path compares
+                            // borrowed strings directly (no allocation per line).
+                            let parent_line = parent_lines.get(old_line - 1);
+                            let is_match = if args.ignore_whitespace {
+                                let blame_key = normalize_for_whitespace(&blame.content);
+                                parent_line.map(|l| normalize_for_whitespace(l)) == Some(blame_key)
+                            } else {
+                                parent_line == Some(&blame.content)
+                            };
+                            if is_match {
                                 blame.commit_id = *parent_id;
                                 blame.author = parent_commit.author.name.clone();
                                 blame.author_email = parent_commit.author.email.clone();
@@ -394,13 +467,13 @@ async fn run_blame(args: &BlameArgs) -> Result<BlameOutput, BlameError> {
                     }
                 }
             }
-            queue.push_back((*parent_id, parent_commit, parent_lines));
+            queue.push_back((*parent_id, parent_commit, parent_lines, parent_to_final));
         }
     }
 
     let filtered_lines = if let Some(ref range) = args.line_range {
         let (start, end) =
-            parse_line_range(range, blame_lines.len()).map_err(BlameError::InvalidLineRange)?;
+            parse_line_range(range, &blame_lines).map_err(BlameError::InvalidLineRange)?;
         blame_lines
             .into_iter()
             .filter(|b| b.line_number >= start && b.line_number <= end)
@@ -563,52 +636,134 @@ fn format_blame_timestamp(timestamp: i64) -> String {
 /// - Returns `Err` for non-numeric tokens, zero indices, indices past the
 ///   file end, or `start > end`. Each error message is suitable for direct
 ///   inclusion in a [`BlameError::InvalidLineRange`].
-fn parse_line_range(range_str: &str, total_lines: usize) -> Result<(usize, usize), String> {
-    let parts: Vec<&str> = range_str.split(',').collect();
+fn parse_line_range(range_str: &str, lines: &[LineBlame]) -> Result<(usize, usize), String> {
+    let total_lines = lines.len();
+    let (start_token, end_token) = split_line_range_tokens(range_str)?;
 
-    match parts.len() {
-        1 => {
-            // Single line: "10"
-            let line = parts[0]
-                .parse::<usize>()
-                .map_err(|_| format!("Invalid line number: {}", parts[0]))?;
-            if line == 0 || line > total_lines {
-                return Err(format!("Line {} is out of range (1-{})", line, total_lines));
+    // Resolve the start endpoint (a number or `/regex/`, searched from the file start).
+    let start = resolve_start_endpoint(start_token, lines)?;
+
+    // A single endpoint means "from <start> to the end of the file" (matching Git),
+    // not just that one line.
+    let end = match end_token {
+        None => total_lines,
+        Some(token) => resolve_end_endpoint(token, lines, start)?,
+    };
+
+    if start == 0 || start > total_lines || end == 0 || end > total_lines || start > end {
+        return Err(format!(
+            "Invalid range {},{} (total lines: {})",
+            start, end, total_lines
+        ));
+    }
+    Ok((start, end))
+}
+
+/// Split a `-L` argument into its `<start>` token and optional `<end>` token. The
+/// start may be a `/regex/` (which can itself contain commas, and `\/` escapes), so a
+/// regex start is scanned to its closing slash before looking for the `,` separator;
+/// a numeric start is split at the first comma.
+fn split_line_range_tokens(range: &str) -> Result<(&str, Option<&str>), String> {
+    if range.starts_with('/') {
+        let bytes = range.as_bytes();
+        let mut i = 1;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'\\' => i += 2, // skip an escaped character (e.g. `\/`)
+                b'/' => {
+                    let start = &range[..=i];
+                    let rest = &range[i + 1..];
+                    return match rest.strip_prefix(',') {
+                        Some(end) => Ok((start, Some(end))),
+                        None if rest.is_empty() => Ok((start, None)),
+                        None => Err(format!("expected ',' after /regex/ in -L: {range}")),
+                    };
+                }
+                _ => i += 1,
             }
-            Ok((line, line))
         }
-        2 => {
-            let start = parts[0]
-                .parse::<usize>()
-                .map_err(|_| format!("Invalid start line: {}", parts[0]))?;
-
-            // Check if second part is relative (+N) or absolute
-            let end = if parts[1].starts_with('+') {
-                let offset = parts[1][1..]
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid offset: {}", parts[1]))?;
-                start + offset - 1
-            } else {
-                parts[1]
-                    .parse::<usize>()
-                    .map_err(|_| format!("Invalid end line: {}", parts[1]))?
-            };
-
-            if start == 0 || start > total_lines || end == 0 || end > total_lines || start > end {
-                return Err(format!(
-                    "Invalid range {},{} (total lines: {})",
-                    start, end, total_lines
-                ));
-            }
-            Ok((start, end))
+        Err(format!("unterminated /regex/ in -L: {range}"))
+    } else {
+        match range.find(',') {
+            Some(idx) => Ok((&range[..idx], Some(&range[idx + 1..]))),
+            None => Ok((range, None)),
         }
-        _ => Err("Invalid range format. Use: LINE or START,END or START,+COUNT".to_string()),
+    }
+}
+
+/// If `token` is `/regex/`, return the inner regex source.
+fn regex_token_body(token: &str) -> Option<&str> {
+    token
+        .strip_prefix('/')
+        .and_then(|rest| rest.strip_suffix('/'))
+}
+
+fn compile_blame_regex(source: &str) -> Result<Regex, String> {
+    Regex::new(source).map_err(|error| format!("invalid regex /{source}/: {error}"))
+}
+
+/// Resolve a `<start>` token: a line number, or a `/regex/` resolved to the first
+/// matching line (searched from the start of the file), matching Git.
+fn resolve_start_endpoint(token: &str, lines: &[LineBlame]) -> Result<usize, String> {
+    if let Some(source) = regex_token_body(token) {
+        let regex = compile_blame_regex(source)?;
+        lines
+            .iter()
+            .position(|line| regex.is_match(&line.content))
+            .map(|index| index + 1)
+            .ok_or_else(|| format!("/{source}/: no match in file"))
+    } else {
+        token
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid start line: {token}"))
+    }
+}
+
+/// Resolve an `<end>` token: a line number, `+COUNT` relative to `start`, or a
+/// `/regex/` resolved to the first matching line at or after `start` (matching Git).
+fn resolve_end_endpoint(token: &str, lines: &[LineBlame], start: usize) -> Result<usize, String> {
+    if let Some(source) = regex_token_body(token) {
+        let regex = compile_blame_regex(source)?;
+        lines
+            .iter()
+            .enumerate()
+            .skip(start.saturating_sub(1))
+            .find(|(_, line)| regex.is_match(&line.content))
+            .map(|(index, _)| index + 1)
+            .ok_or_else(|| format!("/{source}/: no match at or after line {start}"))
+    } else if let Some(offset_str) = token.strip_prefix('+') {
+        let offset = offset_str
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid offset: {token}"))?;
+        if offset == 0 {
+            return Err(format!("Invalid offset: {token}"));
+        }
+        Ok(start + offset - 1)
+    } else {
+        token
+            .parse::<usize>()
+            .map_err(|_| format!("Invalid end line: {token}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `-w` normalization strips only ASCII whitespace (Git's `isspace` set),
+    /// leaving Unicode whitespace such as NBSP intact so it still counts as a
+    /// real change — matching Git's byte-based ignore-all-whitespace.
+    #[test]
+    fn normalize_for_whitespace_strips_ascii_only() {
+        assert_eq!(normalize_for_whitespace("  let  x =\t1 \r"), "letx=1");
+        assert_eq!(
+            normalize_for_whitespace("a\x0bb\x0cc"),
+            "abc",
+            "vertical-tab and form-feed are ASCII whitespace"
+        );
+        // U+00A0 NBSP is Unicode-only whitespace; Git does not ignore it.
+        assert_eq!(normalize_for_whitespace("a\u{a0}b"), "a\u{a0}b");
+    }
 
     /// Pin the `Display` format for the static-message and direct-
     /// message variants of [`BlameError`]. These strings are used as

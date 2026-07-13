@@ -1,12 +1,12 @@
 [package]
 name = "libra"
-version = "0.17.1613"
+version = "0.18.64"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
-repository = "https://github.com/web3infra-foundation/libra"
-homepage = "https://github.com/web3infra-foundation/libra"
-authors = ["Web3 Infrastructure Foundation"]
+repository = "https://github.com/libra-tools/libra"
+homepage = "https://github.com/libra-tools/libra"
+authors = ["Libra Tools"]
 keywords = ["git", "version-control", "ai", "agent", "vcs"]
 categories = ["command-line-utilities", "development-tools"]
 readme = "README.md"
@@ -18,11 +18,14 @@ test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
 test-provider  = []   # deterministic hidden provider for local TUI automation tests
-subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/commands/agent.md "Step 2 audit closure")
+fastcdc        = []   # lore.md §6: default-OFF FastCDC LFS media chunking client substrate (no new deps; reuses ring sha256; server protocol frozen)
+subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/tracing/agent.md "Step 2 audit closure")
+otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
+keyring = ["dep:keyring"]  # lore.md 2.7: OS-keyring auth backend (release builds enable it; default dev builds unaffected)
 
 [dependencies]
 uuid = { version = "1.23.1", features = ["v4", "v5", "v7"] }
-git-internal = "0.7.6"
+git-internal = "0.8.3"
 anyhow = "1.0.102"
 byte-unit = "5.2.0"
 byteorder = "1.5.0"
@@ -31,7 +34,9 @@ object_store = { version = "0.13.2", features = ["aws", "azure", "gcp", "http"] 
 async-trait = "0.1.89"
 chrono = { version = "0.4.44", features = ["serde"] }
 clap = { version = "4.6.1", features = ["derive"] }
+clap_complete = "4.6.6"
 colored = "3.1.1"
+fastrand = "2.3.0"
 flate2 = "1.1.9"  # add features = ["zlib"] if slow
 tar = "0.4"
 zip = "0.6"
@@ -64,6 +69,7 @@ sea-orm = { version = "1.1.20", features = [
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 sha1 = "0.11.0"
+sha2 = "0.10"
 thiserror = "2.0.18"
 tokio = { version = "1.52.1", features = [
     "io-util",
@@ -80,10 +86,12 @@ tokio-tungstenite = { version = "0.29.0", features = ["native-tls"] }
 toml = "0.8.23"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter"] }
+tracing-appender = "0.2.3"
 url = "2.5.8"
 walkdir = "2.5.0"
 wax = "0.7.0"
 diffs = "0.5.1"
+similar = "2.7.0"
 path-absolutize = "3.1.1"
 infer = "0.19.0"
 pathdiff = "0.2.3"
@@ -127,6 +135,19 @@ unicode-width = "0.2.2"
 libvault = { version = "0.2.2", features = ["storage_sqlite"] }
 base64 = "0.22.1"
 
+# OTLP telemetry (lore.md 1.7) — optional, compiled only with `--features otlp`;
+# http-proto + blocking reqwest + rustls (no tonic: init/flush run on the
+# runtime-free main thread; see docs/development/telemetry-otlp.md)
+opentelemetry = { version = "0.32.0", optional = true }
+opentelemetry_sdk = { version = "0.32.1", optional = true }
+opentelemetry-otlp = { version = "0.32.0", optional = true, default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
+tracing-opentelemetry = { version = "0.33.0", optional = true }
+
+# OS-keyring auth backend (lore.md 2.7) — optional; Linux uses the sync
+# secret-service transport with VENDORED libdbus (static, no runtime dylib
+# dependency on end-user machines); macOS/Windows use native stores.
+keyring = { version = "3", optional = true, default-features = false, features = ["apple-native", "windows-native", "sync-secret-service", "vendored"] }
+
 [target.'cfg(unix)'.dependencies] # only on Unix
 libfuse-fs = "0.1.13"
 pager = "0.16.1"
@@ -135,6 +156,9 @@ rfuse3 = { version = "0.0.8", features = ["tokio-runtime", "unprivileged"] }
 
 [target.'cfg(target_os = "linux")'.dependencies] # Linux-only seccomp BPF compiler
 seccompiler = { version = "0.5.0", features = ["json"] }
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61.2", features = ["Win32_Storage_FileSystem"] }
 
 [dev-dependencies]
 serial_test = { version = "3.4.0", default-features = false, features = ["async"] }
@@ -157,6 +181,9 @@ assert_cmd = "2.2.1"
 pgp = "0.19.0"
 gag = "1.0.0"
 portable-pty = "0.9.0"
+# AST-level use-tree/path walking for tests/compat/agent_architecture_guard.rs
+# (syn 2.x is already in the dependency graph via derive macros).
+syn = { version = "2.0", features = ["full", "visit"] }
 
 # Compatibility-surface integration tests live under tests/compat/. Cargo's
 # default test discovery only picks up *.rs directly under tests/, so each
@@ -252,3 +279,147 @@ path = "tests/compat/help_no_impl_meta_leak.rs"
 [[test]]
 name = "compat_format_patch_flag_surface"
 path = "tests/compat/format_patch_flag_surface.rs"
+
+[[test]]
+name = "compat_otlp_feature_gate_guard"
+path = "tests/compat/otlp_feature_gate_guard.rs"
+
+[[test]]
+name = "compat_fastcdc_feature_gate_guard"
+path = "tests/compat/fastcdc_feature_gate_guard.rs"
+
+[[test]]
+name = "compat_keyring_feature_gate_guard"
+path = "tests/compat/keyring_feature_gate_guard.rs"
+
+[[test]]
+name = "compat_agent_capability_matrix_pin"
+path = "tests/compat/agent_capability_matrix_pin.rs"
+
+[[test]]
+name = "compat_agent_architecture_guard"
+path = "tests/compat/agent_architecture_guard.rs"
+
+[[test]]
+name = "compat_subface_labels"
+path = "tests/compat/subface_labels.rs"
+
+[[test]]
+name = "compat_conflict_status_diff"
+path = "tests/compat/conflict_status_diff_test.rs"
+
+[[test]]
+name = "compat_diff_check_safety"
+path = "tests/compat/diff_check_safety_test.rs"
+
+[[test]]
+name = "compat_clone_shallow_integrity"
+path = "tests/compat/clone_shallow_integrity_test.rs"
+
+[[test]]
+name = "compat_checkout_branch_startpoint"
+path = "tests/compat/checkout_branch_startpoint_test.rs"
+
+[[test]]
+name = "compat_switch_orphan_root"
+path = "tests/compat/switch_orphan_root_test.rs"
+
+[[test]]
+name = "compat_broken_pipe_output"
+path = "tests/compat/broken_pipe_output_test.rs"
+
+[[test]]
+name = "compat_commit_amend_no_edit"
+path = "tests/compat/commit_amend_no_edit_test.rs"
+
+[[test]]
+name = "compat_commit_identity_date"
+path = "tests/compat/commit_identity_date_test.rs"
+
+[[test]]
+name = "compat_sequencer_message_author"
+path = "tests/compat/sequencer_message_author_test.rs"
+
+[[test]]
+name = "compat_write_tree_missing_object"
+path = "tests/compat/write_tree_missing_object_test.rs"
+
+[[test]]
+name = "compat_init_shared_mode"
+path = "tests/compat/init_shared_mode_test.rs"
+
+[[test]]
+name = "compat_symlink_basic"
+path = "tests/compat/symlink_basic_test.rs"
+
+[[test]]
+name = "compat_global_config_schema_future"
+path = "tests/compat/global_config_schema_future_test.rs"
+
+[[test]]
+name = "compat_pathspec_magic"
+path = "tests/compat/pathspec_magic_test.rs"
+
+[[test]]
+name = "compat_ignore_attributes_sources"
+path = "tests/compat/ignore_attributes_sources_test.rs"
+
+[[test]]
+name = "compat_machine_porcelain_contract"
+path = "tests/compat/machine_porcelain_contract_test.rs"
+
+[[test]]
+name = "compat_pretty_format_placeholders"
+path = "tests/compat/pretty_format_placeholders_test.rs"
+
+[[test]]
+name = "compat_config_defaults_semantics"
+path = "tests/compat/config_defaults_semantics_test.rs"
+
+[[test]]
+name = "compat_config_defaults_edge_cases"
+path = "tests/compat/config_defaults_edge_cases_test.rs"
+
+[[test]]
+name = "compat_config_history_defaults"
+path = "tests/compat/config_history_defaults_test.rs"
+
+[[test]]
+name = "compat_fetch_remote_refspec"
+path = "tests/compat/fetch_remote_refspec_test.rs"
+
+[[test]]
+name = "compat_noninteractive_history_controls"
+path = "tests/compat/noninteractive_history_controls_test.rs"
+
+# OTLP integration tests need the feature (excluded from `cargo test --all`
+# under default features via required-features).
+[[test]]
+name = "otlp_telemetry"
+path = "tests/otlp_telemetry.rs"
+required-features = ["otlp"]
+
+[[test]]
+name = "auth_keyring_backend"
+path = "tests/auth_keyring_backend.rs"
+required-features = ["keyring"]
+
+# Live LLM-provider tests (L3): call real APIs when their key/opt-in env is
+# set. Per the L3 convention (CLAUDE.md: match the env gate AND the
+# `test-live-ai` feature), require the feature so a bare `cargo test --all`
+# excludes them — a machine with DEEPSEEK_API_KEY / LIBRA_AI_LIVE_OLLAMA set
+# can no longer hit live providers in default L1 (C3, codex review).
+[[test]]
+name = "ai_agent_test"
+path = "tests/ai_agent_test.rs"
+required-features = ["test-live-ai"]
+
+[[test]]
+name = "ai_chat_agent_test"
+path = "tests/ai_chat_agent_test.rs"
+required-features = ["test-live-ai"]
+
+[[test]]
+name = "ai_ollama_live_gate_test"
+path = "tests/ai_ollama_live_gate_test.rs"
+required-features = ["test-live-ai"]

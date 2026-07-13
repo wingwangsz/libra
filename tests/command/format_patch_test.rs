@@ -263,6 +263,238 @@ fn stdout_output_prints_all_patches() {
 }
 
 // ---------------------------------------------------------------------------
+// --notes
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn notes_appends_block_after_separator() {
+    let repo = repo_with_commits(2);
+    // Attach a multi-line note to the tip commit.
+    let note = run_libra_command(
+        &["notes", "add", "-m", "review line 1\nreview line 2", "HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&note, "notes add");
+
+    // With --notes: the block appears after `---`, before the diffstat, with the
+    // `Notes:` header and four-space indentation (matching Git).
+    let with = run_libra_command(
+        &["format-patch", "--stdout", "--notes", "HEAD~1..HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&with, "format-patch --notes");
+    let body = String::from_utf8_lossy(&with.stdout);
+    assert!(
+        body.contains("---\n\nNotes:\n    review line 1\n    review line 2\n\n"),
+        "notes block must match Git's layout: {body}"
+    );
+
+    // Without --notes: no Notes block is emitted.
+    let without = run_libra_command(&["format-patch", "--stdout", "HEAD~1..HEAD"], repo.path());
+    assert_cli_success(&without, "format-patch (no notes)");
+    assert!(
+        !String::from_utf8_lossy(&without.stdout).contains("Notes:"),
+        "no Notes block without --notes"
+    );
+}
+
+#[test]
+#[serial]
+fn notes_custom_ref_uses_parenthesized_header() {
+    let repo = repo_with_commits(2);
+    let note = run_libra_command(
+        &[
+            "notes",
+            "--ref",
+            "review",
+            "add",
+            "-m",
+            "custom-ref note",
+            "HEAD",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&note, "notes --ref review add");
+
+    // A non-default ref is rendered as `Notes (<short>):`.
+    let out = run_libra_command(
+        &["format-patch", "--stdout", "--notes=review", "HEAD~1..HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "format-patch --notes=review");
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("Notes (review):\n    custom-ref note\n"),
+        "custom ref must use parenthesized header: {body}"
+    );
+
+    // The default ref (which has no note here) yields no block.
+    let default = run_libra_command(
+        &["format-patch", "--stdout", "--notes", "HEAD~1..HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&default, "format-patch --notes (default ref, no note)");
+    assert!(
+        !String::from_utf8_lossy(&default.stdout).contains("Notes"),
+        "commit with no note on the default ref emits no block"
+    );
+}
+
+#[test]
+#[serial]
+fn notes_malformed_ref_is_a_usage_error() {
+    let repo = repo_with_commits(2);
+
+    // A malformed notes ref must fail loudly (exit 129), not silently produce an
+    // ordinary patch with no notes block. Covers Git `check-ref-format` rules:
+    // empty, whitespace, trailing slash, `..`, `~`, leading-dot component,
+    // `.lock` suffix, and `@{`.
+    for bad in [
+        "--notes=",
+        "--notes=bad ref",
+        "--notes=refs/notes/",
+        "--notes=bad..ref",
+        "--notes=bad~ref",
+        "--notes=refs/notes/.hidden",
+        "--notes=refs/notes/foo.lock",
+        "--notes=bad@{ref",
+    ] {
+        let out = run_libra_command(
+            &["format-patch", "--stdout", bad, "HEAD~1..HEAD"],
+            repo.path(),
+        );
+        assert_eq!(
+            out.status.code(),
+            Some(129),
+            "malformed `{bad}` should exit 129, got: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // A valid hierarchical / hyphenated ref is NOT rejected (no note present →
+    // succeeds with no block, not a usage error). A hierarchical ref must be the
+    // full `refs/notes/...` form — `normalize_notes_ref` only auto-prefixes bare
+    // single-segment names.
+    for ok in ["--notes=my-notes", "--notes=refs/notes/team/review"] {
+        let out = run_libra_command(
+            &["format-patch", "--stdout", ok, "HEAD~1..HEAD"],
+            repo.path(),
+        );
+        assert_cli_success(&out, ok);
+        assert!(
+            !String::from_utf8_lossy(&out.stdout).contains("Notes"),
+            "valid noteless ref `{ok}` should emit no block"
+        );
+    }
+}
+
+// ---------------------------------------------------------------------------
+// --attach / --inline
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn attach_wraps_patch_in_mime_multipart() {
+    let repo = repo_with_commits(1);
+    let out = run_libra_command(
+        &["format-patch", "--stdout", "--attach", "HEAD~1..HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "format-patch --attach");
+    let body = String::from_utf8_lossy(&out.stdout);
+
+    // multipart envelope: header, intro line, both parts, closing boundary.
+    assert!(
+        body.contains("Content-Type: multipart/mixed; boundary=\"------------libra "),
+        "missing multipart Content-Type: {body}"
+    );
+    assert!(
+        body.contains("This is a multi-part message in MIME format."),
+        "missing MIME intro line: {body}"
+    );
+    // text/plain part holds the log + diffstat.
+    assert!(
+        body.contains("Content-Type: text/plain; charset=UTF-8; format=fixed"),
+        "missing text/plain part: {body}"
+    );
+    // text/x-patch attachment part holds the diff.
+    assert!(
+        body.contains("Content-Type: text/x-patch; name=\"0001-")
+            && body.contains("Content-Disposition: attachment; filename=\"0001-"),
+        "missing attachment part: {body}"
+    );
+    assert!(
+        body.contains("diff --git "),
+        "diff missing from body: {body}"
+    );
+    // closing boundary terminates the multipart.
+    assert!(
+        body.contains("------------libra ") && body.trim_end().ends_with("--"),
+        "missing closing boundary: {body}"
+    );
+}
+
+#[test]
+#[serial]
+fn inline_uses_inline_content_disposition() {
+    let repo = repo_with_commits(1);
+    let out = run_libra_command(
+        &["format-patch", "--stdout", "--inline", "HEAD~1..HEAD"],
+        repo.path(),
+    );
+    assert_cli_success(&out, "format-patch --inline");
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("Content-Disposition: inline; filename=\"0001-"),
+        "inline should use inline disposition: {body}"
+    );
+    assert!(
+        !body.contains("Content-Disposition: attachment"),
+        "inline must not use attachment disposition: {body}"
+    );
+}
+
+#[test]
+#[serial]
+fn attach_and_inline_are_mutually_exclusive() {
+    let repo = repo_with_commits(1);
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--stdout",
+            "--attach",
+            "--inline",
+            "HEAD~1..HEAD",
+        ],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "--attach with --inline should be rejected: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[serial]
+fn no_attach_stays_plain_text() {
+    let repo = repo_with_commits(1);
+    let out = run_libra_command(&["format-patch", "--stdout", "HEAD~1..HEAD"], repo.path());
+    assert_cli_success(&out, "format-patch plain");
+    let body = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        body.contains("Content-Type: text/plain; charset=UTF-8\n"),
+        "default output should be plain text: {body}"
+    );
+    assert!(
+        !body.contains("multipart/mixed"),
+        "default output must not be multipart: {body}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // JSON output
 // ---------------------------------------------------------------------------
 
@@ -964,4 +1196,472 @@ fn encode_email_headers_splits_long_words_under_75_chars() {
             "each RFC 2047 encoded-word must be <= 75 chars: {w}"
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// Recipient headers (--to / --cc / --no-to / --no-cc)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn recipient_headers_to_and_cc() {
+    let repo = repo_with_commits(1);
+
+    // --to adds a To: header; repeated --cc folds with a 4-space continuation.
+    let output = run_libra_command(
+        &[
+            "format-patch",
+            "--stdout",
+            "HEAD~1..HEAD",
+            "--to",
+            "rev@example.com",
+            "--cc",
+            "cc1@example.com",
+            "--cc",
+            "cc2@example.com",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&output, "format-patch --to/--cc");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("To: rev@example.com\n"),
+        "To: header present: {stdout}"
+    );
+    // Cc folds onto a continuation line, matching git.
+    assert!(
+        stdout.contains("Cc: cc1@example.com,\n    cc2@example.com\n"),
+        "Cc: folds multiple addresses: {stdout}"
+    );
+    // The recipient headers sit after the MIME header block, matching git.
+    let mime_pos = stdout
+        .find("Content-Transfer-Encoding:")
+        .expect("mime block");
+    let to_pos = stdout.find("To: rev@example.com").expect("to");
+    assert!(mime_pos < to_pos, "To: follows the MIME headers: {stdout}");
+
+    // Recipients are passed through verbatim even with --encode-email-headers
+    // (git does not RFC2047-encode addresses).
+    let nonascii = run_libra_command(
+        &[
+            "format-patch",
+            "--stdout",
+            "HEAD~1..HEAD",
+            "--encode-email-headers",
+            "--to",
+            "Jöhn <john@example.com>",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&nonascii, "format-patch --encode-email-headers --to");
+    assert!(
+        String::from_utf8_lossy(&nonascii.stdout).contains("To: Jöhn <john@example.com>\n"),
+        "recipient is not RFC2047-encoded"
+    );
+
+    // --no-to / --no-cc suppress the headers even when addresses are given.
+    let suppressed = run_libra_command(
+        &[
+            "format-patch",
+            "--stdout",
+            "HEAD~1..HEAD",
+            "--to",
+            "rev@example.com",
+            "--no-to",
+            "--cc",
+            "cc@example.com",
+            "--no-cc",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&suppressed, "format-patch --no-to/--no-cc");
+    let suppressed_out = String::from_utf8_lossy(&suppressed.stdout);
+    assert!(
+        !suppressed_out.contains("\nTo: ") && !suppressed_out.contains("\nCc: "),
+        "--no-to/--no-cc suppress the headers: {suppressed_out}"
+    );
+
+    // The cover letter also carries the recipient headers.
+    let cover = run_libra_command(
+        &[
+            "format-patch",
+            "--stdout",
+            "HEAD~1..HEAD",
+            "--cover-letter",
+            "--to",
+            "rev@example.com",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&cover, "format-patch --cover-letter --to");
+    assert!(
+        String::from_utf8_lossy(&cover.stdout).contains("To: rev@example.com\n"),
+        "cover letter carries To:"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// From-header rewriting (--from)
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn from_header_rewrites_author() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // A second commit authored by someone other than the committer.
+    fs::write(p.join("x.txt"), "x\n").unwrap();
+    run_libra_command(&["add", "x.txt"], p);
+    run_libra_command(
+        &[
+            "commit",
+            "-m",
+            "feature",
+            "--author",
+            "Author A <a@x.com>",
+            "--no-verify",
+        ],
+        p,
+    );
+
+    // --from differs from the author: the From: header is rewritten and the
+    // original author is preserved as an in-body From: line.
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--stdout",
+            "HEAD~1..HEAD",
+            "--from=Bot <bot@x.com>",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --from");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("From: Bot <bot@x.com>\n"),
+        "From: header rewritten: {stdout}"
+    );
+    let header_from = stdout.find("From: Bot <bot@x.com>").expect("header From");
+    let inbody_from = stdout
+        .find("From: Author A <a@x.com>")
+        .expect("in-body From");
+    assert!(
+        header_from < inbody_from,
+        "in-body From follows header From"
+    );
+    let body_sep = stdout.find("\n\n").expect("headers/body separator");
+    assert!(
+        body_sep < inbody_from,
+        "in-body From sits in the body section: {stdout}"
+    );
+
+    // --from equal to the author adds no in-body From (only the header).
+    let same = run_libra_command(
+        &[
+            "format-patch",
+            "--stdout",
+            "HEAD~1..HEAD",
+            "--from=Author A <a@x.com>",
+        ],
+        p,
+    );
+    assert_cli_success(&same, "format-patch --from same author");
+    let same_out = String::from_utf8_lossy(&same.stdout);
+    assert_eq!(
+        same_out.matches("From: Author A <a@x.com>").count(),
+        1,
+        "no in-body From when --from equals the author: {same_out}"
+    );
+
+    // Bare `--from` (no value) uses the committer's configured identity. With
+    // `require_equals`, the following `HEAD~1..HEAD` is the revision-range
+    // positional, NOT the --from value — so this must succeed (no ambiguity).
+    let bare = run_libra_command(&["format-patch", "--from", "--stdout", "HEAD~1..HEAD"], p);
+    assert_cli_success(&bare, "format-patch bare --from");
+    let bare_out = String::from_utf8_lossy(&bare.stdout);
+    // create_committed_repo_via_cli configures user.name/email = Test User.
+    assert!(
+        bare_out.contains("From: Test User <test@example.com>\n"),
+        "bare --from uses the committer identity: {bare_out}"
+    );
+    // The committer differs from the author, so the in-body From is preserved.
+    assert!(
+        bare_out.contains("From: Author A <a@x.com>"),
+        "bare --from keeps the in-body author: {bare_out}"
+    );
+
+    // The cover letter also carries the rewritten From: identity. Write to a
+    // directory and read the cover-letter file directly so the assertion is
+    // scoped to the cover letter (not a patch mail, which also has this From:).
+    let cover_dir = tempdir().unwrap();
+    let cover = run_libra_command(
+        &[
+            "format-patch",
+            "-n",
+            "-o",
+            cover_dir.path().to_str().unwrap(),
+            "HEAD~1..HEAD",
+            "--cover-letter",
+            "--from=Bot <bot@x.com>",
+        ],
+        p,
+    );
+    assert_cli_success(&cover, "format-patch --cover-letter --from");
+    let cover_text = fs::read_to_string(cover_dir.path().join("0000-cover-letter.patch"))
+        .expect("cover-letter file");
+    assert!(
+        cover_text.contains("From: Bot <bot@x.com>\n"),
+        "cover letter carries the --from identity (not a blank From:): {cover_text}"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// --base: base-commit / prerequisite-patch-id trailer
+// ---------------------------------------------------------------------------
+
+#[test]
+#[serial]
+fn base_records_base_commit_and_prerequisite_patch_ids() {
+    // create_committed_repo_via_cli gives 1 commit; +3 → 4 commits total.
+    let repo = repo_with_commits(3);
+    let p = repo.path();
+
+    let base_sha = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD~3"], p).stdout)
+        .trim()
+        .to_string();
+
+    // Base older than the series parent → base-commit plus one prerequisite per
+    // commit between the base and the series parent (oldest-first).
+    let out = run_libra_command(
+        &["format-patch", "--base=HEAD~3", "--stdout", "HEAD~1..HEAD"],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --base");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains(&format!("base-commit: {base_sha}\n")),
+        "records the base commit: {text}"
+    );
+    let prereqs = text.matches("prerequisite-patch-id: ").count();
+    assert_eq!(
+        prereqs, 2,
+        "two commits lie between base and series parent: {text}"
+    );
+    // The base trailer precedes the signature footer.
+    let base_pos = text.find("base-commit:").unwrap();
+    let sig_pos = text.find("\n-- \n").unwrap();
+    assert!(
+        base_pos < sig_pos,
+        "base trailer comes before the signature"
+    );
+}
+
+#[test]
+#[serial]
+fn base_multi_file_prerequisite_patch_id_matches_git() {
+    // A prerequisite commit that touches TWO files exercises Git's stable
+    // patch-id combiner (byte-wise add-with-carry, NOT XOR). The patch-id is
+    // derived purely from the diff content, so the expected value is the one
+    // `git patch-id --stable` produces for the same change (a->A, b->B).
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("f1"), "a\n").unwrap();
+    fs::write(p.join("f2"), "b\n").unwrap();
+    run_libra_command(&["add", "f1", "f2"], p);
+    run_libra_command(&["commit", "-m", "base", "--no-verify"], p);
+    fs::write(p.join("f1"), "A\n").unwrap();
+    fs::write(p.join("f2"), "B\n").unwrap();
+    run_libra_command(&["add", "f1", "f2"], p);
+    run_libra_command(&["commit", "-m", "multi", "--no-verify"], p);
+    fs::write(p.join("f3"), "c\n").unwrap();
+    run_libra_command(&["add", "f3"], p);
+    run_libra_command(&["commit", "-m", "tip", "--no-verify"], p);
+
+    let out = run_libra_command(
+        &["format-patch", "--base=HEAD~2", "--stdout", "HEAD~1..HEAD"],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --base multi-file prereq");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("prerequisite-patch-id: 41738f97b408e386f1d209bee7dc2096eeafa713"),
+        "multi-file prerequisite patch-id must match git patch-id --stable: {text}"
+    );
+}
+
+#[test]
+#[serial]
+fn base_prerequisites_skip_merge_commits() {
+    // base -> main2 -> merge(feat) -> tip. With base at the root and the series =
+    // tip, the prerequisites are main2 + feat — the MERGE commit is skipped, like
+    // git's non-merge (`max_parents = 1`) prerequisite walk.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("f"), "1\n").unwrap();
+    run_libra_command(&["add", "f"], p);
+    run_libra_command(&["commit", "-m", "base", "--no-verify"], p);
+    let base = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    run_libra_command(&["branch", "feat"], p);
+    run_libra_command(&["switch", "feat"], p);
+    fs::write(p.join("f"), "1\n2\n").unwrap();
+    run_libra_command(&["add", "f"], p);
+    run_libra_command(&["commit", "-m", "feat", "--no-verify"], p);
+
+    run_libra_command(&["switch", "main"], p);
+    fs::write(p.join("g"), "1\n0\n").unwrap();
+    run_libra_command(&["add", "g"], p);
+    run_libra_command(&["commit", "-m", "main2", "--no-verify"], p);
+    let merge = run_libra_command(&["merge", "feat", "-m", "merge feat"], p);
+    assert_cli_success(&merge, "merge feat");
+
+    fs::write(p.join("h"), "x\n").unwrap();
+    run_libra_command(&["add", "h"], p);
+    run_libra_command(&["commit", "-m", "tip", "--no-verify"], p);
+
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            &format!("--base={base}"),
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --base with a merge in the prereqs");
+    let prereqs = String::from_utf8_lossy(&out.stdout)
+        .matches("prerequisite-patch-id: ")
+        .count();
+    assert_eq!(
+        prereqs, 2,
+        "merge commit must not be emitted as a prerequisite"
+    );
+}
+
+#[test]
+#[serial]
+fn base_with_attach_emits_trailer_in_patch_part() {
+    let repo = repo_with_commits(3);
+    let p = repo.path();
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "--attach",
+            "--base=HEAD~3",
+            "--stdout",
+            "HEAD~1..HEAD",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --attach --base");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("base-commit: "),
+        "attach output carries the base trailer: {text}"
+    );
+    // The trailer sits inside the patch part, before the closing MIME boundary.
+    let base_pos = text.find("base-commit:").unwrap();
+    let close_pos = text.rfind("--\n").unwrap();
+    assert!(
+        base_pos < close_pos,
+        "base trailer precedes the closing boundary"
+    );
+}
+
+#[test]
+#[serial]
+fn base_direct_parent_has_no_prerequisites() {
+    let repo = repo_with_commits(3);
+    let p = repo.path();
+    // Base == the series parent → base-commit only, no prerequisites.
+    let out = run_libra_command(
+        &["format-patch", "--base=HEAD~1", "--stdout", "HEAD~1..HEAD"],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --base direct parent");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("base-commit: "), "has base-commit: {text}");
+    assert!(
+        !text.contains("prerequisite-patch-id:"),
+        "no prerequisites when base is the direct parent: {text}"
+    );
+}
+
+#[test]
+#[serial]
+fn base_on_non_ancestor_fails() {
+    let repo = repo_with_commits(3);
+    let p = repo.path();
+    // A sibling commit that is not an ancestor of the series.
+    run_libra_command(&["branch", "side", "HEAD~2"], p);
+    run_libra_command(&["switch", "side"], p);
+    fs::write(p.join("side.txt"), "side\n").unwrap();
+    run_libra_command(&["add", "side.txt"], p);
+    run_libra_command(&["commit", "-m", "side", "--no-verify"], p);
+    run_libra_command(&["switch", "main"], p);
+
+    let out = run_libra_command(
+        &["format-patch", "--base=side", "--stdout", "HEAD~1..HEAD"],
+        p,
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "non-ancestor base is rejected: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[serial]
+fn base_auto_is_rejected() {
+    let repo = repo_with_commits(3);
+    let out = run_libra_command(
+        &["format-patch", "--base=auto", "--stdout", "HEAD~1..HEAD"],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "--base=auto is a usage error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+#[serial]
+fn base_with_cover_letter_lands_on_cover() {
+    let repo = repo_with_commits(3);
+    let p = repo.path();
+    let dir = tempdir().unwrap();
+    let out = run_libra_command(
+        &[
+            "format-patch",
+            "-o",
+            dir.path().to_str().unwrap(),
+            "--cover-letter",
+            "--base=HEAD~3",
+            "HEAD~1..HEAD",
+        ],
+        p,
+    );
+    assert_cli_success(&out, "format-patch --cover-letter --base");
+    let cover = fs::read_to_string(dir.path().join("0000-cover-letter.patch")).expect("cover");
+    assert!(
+        cover.contains("base-commit: "),
+        "base trailer on the cover: {cover}"
+    );
+    // Exactly one file (the cover letter) carries the base trailer — the patch
+    // files must not duplicate it.
+    let with_base = fs::read_dir(dir.path())
+        .unwrap()
+        .filter_map(|e| fs::read_to_string(e.unwrap().path()).ok())
+        .filter(|t| t.contains("base-commit:"))
+        .count();
+    assert_eq!(
+        with_base, 1,
+        "only the cover letter carries the base trailer"
+    );
 }

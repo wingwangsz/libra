@@ -329,6 +329,140 @@ fn test_reset_json_pathspec_omits_previous_commit() {
 }
 
 #[test]
+fn reset_bare_pathspec_unstages_file_like_git() {
+    // Given: a tracked file is modified and staged.
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();
+    let add_output = run_libra_command(&["add", "tracked.txt"], repo.path());
+    assert_cli_success(&add_output, "stage tracked.txt");
+
+    // When: reset receives the file as a bare positional, matching `git reset <path>`.
+    let output = run_libra_command(&["reset", "tracked.txt"], repo.path());
+
+    // Then: the file is unstaged but the worktree modification remains.
+    assert_cli_success(&output, "reset tracked.txt");
+    let status = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&status, "status --short");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), " M tracked.txt\n");
+}
+
+#[test]
+fn reset_double_dash_pathspec_unstages_file_named_like_revision() {
+    // Given: a tracked file is literally named HEAD and has staged content.
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("HEAD"), "head file\n").unwrap();
+    let add = run_libra_command(&["add", "HEAD"], repo.path());
+    assert_cli_success(&add, "add HEAD file");
+    let commit = run_libra_command(
+        &["commit", "-m", "add head file", "--no-verify"],
+        repo.path(),
+    );
+    assert_cli_success(&commit, "commit HEAD file");
+    fs::write(repo.path().join("HEAD"), "head file\nupdated\n").unwrap();
+    let add = run_libra_command(&["add", "HEAD"], repo.path());
+    assert_cli_success(&add, "stage HEAD file update");
+
+    // When: `--` explicitly marks the following token as a pathspec.
+    let output = run_libra_command(&["reset", "--", "HEAD"], repo.path());
+
+    // Then: the revision-like filename is treated as a path and unstaged.
+    assert_cli_success(&output, "reset -- HEAD");
+    let status = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&status, "status --short");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), " M HEAD\n");
+}
+
+#[test]
+fn reset_double_dash_preserves_dash_prefixed_pathspecs() {
+    // Given: tracked files have names that would otherwise parse as flags.
+    let repo = create_committed_repo_via_cli();
+    for name in ["-h", "--help"] {
+        fs::write(repo.path().join(name), format!("{name}\n")).unwrap();
+        let add = run_libra_command(&["add", "--", name], repo.path());
+        assert_cli_success(&add, "add dash-prefixed file");
+    }
+    let commit = run_libra_command(
+        &["commit", "-m", "add dash-prefixed files", "--no-verify"],
+        repo.path(),
+    );
+    assert_cli_success(&commit, "commit dash-prefixed files");
+
+    for name in ["-h", "--help"] {
+        fs::write(repo.path().join(name), format!("{name}\nupdated\n")).unwrap();
+        let add = run_libra_command(&["add", "--", name], repo.path());
+        assert_cli_success(&add, "stage dash-prefixed file update");
+
+        // When: `--` marks the dash-prefixed token as a pathspec.
+        let output = run_libra_command(&["reset", "--", name], repo.path());
+
+        // Then: reset treats the token as a filename instead of a reset/help flag.
+        assert_cli_success(&output, "reset dash-prefixed pathspec");
+        let status = run_libra_command(&["status", "--short"], repo.path());
+        assert_cli_success(&status, "status --short");
+        let stdout = String::from_utf8_lossy(&status.stdout);
+        assert!(
+            stdout.contains(&format!(" M {name}\n")),
+            "expected {name} to be unstaged, got: {stdout}",
+        );
+    }
+}
+
+#[test]
+fn reset_bare_revision_path_ambiguity_errors_like_git() {
+    // Given: a token names both a branch and a tracked path.
+    let repo = create_committed_repo_via_cli();
+    fs::write(repo.path().join("feature"), "branch/path collision\n").unwrap();
+    let add = run_libra_command(&["add", "feature"], repo.path());
+    assert_cli_success(&add, "add feature file");
+    let commit = run_libra_command(
+        &["commit", "-m", "add feature file", "--no-verify"],
+        repo.path(),
+    );
+    assert_cli_success(&commit, "commit feature file");
+    let branch = run_libra_command(&["branch", "feature"], repo.path());
+    assert_cli_success(&branch, "create feature branch");
+    fs::write(
+        repo.path().join("feature"),
+        "branch/path collision\nupdated\n",
+    )
+    .unwrap();
+    let add = run_libra_command(&["add", "feature"], repo.path());
+    assert_cli_success(&add, "stage feature file update");
+
+    // When: reset receives the ambiguous token without `--`.
+    let output = run_libra_command(&["reset", "feature"], repo.path());
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    // Then: it refuses to guess between revision and pathspec.
+    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert!(
+        stderr.contains("ambiguous argument 'feature': both revision and filename"),
+        "unexpected stderr: {stderr}"
+    );
+    let status = run_libra_command(&["status", "--short"], repo.path());
+    assert_cli_success(&status, "status --short");
+    assert_eq!(String::from_utf8_lossy(&status.stdout), "M  feature\n");
+}
+
+#[test]
+fn reset_soft_revision_does_not_probe_index_for_pathspec_disambiguation() {
+    // Given: a normal repository whose index is unreadable.
+    let repo = create_committed_repo_via_cli();
+    fs::write(
+        repo.path().join(".libra").join("index"),
+        b"corrupted-index-data",
+    )
+    .unwrap();
+
+    // When: reset receives an unambiguous revision target.
+    let output = run_libra_command(&["reset", "--soft", "HEAD"], repo.path());
+
+    // Then: soft reset resolves the revision without probing pathspec state.
+    assert_cli_success(&output, "reset --soft HEAD with corrupt index");
+}
+
+#[test]
 fn test_reset_json_hard_with_pathspec_returns_usage_error() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();
@@ -512,6 +646,9 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -543,6 +680,9 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -567,11 +707,14 @@ async fn test_reset_hard_io_failure_rolls_back_index_and_keeps_head() {
 
     let result = reset::execute_safe(
         ResetArgs {
-            target: "HEAD~1".to_string(),
+            target: Some("HEAD~1".to_string()),
             soft: false,
             mixed: false,
             hard: true,
+            merge: false,
+            keep: false,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -621,6 +764,9 @@ async fn setup_standard_repo(
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -640,6 +786,9 @@ async fn setup_standard_repo(
     .await;
     let commit1 = Head::current_commit().await.unwrap();
     branch::execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("1".to_string()),
         commit_hash: None,
         list: false,
@@ -647,6 +796,7 @@ async fn setup_standard_repo(
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -678,6 +828,9 @@ async fn setup_standard_repo(
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -697,6 +850,9 @@ async fn setup_standard_repo(
     .await;
     let commit2 = Head::current_commit().await.unwrap();
     branch::execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("2".to_string()),
         commit_hash: None,
         list: false,
@@ -704,6 +860,7 @@ async fn setup_standard_repo(
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -735,6 +892,9 @@ async fn setup_standard_repo(
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -754,6 +914,9 @@ async fn setup_standard_repo(
     .await;
     let commit3 = Head::current_commit().await.unwrap();
     branch::execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("3".to_string()),
         commit_hash: None,
         list: false,
@@ -761,6 +924,7 @@ async fn setup_standard_repo(
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -792,6 +956,9 @@ async fn setup_standard_repo(
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -811,6 +978,9 @@ async fn setup_standard_repo(
     .await;
     let commit4 = Head::current_commit().await.unwrap();
     branch::execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("4".to_string()),
         commit_hash: None,
         list: false,
@@ -818,6 +988,7 @@ async fn setup_standard_repo(
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -858,6 +1029,9 @@ async fn setup_test_state() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 }
@@ -874,11 +1048,14 @@ async fn test_reset_soft() {
 
     // Perform soft reset to commit 1
     reset::execute(ResetArgs {
-        target: "1".to_string(), // Reset to branch 1
+        target: Some("1".to_string()), // Reset to branch 1
         soft: true,
         mixed: false,
         hard: false,
+        merge: false,
+        keep: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -921,11 +1098,14 @@ async fn test_reset_mixed() {
 
     // Perform mixed reset (default) to commit 1
     reset::execute(ResetArgs {
-        target: "1".to_string(), // Reset to branch 1
+        target: Some("1".to_string()), // Reset to branch 1
         soft: false,
         mixed: false, // false means default (mixed)
         hard: false,
+        merge: false,
+        keep: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -972,11 +1152,14 @@ async fn test_reset_hard() {
 
     // Perform hard reset to commit 1
     reset::execute(ResetArgs {
-        target: "1".to_string(), // Reset to branch 1
+        target: Some("1".to_string()), // Reset to branch 1
         soft: false,
         mixed: false,
         hard: true,
+        merge: false,
+        keep: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -1050,6 +1233,9 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1082,16 +1268,22 @@ async fn test_reset_mixed_same_target_resets_index_without_moving_head() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
     reset::execute_safe(
         ResetArgs {
-            target: "HEAD".to_string(),
+            target: Some("HEAD".to_string()),
             soft: false,
             mixed: true,
             hard: false,
+            merge: false,
+            keep: false,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -1137,6 +1329,9 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1169,16 +1364,22 @@ async fn test_reset_hard_same_target_restores_worktree_and_removes_staged_additi
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
     reset::execute_safe(
         ResetArgs {
-            target: "HEAD".to_string(),
+            target: Some("HEAD".to_string()),
             soft: false,
             mixed: false,
             hard: true,
+            merge: false,
+            keep: false,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -1229,6 +1430,9 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1260,6 +1464,9 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1287,17 +1494,21 @@ async fn test_reset_hard_removes_paths_tracked_only_by_head_tree() {
         ignore_unmatch: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        sparse: false,
     })
     .await;
     fs::write("tracked.txt", "tracked\nstill here\n").unwrap();
 
     reset::execute_safe(
         ResetArgs {
-            target: "HEAD~1".to_string(),
+            target: Some("HEAD~1".to_string()),
             soft: false,
             mixed: false,
             hard: true,
+            merge: false,
+            keep: false,
             pathspecs: vec![],
+            pathspec_separator: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_refresh: false,
@@ -1334,11 +1545,14 @@ async fn test_reset_with_head_reference() {
 
     // Reset using HEAD~ syntax
     reset::execute(ResetArgs {
-        target: "HEAD~1".to_string(),
+        target: Some("HEAD~1".to_string()),
         soft: false,
         mixed: true,
         hard: false,
+        merge: false,
+        keep: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,
@@ -1380,11 +1594,14 @@ async fn test_reset_on_branch() {
 
             // Perform reset
             reset::execute(ResetArgs {
-                target: commit1.to_string(),
+                target: Some(commit1.to_string()),
                 soft: true,
                 mixed: false,
                 hard: false,
+                merge: false,
+                keep: false,
                 pathspecs: vec![],
+                pathspec_separator: false,
                 pathspec_from_file: None,
                 pathspec_file_nul: false,
                 no_refresh: false,
@@ -1434,6 +1651,9 @@ async fn test_reset_hard_skips_ignored_directories() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1466,11 +1686,14 @@ async fn test_reset_hard_skips_ignored_directories() {
 
     // Perform hard reset
     reset::execute(ResetArgs {
-        target: "HEAD".to_string(),
+        target: Some("HEAD".to_string()),
         soft: false,
         mixed: false,
         hard: true,
+        merge: false,
+        keep: false,
         pathspecs: vec![],
+        pathspec_separator: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
         no_refresh: false,

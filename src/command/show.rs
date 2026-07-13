@@ -1,6 +1,11 @@
 //! Show command that resolves object IDs and prints commit, tree, blob, or ref details with formatting suitable for diffable objects.
 
-use std::{path::PathBuf, str::FromStr};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    io::IsTerminal,
+    path::{Path, PathBuf},
+    str::FromStr,
+};
 
 use clap::Parser;
 use colored::Colorize;
@@ -18,20 +23,24 @@ use serde::Serialize;
 use crate::{
     command::{
         load_object,
-        log::{ChangeType, generate_diff, get_changed_files_for_commit, parse_pretty_format},
+        log::{
+            ChangeType,
+            config::{configured_date, configured_pretty, resolve_cli_date},
+            generate_diff, get_changed_files_for_commit, parse_pretty_format,
+        },
     },
     common_utils::parse_commit_msg,
     internal::{
         branch::Branch,
         head::Head,
-        log::formatter::{CommitFormatter, FormatContext},
+        log::formatter::{CommitFormatter, FormatContext, format_timestamp_with},
         tag,
     },
     utils::{
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         object_ext::TreeExt,
-        output::{OutputConfig, emit_json_data},
+        output::{ColorChoice, OutputConfig, emit_json_data},
         pager::Pager,
         path, util,
     },
@@ -43,7 +52,10 @@ EXAMPLES:
     libra show --no-patch v1.0.0            Show tag or commit metadata only
     libra show HEAD:src/main.rs             Show a file from a specific revision
     libra show --stat HEAD~1                Show only diff statistics
+    libra show --patch-with-stat HEAD       Show the diffstat followed by the full patch
     libra show --name-status HEAD           Show changed files with A/M/D status
+    libra show --raw HEAD                    Raw diff format (mode/sha/status per file)
+    libra show --summary HEAD               Show created/deleted file mode summary
     libra show --format='%h %s' HEAD        Custom header format (alias for --pretty)
     libra show --abbrev-commit HEAD         Abbreviate the commit hash in the header
     libra --json show HEAD                  Structured JSON output for agents";
@@ -74,10 +86,22 @@ pub struct ShowArgs {
     #[clap(long, value_name = "FORMAT", conflicts_with = "pretty")]
     pub format: Option<String>,
 
+    /// Date rendering mode for author/committer dates: default / short / iso /
+    /// iso-strict / rfc / unix / raw.
+    #[clap(long, value_name = "FORMAT")]
+    pub date: Option<String>,
+
     /// Abbreviate the commit object name in the default header instead of
-    /// printing the full 40-character hash.
-    #[clap(long)]
+    /// printing the full (unabbreviated) hash.
+    #[clap(long, overrides_with = "no_abbrev_commit")]
     pub abbrev_commit: bool,
+
+    /// Show the full (unabbreviated) commit object name, countermanding an
+    /// earlier `--abbrev-commit` (last one on the command line wins), matching
+    /// `git show --no-abbrev-commit`. The full hash is the default, so on its
+    /// own this is a no-op.
+    #[clap(long = "no-abbrev-commit", overrides_with = "abbrev_commit")]
+    pub no_abbrev_commit: bool,
 
     /// Show only changed file names.
     #[clap(long)]
@@ -87,9 +111,46 @@ pub struct ShowArgs {
     #[clap(long = "name-status")]
     pub name_status: bool,
 
+    /// Show the diff in the raw format (`:<old-mode> <new-mode> <old-sha>
+    /// <new-sha> <status>\t<path>`) instead of a patch, like `git show --raw`.
+    #[clap(long)]
+    pub raw: bool,
+
     /// Show diff statistics.
     #[clap(long)]
     pub stat: bool,
+
+    /// Show the diffstat block followed by the full patch (Git's legacy synonym
+    /// for `-p --stat`).
+    #[clap(long = "patch-with-stat")]
+    pub patch_with_stat: bool,
+
+    /// Show a condensed summary of created and deleted files (their mode and
+    /// path), like `git show --summary`. Mirrors `libra diff --summary`:
+    /// rename/copy and mode-change detection are not implemented.
+    #[clap(long)]
+    pub summary: bool,
+
+    /// Do not expand tabs in the commit message. Accepted for Git parity and is
+    /// a no-op: Libra's show never expands tabs (it prints them verbatim).
+    #[clap(long = "no-expand-tabs")]
+    pub no_expand_tabs: bool,
+
+    /// Do not show commit notes. Accepted for Git parity and is a no-op: Libra's
+    /// show never displays notes inline. (Use `libra notes show <commit>`.)
+    #[clap(long = "no-notes")]
+    pub no_notes: bool,
+
+    /// Do not use a `.mailmap` to rewrite identities. Accepted for Git parity
+    /// and is a no-op: Libra's show never applies a mailmap.
+    #[clap(long = "no-mailmap")]
+    pub no_mailmap: bool,
+
+    /// Do not display the GPG signature of signed commits. Accepted for Git
+    /// parity and is a no-op: Libra's show never displays commit signatures
+    /// inline. (Git's opposite `--show-signature` is not implemented.)
+    #[clap(long = "no-show-signature")]
+    pub no_show_signature: bool,
 
     /// Limit output to matching paths.
     #[clap(value_name = "PATHS", num_args = 0..)]
@@ -219,8 +280,12 @@ pub async fn execute(args: ShowArgs) {
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. Resolves a revision (commit, tag, tree, blob, or
 /// `<rev>:<path>`) and prints its contents with diff formatting.
-pub async fn execute_safe(args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute_safe(mut args: ShowArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::from(ShowError::NotInRepo))?;
+
+    if let Some(date) = args.date.take() {
+        args.date = Some(resolve_cli_date(&date)?);
+    }
 
     if output.is_json() {
         let result = run_show(&args).await?;
@@ -231,7 +296,22 @@ pub async fn execute_safe(args: ShowArgs, output: &OutputConfig) -> CliResult<()
         return validate_show_quiet(&args).await;
     }
 
-    let rendered = render_show_human(&args).await?;
+    // These are commit-display defaults. Invalid values must not block
+    // tree/blob/REV:path output, which never renders either setting.
+    if show_target_uses_commit_display(&args).await? {
+        if !args.oneline && args.pretty.is_none() && args.format.is_none() {
+            let configured = configured_pretty().await?;
+            // `medium` is Git's default renderer, including the full commit id.
+            if configured.as_deref() != Some("medium") {
+                args.pretty = configured;
+            }
+        }
+        if args.date.is_none() {
+            args.date = configured_date().await?;
+        }
+    }
+
+    let rendered = render_show_human(&args, color_enabled_for_output(output)).await?;
     if rendered.is_empty() {
         return Ok(());
     }
@@ -241,7 +321,32 @@ pub async fn execute_safe(args: ShowArgs, output: &OutputConfig) -> CliResult<()
     pager.finish()
 }
 
-async fn render_show_human(args: &ShowArgs) -> CliResult<String> {
+fn color_enabled_for_output(output: &OutputConfig) -> bool {
+    match output.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => std::io::stdout().is_terminal(),
+    }
+}
+
+async fn show_target_uses_commit_display(args: &ShowArgs) -> CliResult<bool> {
+    let object_ref = args.object.as_deref().unwrap_or("HEAD");
+    if object_ref.contains(':') {
+        return Ok(false);
+    }
+
+    if let Some(hash) = resolve_existing_object_hash(object_ref) {
+        let storage = ClientStorage::init(path::objects());
+        let object_type = storage
+            .get_object_type(&hash)
+            .map_err(|error| show_object_load_error(hash, error))?;
+        return Ok(matches!(object_type, ObjectType::Commit | ObjectType::Tag));
+    }
+
+    Ok(util::get_commit_base(object_ref).await.is_ok())
+}
+
+async fn render_show_human(args: &ShowArgs, color_enabled: bool) -> CliResult<String> {
     let object_ref = args.object.as_deref().unwrap_or("HEAD");
 
     // Handle `<revision>:<path>` lookups before generic revision resolution.
@@ -252,7 +357,7 @@ async fn render_show_human(args: &ShowArgs) -> CliResult<String> {
     // Raw object IDs should keep their native schema, including annotated tag
     // objects, but hash-like ref names must still fall back to ref resolution.
     if let Some(hash) = resolve_existing_object_hash(object_ref) {
-        return show_object_by_hash(&hash, args).await;
+        return show_object_by_hash(&hash, args, color_enabled).await;
     }
 
     // Resolve refs first so tags keep their custom rendering.
@@ -266,11 +371,11 @@ async fn render_show_human(args: &ShowArgs) -> CliResult<String> {
                 } else {
                     commit_hash
                 };
-                return show_tag_by_hash(&tag_hash, args).await;
+                return show_tag_by_hash(&tag_hash, args, color_enabled).await;
             }
             _ => {
                 // Not a tag, lightweight tag, or tag doesn't exist: show as commit.
-                return show_commit(&commit_hash, args).await;
+                return show_commit(&commit_hash, args, color_enabled).await;
             }
         }
     }
@@ -312,6 +417,7 @@ async fn validate_show_quiet(args: &ShowArgs) -> CliResult<()> {
 fn show_object_by_hash<'a>(
     hash: &'a ObjectHash,
     args: &'a ShowArgs,
+    color_enabled: bool,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = CliResult<String>> + 'a>> {
     Box::pin(async move {
         let storage = ClientStorage::init(path::objects());
@@ -321,8 +427,8 @@ fn show_object_by_hash<'a>(
             .map_err(|e| show_object_load_error(hash, e))?;
 
         match obj_type {
-            ObjectType::Commit => show_commit(hash, args).await,
-            ObjectType::Tag => show_tag_by_hash(hash, args).await,
+            ObjectType::Commit => show_commit(hash, args, color_enabled).await,
+            ObjectType::Tag => show_tag_by_hash(hash, args, color_enabled).await,
             ObjectType::Tree => show_tree(hash).await,
             ObjectType::Blob => show_blob(hash).await,
             _ => Err(show_unsupported_object_type_error(format!("{obj_type:?}"))),
@@ -352,23 +458,49 @@ fn validate_object_by_hash<'a>(
 }
 
 /// Shows a commit together with optional diff output.
-async fn show_commit(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<String> {
+async fn show_commit(
+    commit_hash: &ObjectHash,
+    args: &ShowArgs,
+    color_enabled: bool,
+) -> CliResult<String> {
     // Load the commit before rendering any metadata or diff output.
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
 
     let mut output = String::new();
-    display_commit_info(&mut output, &commit, args);
+    display_commit_info(&mut output, &commit, args, color_enabled);
 
     // Render patch-style details when requested.
     if !args.no_patch {
         let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
 
-        if args.stat {
+        if args.patch_with_stat {
+            // `--patch-with-stat` (Git's `-p --stat`): the diffstat block followed
+            // by the full patch.
+            let diffstat = show_diffstat(&commit, paths.clone()).await?;
+            if !diffstat.is_empty() {
+                output.push_str(&diffstat);
+            }
+            let diff_output = generate_diff(&commit, paths).await?;
+            if !diff_output.is_empty() {
+                output.push('\n');
+                output.push_str(&diff_output);
+            }
+        } else if args.stat {
             // Show the summary view.
             let diffstat = show_diffstat(&commit, paths.clone()).await?;
             if !diffstat.is_empty() {
                 output.push_str(&diffstat);
+            }
+        } else if args.summary {
+            // Show only the created/deleted-file summary, parsed out of the
+            // commit's unified diff (the same text the patch view renders).
+            let diff_output = generate_diff(&commit, paths).await?;
+            let summary = format_show_summary(&diff_output);
+            if !summary.is_empty() {
+                output.push('\n');
+                output.push_str(&summary);
+                output.push('\n');
             }
         } else if args.name_status {
             // Show changed file names prefixed by their status letter (A/M/D),
@@ -384,6 +516,14 @@ async fn show_commit(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<Str
                     };
                     output.push_str(&format!("{}\t{}\n", status, file.path.display()));
                 }
+            }
+        } else if args.raw {
+            // Show the raw diff format, matching `git show --raw`:
+            // `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>`.
+            let raw_lines = raw_diff_lines_for_commit(&commit, &paths).await?;
+            if !raw_lines.is_empty() {
+                output.push('\n');
+                output.push_str(&raw_lines);
             }
         } else if args.name_only {
             // Show only changed file names.
@@ -406,6 +546,140 @@ async fn show_commit(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<Str
     Ok(output)
 }
 
+/// Build the `--summary` view from a commit's full unified diff text: one
+/// ` create mode <mode> <path>` line per created file and ` delete mode <mode>
+/// <path>` per deleted file. Mirrors `libra diff --summary` (created/deleted
+/// files only — rename/copy and mode-change detection are not implemented).
+/// Returns an empty string when nothing was created or deleted.
+fn format_show_summary(diff_text: &str) -> String {
+    let mut lines = Vec::new();
+    // Path of the file in the current `diff --git` block, recovered from the
+    // header (see `reconstruct_identical_diff_path`) and reset at every header.
+    // The `new file mode`/`deleted file mode` line — which is present for binary
+    // files too (their hunks carry no `---`/`+++` path lines) — then emits using
+    // that path, so binary creates/deletes are handled and a stale path can
+    // never leak into the next file's block.
+    let mut current_path: Option<String> = None;
+    for line in diff_text.lines() {
+        if let Some(body) = line.strip_prefix("diff --git a/") {
+            current_path = reconstruct_identical_diff_path(body);
+        } else if line.starts_with("diff --git ") {
+            // A header not in the expected `a/<P> b/<P>` shape (should not occur
+            // for created/deleted files): drop any path so we never misattribute.
+            current_path = None;
+        } else if let Some(mode) = line.strip_prefix("new file mode ")
+            && let Some(path) = &current_path
+        {
+            lines.push(format!(" create mode {} {}", mode.trim(), path));
+        } else if let Some(mode) = line.strip_prefix("deleted file mode ")
+            && let Some(path) = &current_path
+        {
+            lines.push(format!(" delete mode {} {}", mode.trim(), path));
+        }
+    }
+    lines.join("\n")
+}
+
+/// Recover the file path from the body of a `diff --git a/<P> b/<P>` header (the
+/// text after the leading `a/`). For created/deleted files the a-side and
+/// b-side are the identical `<P>`, so the body is exactly `<P> b/<P>`; we split
+/// at the unique midpoint and verify the reconstruction, which recovers paths
+/// containing " b/" or spaces. Returns `None` for rename headers (a-side !=
+/// b-side), since those are neither creates nor deletes.
+fn reconstruct_identical_diff_path(body: &str) -> Option<String> {
+    // `body` == "<P> b/<P>" ⇒ len == 2*len(P) + len(" b/").
+    const SEP: &str = " b/";
+    if body.len() <= SEP.len() || !(body.len() - SEP.len()).is_multiple_of(2) {
+        return None;
+    }
+    let plen = (body.len() - SEP.len()) / 2;
+    // `plen` is a char boundary for any genuine `<P> b/<P>` body (it lands at the
+    // end of the first `<P>`); `get` returns None otherwise, declining safely.
+    let candidate = body.get(..plen)?;
+    if body == format!("{candidate} b/{candidate}") {
+        Some(candidate.to_string())
+    } else {
+        None
+    }
+}
+
+/// Build the `git show --raw` body for a commit: one line per changed file,
+/// `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>` (object ids
+/// abbreviated to 7, the absent side rendered as zeros). The change set is built
+/// directly from the commit and its first-parent trees so it is mode-aware (a
+/// same-content file whose mode changed still shows as `M`, matching Git —
+/// reachable e.g. for history imported from Git) and path-ordered.
+async fn raw_diff_lines_for_commit(commit: &Commit, paths: &[PathBuf]) -> CliResult<String> {
+    let new_map = tree_entry_map(&commit.tree_id)?;
+    let old_map = if let Some(parent) = commit.parent_commit_ids.first() {
+        let parent_commit =
+            load_object::<Commit>(parent).map_err(|e| show_object_load_error(parent, e))?;
+        tree_entry_map(&parent_commit.tree_id)?
+    } else {
+        BTreeMap::new()
+    };
+    Ok(build_raw_lines(&old_map, &new_map, paths))
+}
+
+/// Map each blob path in a tree to its `(octal-mode, abbreviated-id)`.
+fn tree_entry_map(tree_id: &ObjectHash) -> CliResult<BTreeMap<PathBuf, (String, String)>> {
+    let tree = load_object::<Tree>(tree_id).map_err(|e| show_object_load_error(tree_id, e))?;
+    Ok(tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, hash, mode)| {
+            let mode_str = String::from_utf8_lossy(mode.to_bytes()).into_owned();
+            let sha = hash.to_string().chars().take(7).collect::<String>();
+            (path, (mode_str, sha))
+        })
+        .collect())
+}
+
+/// Render the raw diff lines for the union of `old_map`/`new_map` paths (filtered
+/// by `paths`): added paths show a zeroed old side, deleted paths a zeroed new
+/// side, and a path present on both sides is `M` when its `(mode, id)` differs
+/// (so a mode-only change is reported, like Git). Output is path-ordered.
+fn build_raw_lines(
+    old_map: &BTreeMap<PathBuf, (String, String)>,
+    new_map: &BTreeMap<PathBuf, (String, String)>,
+    paths: &[PathBuf],
+) -> String {
+    const ZERO_MODE: &str = "000000";
+    let zero_sha = "0".repeat(7);
+    let absent = || (ZERO_MODE.to_string(), zero_sha.clone());
+    let matches_filter = |path: &Path| {
+        paths.is_empty() || paths.iter().any(|filter| util::is_sub_path(path, filter))
+    };
+
+    let mut all_paths: BTreeSet<&PathBuf> = BTreeSet::new();
+    all_paths.extend(old_map.keys());
+    all_paths.extend(new_map.keys());
+
+    let mut out = String::new();
+    for path in all_paths {
+        if !matches_filter(path) {
+            continue;
+        }
+        let (status, (old_mode, old_sha), (new_mode, new_sha)) =
+            match (old_map.get(path), new_map.get(path)) {
+                (None, Some(new)) => ("A", absent(), new.clone()),
+                (Some(old), None) => ("D", old.clone(), absent()),
+                (Some(old), Some(new)) => {
+                    if old == new {
+                        continue;
+                    }
+                    ("M", old.clone(), new.clone())
+                }
+                (None, None) => continue,
+            };
+        out.push_str(&format!(
+            ":{old_mode} {new_mode} {old_sha} {new_sha} {status}\t{}\n",
+            path.display()
+        ));
+    }
+    out
+}
+
 async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> CliResult<()> {
     let commit =
         load_object::<Commit>(commit_hash).map_err(|e| show_object_load_error(commit_hash, e))?;
@@ -415,10 +689,11 @@ async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> Cl
     }
 
     let paths: Vec<PathBuf> = args.pathspec.iter().map(util::to_workdir_path).collect();
-    if args.stat || args.name_only || args.name_status {
-        // --stat / --name-only / --name-status human paths only need tree-level file lists,
-        // not blob contents.  Use the same function so quiet mode has the same
-        // success/failure semantics as the visible rendering path.
+    if args.stat || args.name_only || args.name_status || args.raw {
+        // --stat / --name-only / --name-status / --raw human paths only need
+        // tree-level file lists, not blob contents.  Use the same function so
+        // quiet mode has the same success/failure semantics as the visible
+        // rendering path.
         let _ = get_changed_files_for_commit(&commit, &paths).await?;
     } else {
         let _ = generate_diff(&commit, paths).await?;
@@ -428,7 +703,11 @@ async fn validate_commit_output(commit_hash: &ObjectHash, args: &ShowArgs) -> Cl
 }
 
 /// Shows an annotated or lightweight tag.
-async fn show_tag_by_hash(hash: &ObjectHash, args: &ShowArgs) -> CliResult<String> {
+async fn show_tag_by_hash(
+    hash: &ObjectHash,
+    args: &ShowArgs,
+    color_enabled: bool,
+) -> CliResult<String> {
     match tag::load_object_trait(hash).await {
         Ok(tag::TagObject::Tag(tag_obj)) => {
             let mut output = String::new();
@@ -441,19 +720,23 @@ async fn show_tag_by_hash(hash: &ObjectHash, args: &ShowArgs) -> CliResult<Strin
             ));
             output.push('\n');
 
-            let date = chrono::DateTime::from_timestamp(tag_obj.tagger.timestamp as i64, 0)
-                .unwrap_or(chrono::DateTime::UNIX_EPOCH);
-            output.push_str(&format!("Date:   {}\n\n", date.to_rfc2822()));
+            output.push_str(&format!(
+                "Date:   {}\n\n",
+                format_timestamp_with(
+                    tag_obj.tagger.timestamp as i64,
+                    args.date.as_deref().unwrap_or_default(),
+                )
+            ));
             output.push_str(tag_obj.message.trim());
             output.push_str("\n\n");
 
             // Continue with the tagged object.
-            output.push_str(&show_object_by_hash(&tag_obj.object_hash, args).await?);
+            output.push_str(&show_object_by_hash(&tag_obj.object_hash, args, color_enabled).await?);
             Ok(output)
         }
         Ok(tag::TagObject::Commit(commit)) => {
             // Lightweight tags point directly to commits.
-            show_commit(&commit.id, args).await
+            show_commit(&commit.id, args, color_enabled).await
         }
         Ok(_) => Err(show_unsupported_object_type_error("tag target")),
         Err(e) => Err(show_object_load_error(hash, e)),
@@ -557,12 +840,19 @@ async fn validate_commit_file(rev: &str, file_path: &str) -> CliResult<()> {
 }
 
 /// Renders the commit header using the selected format.
-fn display_commit_info(output: &mut String, commit: &Commit, args: &ShowArgs) {
+fn display_commit_info(output: &mut String, commit: &Commit, args: &ShowArgs, color_enabled: bool) {
     // `--format` is Git's alias for `--pretty` (mutually exclusive in clap).
-    if let Some(pretty) = args.pretty.as_ref().or(args.format.as_ref()) {
+    if let Some(pretty) = args
+        .pretty
+        .as_ref()
+        .or(args.format.as_ref())
+        .filter(|pretty| pretty.as_str() != "medium")
+    {
         // `--pretty=<fmt>` renders the commit header through the shared log
         // formatter (oneline / format:<tmpl> / tformat:<tmpl> / custom template).
-        let formatter = CommitFormatter::new(parse_pretty_format(pretty.clone()));
+        let formatter = CommitFormatter::new(parse_pretty_format(pretty.clone()))
+            .with_date_mode(args.date.clone().unwrap_or_default())
+            .with_color_enabled(color_enabled);
         let ctx = FormatContext {
             graph_prefix: "",
             decoration: "",
@@ -596,9 +886,13 @@ fn display_commit_info(output: &mut String, commit: &Commit, args: &ShowArgs) {
         ));
 
         // Format the commit timestamp for display.
-        let date = chrono::DateTime::from_timestamp(commit.committer.timestamp as i64, 0)
-            .unwrap_or(chrono::DateTime::UNIX_EPOCH);
-        output.push_str(&format!("Date:   {}\n", date.to_rfc2822()));
+        output.push_str(&format!(
+            "Date:   {}\n",
+            format_timestamp_with(
+                commit.committer.timestamp as i64,
+                args.date.as_deref().unwrap_or_default(),
+            )
+        ));
 
         // Print the commit message body.
         let (msg, _) = parse_commit_msg(&commit.message);
@@ -959,6 +1253,48 @@ mod tests {
     use crate::utils::error::StableErrorCode;
 
     #[test]
+    fn build_raw_lines_reports_adds_deletes_and_mode_only_changes() {
+        let entry = |mode: &str, sha: &str| (mode.to_string(), sha.to_string());
+        let mut old = BTreeMap::new();
+        old.insert(PathBuf::from("f"), entry("100644", "587be6b"));
+        old.insert(PathBuf::from("gone"), entry("100644", "1111111"));
+        let mut new = BTreeMap::new();
+        // `f` keeps its blob id but flips to executable: a mode-only change that
+        // a sha-only diff would miss, but Git's --raw reports as `M`.
+        new.insert(PathBuf::from("f"), entry("100755", "587be6b"));
+        new.insert(PathBuf::from("added"), entry("100644", "2222222"));
+
+        let out = build_raw_lines(&old, &new, &[]);
+        assert!(
+            out.contains(":000000 100644 0000000 2222222 A\tadded\n"),
+            "added: {out}"
+        );
+        assert!(
+            out.contains(":100644 100755 587be6b 587be6b M\tf\n"),
+            "mode-only change must be reported as M: {out}"
+        );
+        assert!(
+            out.contains(":100644 000000 1111111 0000000 D\tgone\n"),
+            "deleted: {out}"
+        );
+        // Path order (BTreeSet): added, f, gone.
+        let order: Vec<&str> = out
+            .lines()
+            .map(|l| l.rsplit('\t').next().unwrap())
+            .collect();
+        assert_eq!(order, vec!["added", "f", "gone"]);
+
+        // An identical (mode, id) pair on both sides emits nothing.
+        let same = old.clone();
+        assert_eq!(build_raw_lines(&same, &same, &[]), "");
+
+        // A pathspec filter keeps only matching paths.
+        let filtered = build_raw_lines(&old, &new, &[PathBuf::from("added")]);
+        assert!(filtered.contains("A\tadded"));
+        assert!(!filtered.contains("\tf\n"), "filtered out f: {filtered}");
+    }
+
+    #[test]
     fn show_error_to_cli_error_pins_stable_codes_and_hints() {
         let cases = [
             (
@@ -1048,9 +1384,72 @@ mod tests {
         let args = ShowArgs::try_parse_from(["show", "--stat"]).unwrap();
         assert!(args.stat);
 
+        // `--summary` flag.
+        let args = ShowArgs::try_parse_from(["show", "--summary"]).unwrap();
+        assert!(args.summary);
+
         // `<revision>:<path>` syntax.
         let args = ShowArgs::try_parse_from(["show", "HEAD:test.txt"]).unwrap();
         assert_eq!(args.object, Some("HEAD:test.txt".to_string()));
+    }
+
+    #[test]
+    fn format_show_summary_reports_only_created_and_deleted_files() {
+        // A text create (whose path contains " b/", proving the path comes from
+        // the reconstructed header, not a naive split), a BINARY create with no
+        // `---`/`+++` lines (proving the mode line alone drives emission and a
+        // stale path cannot leak into the next block), a delete, and a modified
+        // file (omitted). Each emitted line carries the file's mode.
+        let diff = "\
+diff --git a/has b/space.txt b/has b/space.txt
+new file mode 100644
+index 0000000..89b24ec
+--- /dev/null
++++ b/has b/space.txt
+@@ -0,0 +1 @@
++hello
+diff --git a/logo.png b/logo.png
+new file mode 100755
+index 0000000..0a1b2c3
+Binary files /dev/null and b/logo.png differ
+diff --git a/gone.txt b/gone.txt
+deleted file mode 100644
+index 89b24ec..0000000
+--- a/gone.txt
++++ /dev/null
+@@ -1 +0,0 @@
+-bye
+diff --git a/edited.txt b/edited.txt
+index 1111111..2222222 100644
+--- a/edited.txt
++++ b/edited.txt
+@@ -1 +1 @@
+-old
++new
+";
+        assert_eq!(
+            super::format_show_summary(diff),
+            " create mode 100644 has b/space.txt\n create mode 100755 logo.png\n delete mode 100644 gone.txt"
+        );
+        // No created or deleted files → empty summary.
+        assert_eq!(
+            super::format_show_summary("diff --git a/x b/x\nindex 1..2 100644\n"),
+            ""
+        );
+        // Header path reconstruction: identical a/b sides (incl. " b/" paths)
+        // recover the path; a rename (a != b) is declined.
+        assert_eq!(
+            super::reconstruct_identical_diff_path("dir/f.txt b/dir/f.txt"),
+            Some("dir/f.txt".to_string())
+        );
+        assert_eq!(
+            super::reconstruct_identical_diff_path("has b/x.txt b/has b/x.txt"),
+            Some("has b/x.txt".to_string())
+        );
+        assert_eq!(
+            super::reconstruct_identical_diff_path("old.txt b/new.txt"),
+            None
+        );
     }
 
     #[test]

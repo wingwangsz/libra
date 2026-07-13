@@ -2,7 +2,7 @@
 
 use std::{
     borrow::Cow,
-    collections::{HashMap, HashSet, VecDeque},
+    collections::{BTreeMap, HashMap, HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     str::FromStr,
@@ -18,8 +18,11 @@ use git_internal::{
         tree::{Tree, TreeItem, TreeItemMode},
     },
 };
-use sea_orm::{ConnectionTrait, DbBackend, Statement, TransactionTrait, Value};
-use serde::Serialize;
+use sea_orm::{
+    ColumnTrait, ConnectionTrait, DbBackend, EntityTrait, QueryFilter, QueryOrder, Statement,
+    TransactionTrait, Value,
+};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     cli_error,
@@ -29,6 +32,7 @@ use crate::{
         branch::Branch,
         db::get_db_conn_instance,
         head::Head,
+        model::{reference as ref_model, reflog as reflog_model},
         reflog,
         reflog::{ReflogAction, ReflogContext, ReflogError, with_reflog},
     },
@@ -62,6 +66,121 @@ pub struct RebaseState {
     pub current_head: ObjectHash,
     /// Whether fixup!/squash! commits should be folded during this rebase.
     pub autosquash: bool,
+    /// How to handle commits that *become* empty after replay (Git's `--empty`).
+    /// Must survive a conflict + `--continue`, so a later become-empty commit in
+    /// the sequence is dropped/kept the same way the start invocation requested.
+    pub empty_mode: RebaseEmptyMode,
+}
+
+/// Durable options whose lifetime spans a non-interactive rebase sequence.
+///
+/// The primary todo/current-head state remains in SQLite. These additive
+/// controls live in one atomic sidecar so older databases do not need a schema
+/// migration and a crash cannot leave half-written exec/update-ref/autostash
+/// metadata. The sidecar is removed only after final ref updates and any held
+/// autostash have been resolved.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RebaseAuxState {
+    #[serde(default)]
+    exec_commands: Vec<String>,
+    /// Index of the command that must be retried by `rebase --continue` after
+    /// an `--exec` failure. `None` means no command is pending.
+    #[serde(default)]
+    pending_exec: Option<usize>,
+    #[serde(default)]
+    update_refs: bool,
+    /// Branches selected at rebase start. Checked-out branches are excluded.
+    #[serde(default)]
+    refs_to_update: Vec<RebaseRefUpdate>,
+    /// Original commit -> rewritten commit, populated after every replayed or
+    /// dropped commit so update-refs survives conflicts and process restarts.
+    #[serde(default)]
+    rewrites: BTreeMap<String, String>,
+    /// Original start-empty commit -> its original parent (or the new base).
+    /// Used to resolve branches pointing at commits removed by
+    /// `--no-keep-empty` once their nearest retained ancestor is rewritten.
+    #[serde(default)]
+    rewrite_aliases: BTreeMap<String, String>,
+    /// Held stash commit, deliberately outside `refs/stash` until the rebase
+    /// completes or aborts.
+    #[serde(default)]
+    autostash: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RebaseRefUpdate {
+    branch: String,
+    old_oid: String,
+}
+
+impl RebaseAuxState {
+    fn path() -> PathBuf {
+        util::storage_path().join("rebase-aux.json")
+    }
+
+    fn load_optional() -> Result<Option<Self>, RebaseError> {
+        let path = Self::path();
+        if !path.exists() {
+            return Ok(None);
+        }
+        let bytes = fs::read(&path).map_err(|error| RebaseError::AuxStateLoad {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        serde_json::from_slice(&bytes)
+            .map(Some)
+            .map_err(|error| RebaseError::AuxStateLoad {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            })
+    }
+
+    fn save(&self) -> Result<(), RebaseError> {
+        let path = Self::path();
+        let bytes = serde_json::to_vec_pretty(self).map_err(|error| RebaseError::AuxStateSave {
+            path: path.display().to_string(),
+            detail: error.to_string(),
+        })?;
+        crate::utils::atomic_write::write_atomic(&path, &bytes, true).map_err(|error| {
+            RebaseError::AuxStateSave {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }
+        })
+    }
+
+    fn cleanup() -> Result<(), RebaseError> {
+        let path = Self::path();
+        match fs::remove_file(&path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(RebaseError::AuxStateSave {
+                path: path.display().to_string(),
+                detail: error.to_string(),
+            }),
+        }
+    }
+}
+
+/// Return the held autostash root for repository maintenance. Held objects are
+/// intentionally absent from `refs/stash`; GC must trace this sidecar while a
+/// rebase is stopped or it can delete the user's only copy of dirty changes.
+pub(crate) fn held_autostash_oid() -> CliResult<Option<ObjectHash>> {
+    RebaseAuxState::load_optional()
+        .map_err(|error| {
+            CliError::fatal(format!("failed to load rebase autostash GC root: {error}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?
+        .and_then(|aux| aux.autostash)
+        .map(|oid| {
+            ObjectHash::from_str(&oid).map_err(|error| {
+                CliError::fatal(format!(
+                    "rebase-aux.json contains invalid autostash object '{oid}': {error}"
+                ))
+                .with_stable_code(StableErrorCode::RepoCorrupt)
+            })
+        })
+        .transpose()
 }
 
 impl RebaseState {
@@ -201,6 +320,18 @@ impl RebaseState {
                 .await
                 .map_err(|e| format!("failed to add rebase_state.todo_actions: {e}"))?;
         }
+        if !columns.contains("empty_mode") {
+            // Default `keep` preserves Libra's existing behavior (replay become-empty
+            // commits) for any state row written before this column existed.
+            let stmt = Statement::from_string(
+                DbBackend::Sqlite,
+                "ALTER TABLE rebase_state ADD COLUMN empty_mode TEXT NOT NULL DEFAULT 'keep'"
+                    .to_string(),
+            );
+            db.execute(stmt)
+                .await
+                .map_err(|e| format!("failed to add rebase_state.empty_mode: {e}"))?;
+        }
         Ok(())
     }
 
@@ -220,7 +351,7 @@ impl RebaseState {
         let stmt = Statement::from_string(
             DbBackend::Sqlite,
             r#"
-                SELECT head_name, onto, orig_head, current_head, todo, done, stopped_sha, autosquash, todo_actions
+                SELECT head_name, onto, orig_head, current_head, todo, done, stopped_sha, autosquash, todo_actions, empty_mode
                 FROM rebase_state
                 LIMIT 1
             "#
@@ -261,6 +392,12 @@ impl RebaseState {
         let todo_actions_str: String = row
             .try_get_by_index(8)
             .map_err(|e| format!("invalid todo_actions: {e}"))?;
+        let empty_mode_str: String = row
+            .try_get_by_index(9)
+            .map_err(|e| format!("invalid empty_mode: {e}"))?;
+        // Unknown/legacy values fall back to `keep` (Libra's pre-feature behavior).
+        let empty_mode =
+            parse_rebase_empty_mode(empty_mode_str.trim()).unwrap_or(RebaseEmptyMode::Keep);
 
         let onto =
             ObjectHash::from_str(onto_str.trim()).map_err(|e| format!("Invalid onto hash: {e}"))?;
@@ -291,6 +428,7 @@ impl RebaseState {
             stopped_sha,
             current_head,
             autosquash,
+            empty_mode,
         }))
     }
 
@@ -317,12 +455,16 @@ impl RebaseState {
             None => Value::String(None),
         };
 
+        let empty_mode_value = match state.empty_mode {
+            RebaseEmptyMode::Drop => "drop",
+            RebaseEmptyMode::Keep => "keep",
+        };
         let insert_stmt = Statement::from_sql_and_values(
             DbBackend::Sqlite,
             r#"
                 INSERT INTO rebase_state
-                (head_name, onto, orig_head, current_head, todo, todo_actions, done, stopped_sha, autosquash)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?);
+                (head_name, onto, orig_head, current_head, todo, todo_actions, done, stopped_sha, autosquash, empty_mode)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?);
             "#,
             [
                 state.head_name.clone().into(),
@@ -334,6 +476,7 @@ impl RebaseState {
                 done.into(),
                 stopped_value,
                 (state.autosquash as i64).into(),
+                empty_mode_value.into(),
             ],
         );
 
@@ -423,6 +566,9 @@ impl RebaseState {
             stopped_sha,
             current_head,
             autosquash: false,
+            // Legacy on-disk rebase state predates `--empty`; default to keep
+            // (Libra's pre-feature behavior).
+            empty_mode: RebaseEmptyMode::Keep,
         })
     }
 
@@ -529,6 +675,57 @@ pub enum ReplayResult {
         kind: ReplayErrorKind,
         detail: String,
     },
+    /// The commit *became* empty after replay (its merged tree equals the new
+    /// parent's tree, though the original commit was not itself empty) and the
+    /// effective `--empty` mode is `drop`: skip it without creating a commit. The
+    /// index/worktree already match the new parent (the merged tree is identical),
+    /// so no mutation is needed. Carries the dropped commit's subject for reporting.
+    BecameEmptyDropped { subject: String },
+}
+
+/// Policy for a commit that *becomes* empty after replay (Git's `--empty`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebaseEmptyMode {
+    /// Skip the become-empty commit (`--empty=drop`, Git's non-interactive default).
+    Drop,
+    /// Record the now-empty commit (`--empty=keep`; Libra's default when `--empty`
+    /// is omitted).
+    Keep,
+}
+
+/// Parse a `--empty=<mode>` value. Only `drop`/`keep` are supported; Git's
+/// `stop`/`ask` (halt for the user to decide) require an interactive-style
+/// halt-on-empty resume flow Libra's non-interactive rebase does not have.
+/// `None` for an unrecognized or unsupported mode (the caller reports it).
+fn parse_rebase_empty_mode(value: &str) -> Option<RebaseEmptyMode> {
+    match value {
+        "drop" => Some(RebaseEmptyMode::Drop),
+        "keep" => Some(RebaseEmptyMode::Keep),
+        _ => None,
+    }
+}
+
+/// Resolve the effective `--empty` mode for a rebase. Omitted → `keep` (Libra's
+/// default — an intentional divergence from Git, which drops). `drop`/`keep` are
+/// supported; `stop`/`ask` are rejected (no halt-on-empty resume flow); any other
+/// value is a usage error. All rejections are `LBR-CLI-002` (exit 129).
+fn resolve_rebase_empty_mode(args: &RebaseArgs) -> CliResult<RebaseEmptyMode> {
+    let Some(raw) = args.empty.as_deref() else {
+        return Ok(RebaseEmptyMode::Keep);
+    };
+    if let Some(mode) = parse_rebase_empty_mode(raw) {
+        return Ok(mode);
+    }
+    let hint = if matches!(raw, "stop" | "ask") {
+        "Libra's non-interactive rebase has no halt-on-empty flow; use --empty=drop or --empty=keep"
+    } else {
+        "valid values are drop, keep (Git's stop/ask are not supported)"
+    };
+    Err(
+        CliError::command_usage(format!("unrecognized --empty mode '{raw}'"))
+            .with_stable_code(StableErrorCode::CliInvalidArguments)
+            .with_hint(hint),
+    )
 }
 
 /// Categorizes the cause of a non-conflict failure inside
@@ -629,9 +826,16 @@ EXAMPLES:
     libra rebase main             Replay current branch on top of main
     libra rebase --autosquash main Fold fixup!/squash! commits while replaying
     libra rebase --reapply-cherry-picks main
+    libra rebase --autostash main  Preserve tracked local changes around the rebase
+    libra rebase --exec 'cargo test' main  Run a sandboxed command after each replay
+    libra rebase --update-refs main  Move other local branches in the rewritten range
+    libra rebase --fork-point origin/main  Recover a force-moved upstream fork point
     libra rebase --onto main dev  Replay dev..HEAD onto main, keeping the upstream range
+    libra rebase --keep-empty main Keep empty commits while replaying (Libra's default)
+    libra rebase --no-keep-empty main  Drop commits that are already empty in the source
+    libra rebase --empty=drop main  Drop commits that become empty after replay (already upstream)
     libra rebase --continue       Resume an in-progress rebase after fixing conflicts
-    libra rebase --skip           Drop the current conflicting commit and continue
+    libra rebase --skip           Skip a conflict, or the failed exec command, and continue
     libra rebase --abort          Restore the original branch and clear rebase state
     libra rebase --json main      Structured JSON output for agents";
 
@@ -672,9 +876,78 @@ pub struct RebaseArgs {
     /// Explicitly replay clean cherry-pick commits instead of dropping them
     #[clap(long = "reapply-cherry-picks", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
     pub reapply_cherry_picks: bool,
+
+    /// Automatically stash tracked working-tree and index changes before the
+    /// rebase, then re-apply them after completion or abort. A conflicting
+    /// re-apply is preserved in the normal stash list.
+    #[clap(long = "autostash", overrides_with = "no_autostash", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub autostash: bool,
+
+    /// Disable autostash. Last one wins when combined with `--autostash`.
+    #[clap(long = "no-autostash", overrides_with = "autostash", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub no_autostash: bool,
+
+    /// Run a shell command after each successfully replayed commit. Commands
+    /// execute in a required workspace-write, network-denied Libra sandbox; a
+    /// non-zero result stops the rebase and is retried by `--continue`.
+    #[clap(long = "exec", value_name = "cmd", action = clap::ArgAction::Append, conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub exec: Vec<String>,
+
+    /// Update other local branches that point into the rewritten commit range.
+    /// Branches checked out in any worktree are never moved.
+    #[clap(long = "update-refs", overrides_with = "no_update_refs", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub update_refs: bool,
+
+    /// Disable automatic branch updates. Last one wins with `--update-refs`.
+    #[clap(long = "no-update-refs", overrides_with = "update_refs", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub no_update_refs: bool,
+
+    /// Use the upstream reflog to find the point where the rebased branch
+    /// forked, falling back to the ordinary merge base when no reflog tip is an
+    /// ancestor of HEAD.
+    #[clap(long = "fork-point", overrides_with = "no_fork_point", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub fork_point: bool,
+
+    /// Use the ordinary merge base even when `--fork-point` was specified
+    /// earlier. Last one wins.
+    #[clap(long = "no-fork-point", overrides_with = "fork_point", conflicts_with_all = ["continue_rebase", "abort", "skip"])]
+    pub no_fork_point: bool,
+
+    /// Do not update the rerere (reuse recorded resolution) index. Accepted for
+    /// Git parity and is a no-op: `libra rerere` exists as a standalone command
+    /// but is not yet auto-integrated into rebase, so there is nothing to update
+    /// here. (Git's `--rerere-autoupdate` is not exposed.)
+    #[clap(long = "no-rerere-autoupdate")]
+    pub no_rerere_autoupdate: bool,
+
+    /// Keep commits that begin empty (already empty before replay) rather than
+    /// dropping them. Accepted for Git parity and is a no-op: Libra's rebase
+    /// already keeps empty commits by default, so this matches existing behavior.
+    /// Toggle pair with `--no-keep-empty`; the last one wins. (This controls
+    /// commits that *begin* empty; `--empty=<mode>` controls commits that *become*
+    /// empty after replay.)
+    #[clap(long = "keep-empty", overrides_with = "no_keep_empty")]
+    pub keep_empty: bool,
+
+    /// Drop commits that begin empty (their tree equals their parent's — they
+    /// introduce no change) instead of replaying them. Toggle pair with
+    /// `--keep-empty`; the last one wins. (Only commits that are ALREADY empty are
+    /// dropped here; `--empty=<mode>` handles commits that *become* empty after
+    /// replay.)
+    #[clap(long = "no-keep-empty", overrides_with = "keep_empty")]
+    pub no_keep_empty: bool,
+
+    /// How to handle a commit that *becomes* empty after replay (its changes are
+    /// already present on the new base): `drop` skips it, `keep` records the empty
+    /// commit. Omitted, Libra keeps it (an intentional divergence — Git drops by
+    /// default; pass `--empty=drop` for Git's behavior). Git's `stop`/`ask` (halt
+    /// for the user to decide) are not supported: Libra's non-interactive rebase
+    /// has no halt-on-empty resume flow.
+    #[clap(long = "empty", value_name = "mode")]
+    pub empty: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Default, Serialize)]
 struct RebaseOutput {
     action: String,
     status: String,
@@ -694,6 +967,10 @@ struct RebaseOutput {
     restored: Option<bool>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     applied_commits: Vec<RebaseAppliedCommitOutput>,
+    /// Commits skipped under `--empty=drop` (became empty after replay). Additive;
+    /// absent when none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    dropped_commits: Vec<RebaseDroppedCommitOutput>,
     #[serde(skip_serializing_if = "Option::is_none")]
     skipped_commit: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -709,9 +986,17 @@ struct RebaseAppliedCommitOutput {
     subject: String,
 }
 
+/// A commit skipped under `--empty=drop` (it became empty after replay).
+#[derive(Debug, Clone, Serialize)]
+struct RebaseDroppedCommitOutput {
+    commit: String,
+    subject: String,
+}
+
 #[derive(Debug, Default)]
 struct RebaseReplaySummary {
     applied_commits: Vec<RebaseAppliedCommitOutput>,
+    dropped_commits: Vec<RebaseDroppedCommitOutput>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -722,6 +1007,10 @@ pub(crate) enum RebaseError {
     StateCheck(String),
     #[error("failed to load rebase state: {0}")]
     StateLoad(String),
+    #[error("failed to load rebase auxiliary state '{path}': {detail}")]
+    AuxStateLoad { path: String, detail: String },
+    #[error("failed to save rebase auxiliary state '{path}': {detail}")]
+    AuxStateSave { path: String, detail: String },
     #[error("not on a branch or in detached HEAD state, cannot rebase")]
     NotOnBranch,
     #[error("current branch '{branch}' has no commits")]
@@ -732,6 +1021,21 @@ pub(crate) enum RebaseError {
     OntoResolve { onto: String, detail: String },
     #[error("no common ancestor found")]
     NoCommonAncestor,
+    #[error("invalid --exec command: {0}")]
+    InvalidExec(String),
+    #[error(
+        "rebase --exec command failed after commit {commit}: {command} (exit {exit_code}){detail}"
+    )]
+    ExecFailed {
+        commit: String,
+        command: String,
+        exit_code: i32,
+        detail: String,
+    },
+    #[error("failed to prepare rebase update-refs: {0}")]
+    UpdateRefs(String),
+    #[error("rebase --autostash failed: {0}")]
+    Autostash(String),
     #[error("failed to determine working tree status: {0}")]
     WorktreeStatus(String),
     #[error("{detail}, can't {action}")]
@@ -787,7 +1091,9 @@ impl From<RebaseError> for CliError {
         match &error {
             RebaseError::NoRebaseInProgress => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::RepoStateInvalid),
-            RebaseError::StateCheck(..) | RebaseError::StateLoad(..) => {
+            RebaseError::StateCheck(..)
+            | RebaseError::StateLoad(..)
+            | RebaseError::AuxStateLoad { .. } => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
             RebaseError::NotOnBranch | RebaseError::BranchHasNoCommits { .. } => {
@@ -798,6 +1104,26 @@ impl From<RebaseError> for CliError {
             | RebaseError::OntoResolve { .. }
             | RebaseError::NoCommonAncestor => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::CliInvalidTarget),
+            RebaseError::InvalidExec(..) => CliError::command_usage(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("pass a non-empty shell command without NUL bytes"),
+            RebaseError::ExecFailed {
+                commit,
+                command,
+                exit_code,
+                ..
+            } => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("fix the command or repository state, then run 'libra rebase --continue'")
+                .with_hint("or run 'libra rebase --skip' to keep the applied commit and continue")
+                .with_detail("commit", commit.clone())
+                .with_detail("command", command.clone())
+                .with_detail("exit_code", *exit_code),
+            RebaseError::UpdateRefs(..) => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoWriteFailed),
+            RebaseError::Autostash(..) => CliError::failure(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("inspect 'libra stash list' and re-run the rebase after preserving local changes"),
             RebaseError::WorktreeStatus(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
             }
@@ -874,6 +1200,7 @@ impl From<RebaseError> for CliError {
             | RebaseError::IndexSave(..)
             | RebaseError::WorkdirReset(..)
             | RebaseError::StateSave(..)
+            | RebaseError::AuxStateSave { .. }
             | RebaseError::Finalize(..) => {
                 CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoWriteFailed)
             }
@@ -903,13 +1230,17 @@ pub async fn execute(args: RebaseArgs) {
 
 /// Safe CLI entry point with preflight validation for argument and state errors.
 pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::command::ensure_main_worktree("rebase")?;
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
     // Refuse to start a NEW rebase while a cherry-pick sequence is in progress
     // (rebase's own --continue/--abort/--skip operate on rebase state, not
     // cherry-pick, so they are exempt from this guard).
     if !(args.continue_rebase || args.abort || args.skip) {
-        crate::command::cherry_pick::ensure_no_cherry_pick_in_progress().await?;
+        crate::internal::sequencer::ensure_none_in_progress(
+            crate::internal::sequencer::SequenceKind::Rebase,
+        )
+        .await?;
     }
 
     // For --continue, --abort, --skip: verify that a rebase is actually in
@@ -943,6 +1274,9 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
     }
 
     preflight_rebase(&args).await?;
+    // Validate `--empty` before any dispatch (start or sequencer control) so a bad
+    // mode fails fast (exit 129) rather than slipping through.
+    let empty_mode = resolve_rebase_empty_mode(&args)?;
     if args.abort {
         let result = run_rebase_abort().await.map_err(CliError::from)?;
         return render_rebase_output(&result, output);
@@ -956,20 +1290,36 @@ pub async fn execute_safe(args: RebaseArgs, output: &OutputConfig) -> CliResult<
         return render_rebase_output(&result, output);
     }
     if let Some(upstream) = args.upstream.as_deref() {
+        prepare_rebase_aux(&args).await.map_err(CliError::from)?;
         // `git rebase --onto <newbase> <upstream> <branch>` form: check out the
         // named branch first (no-op when it is already current), so the rest of
         // the start path rebases it as "the current branch".
-        if let Some(branch) = args.branch.as_deref() {
-            switch_to_rebase_branch(branch, output).await?;
+        let start_result = async {
+            if let Some(branch) = args.branch.as_deref() {
+                switch_to_rebase_branch(branch, output).await?;
+            }
+            run_rebase_start(
+                upstream,
+                args.onto.as_deref(),
+                args.autosquash,
+                args.reapply_cherry_picks,
+                args.no_keep_empty,
+                empty_mode,
+                args.fork_point,
+            )
+            .await
+            .map_err(CliError::from)
         }
-        let result = run_rebase_start(
-            upstream,
-            args.onto.as_deref(),
-            args.autosquash,
-            args.reapply_cherry_picks,
-        )
-        .await
-        .map_err(CliError::from)?;
+        .await;
+
+        let in_progress = RebaseState::is_in_progress()
+            .await
+            .map_err(|detail| CliError::from(RebaseError::StateCheck(detail)))?;
+        if !in_progress {
+            resolve_rebase_autostash().await.map_err(CliError::from)?;
+            RebaseAuxState::cleanup().map_err(CliError::from)?;
+        }
+        let result = start_result?;
         return render_rebase_output(&result, output);
     }
     Ok(())
@@ -987,6 +1337,7 @@ async fn switch_to_rebase_branch(branch: &str, output: &OutputConfig) -> CliResu
     }
     switch::execute_safe(
         switch::SwitchArgs {
+            no_progress: false,
             branch: Some(branch.to_string()),
             create: None,
             force_create: None,
@@ -1033,6 +1384,12 @@ fn render_rebase_output(result: &RebaseOutput, output: &OutputConfig) -> CliResu
         }
     }
 
+    for dropped in &result.dropped_commits {
+        println!(
+            "dropping {} {} -- patch contents already upstream",
+            dropped.commit, dropped.subject
+        );
+    }
     for applied in &result.applied_commits {
         println!("Applied: {} {}", short_id(&applied.commit), applied.subject);
     }
@@ -1076,6 +1433,12 @@ fn render_rebase_start_output(result: &RebaseOutput) {
                 println!(
                     "Rebasing {replay_count} commits from `{}` onto `{upstream}`...",
                     result.branch
+                );
+            }
+            for dropped in &result.dropped_commits {
+                println!(
+                    "dropping {} {} -- patch contents already upstream",
+                    dropped.commit, dropped.subject
                 );
             }
             for applied in &result.applied_commits {
@@ -1392,11 +1755,479 @@ async fn preflight_rebase(args: &RebaseArgs) -> CliResult<()> {
     Ok(())
 }
 
+fn validate_exec_commands(commands: &[String]) -> Result<(), RebaseError> {
+    for command in commands {
+        if command.trim().is_empty() {
+            return Err(RebaseError::InvalidExec(
+                "command must not be empty".to_string(),
+            ));
+        }
+        if command.contains('\0') {
+            return Err(RebaseError::InvalidExec(
+                "command must not contain a NUL byte".to_string(),
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Recover an auxiliary sidecar left after the primary rebase state was
+/// already removed. A held stash is promoted into the normal stash list before
+/// the stale file is discarded, so a crash can duplicate changes but never
+/// lose them.
+async fn recover_stale_rebase_aux() -> Result<(), RebaseError> {
+    if RebaseState::is_in_progress()
+        .await
+        .map_err(RebaseError::StateCheck)?
+    {
+        return Ok(());
+    }
+    let Some(aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    if let Some(stash) = aux.autostash {
+        let oid = ObjectHash::from_str(&stash).map_err(|error| {
+            RebaseError::Autostash(format!(
+                "rebase-aux.json contains invalid stash object '{stash}': {error}"
+            ))
+        })?;
+        crate::command::stash::store_stash_commit(&oid, "autostash")
+            .await
+            .map_err(|error| {
+                RebaseError::Autostash(format!(
+                    "failed to recover held stash {stash} into the stash list: {error}"
+                ))
+            })?;
+        emit_warning(
+            "recovered a stale rebase autostash into the stash list; inspect it with 'libra stash show'",
+        );
+    }
+    RebaseAuxState::cleanup()
+}
+
+async fn prepare_rebase_aux(args: &RebaseArgs) -> Result<(), RebaseError> {
+    validate_exec_commands(&args.exec)?;
+    recover_stale_rebase_aux().await?;
+
+    let mut aux = RebaseAuxState {
+        exec_commands: args.exec.clone(),
+        update_refs: args.update_refs,
+        ..Default::default()
+    };
+    if args.autostash {
+        match crate::command::stash::create_held_stash_commit("autostash").await {
+            Ok(Some(stash)) => {
+                aux.autostash = Some(stash.to_string());
+                // ORDER IS LOAD-BEARING: stash object -> durable sidecar ->
+                // destructive reset. A crash never leaves the dirty data both
+                // absent from the worktree and unreachable.
+                aux.save()?;
+                crate::command::stash::reset_to_head_for_held_stash()
+                    .await
+                    .map_err(|error| {
+                        RebaseError::Autostash(format!(
+                            "created stash {stash} but failed to clean the worktree: {error}; rebase-aux.json still references it"
+                        ))
+                    })?;
+            }
+            Ok(None) => {}
+            Err(error) => return Err(RebaseError::Autostash(error.to_string())),
+        }
+    }
+    if !aux.exec_commands.is_empty() || aux.update_refs || aux.autostash.is_some() {
+        aux.save()?;
+    }
+    Ok(())
+}
+
+async fn resolve_rebase_autostash() -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    let Some(stash) = aux.autostash.take() else {
+        return Ok(());
+    };
+    let oid = ObjectHash::from_str(&stash).map_err(|error| {
+        RebaseError::Autostash(format!(
+            "rebase-aux.json contains invalid stash object '{stash}': {error}"
+        ))
+    })?;
+    match crate::command::stash::apply_held_stash_commit(&oid).await {
+        Ok(()) => {
+            aux.save()?;
+            Ok(())
+        }
+        Err(apply_error) => {
+            crate::command::stash::store_stash_commit(&oid, "autostash")
+                .await
+                .map_err(|store_error| {
+                    RebaseError::Autostash(format!(
+                        "could not re-apply stash {stash} ({apply_error}) and could not preserve it in the stash list ({store_error}); rebase-aux.json still references it"
+                    ))
+                })?;
+            aux.save()?;
+            emit_warning(format!(
+                "rebase completed, but autostash re-apply conflicted ({apply_error}); changes are safe in stash@{{0}}"
+            ));
+            Ok(())
+        }
+    }
+}
+
+async fn checked_out_local_branches() -> Result<HashSet<String>, RebaseError> {
+    let db = get_db_conn_instance().await;
+    ref_model::Entity::find()
+        .filter(ref_model::Column::Kind.eq(ref_model::ConfigKind::Head))
+        .filter(ref_model::Column::Remote.is_null())
+        .all(&db)
+        .await
+        .map_err(|error| {
+            RebaseError::UpdateRefs(format!(
+                "failed to inspect branches checked out by repository worktrees: {error}"
+            ))
+        })
+        .map(|heads| heads.into_iter().filter_map(|head| head.name).collect())
+}
+
+async fn capture_rebase_update_refs(
+    commits: &[ObjectHash],
+    current_branch: &str,
+) -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    if !aux.update_refs {
+        return Ok(());
+    }
+    let rewritten = commits.iter().copied().collect::<HashSet<_>>();
+    let checked_out = checked_out_local_branches().await?;
+    let branches = Branch::list_branches_result(None).await.map_err(|error| {
+        RebaseError::UpdateRefs(format!("failed to list local branches: {error}"))
+    })?;
+    aux.refs_to_update = branches
+        .into_iter()
+        .filter(|branch| {
+            branch.name != current_branch
+                && !checked_out.contains(&branch.name)
+                && rewritten.contains(&branch.commit)
+        })
+        .map(|branch| RebaseRefUpdate {
+            branch: branch.name,
+            old_oid: branch.commit.to_string(),
+        })
+        .collect();
+    aux.refs_to_update
+        .sort_by(|left, right| left.branch.cmp(&right.branch));
+    aux.save()
+}
+
+fn record_start_empty_rewrite_aliases(
+    original_range: &[ObjectHash],
+    retained: &[ObjectHash],
+    newbase: ObjectHash,
+) -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    if !aux.update_refs {
+        return Ok(());
+    }
+    let originals = original_range.iter().copied().collect::<HashSet<_>>();
+    let retained = retained.iter().copied().collect::<HashSet<_>>();
+    for commit_id in original_range {
+        if retained.contains(commit_id) {
+            continue;
+        }
+        let commit: Commit = load_object(commit_id).map_err(|error| RebaseError::CommitLoad {
+            commit: commit_id.to_string(),
+            detail: format!("recording --update-refs empty-commit mapping: {error}"),
+        })?;
+        let target = commit
+            .parent_commit_ids
+            .first()
+            .copied()
+            .filter(|parent| originals.contains(parent))
+            .unwrap_or(newbase);
+        aux.rewrite_aliases
+            .insert(commit_id.to_string(), target.to_string());
+    }
+    aux.save()
+}
+
+fn resolve_rebase_rewrite(
+    aux: &RebaseAuxState,
+    original: &str,
+    newbase: ObjectHash,
+) -> anyhow::Result<ObjectHash> {
+    let mut current = original;
+    let mut seen = HashSet::new();
+    loop {
+        if !seen.insert(current.to_string()) {
+            anyhow::bail!("rebase update-refs rewrite mapping contains a cycle at {current}");
+        }
+        if let Some(rewritten) = aux.rewrites.get(current) {
+            return ObjectHash::from_str(rewritten)
+                .map_err(anyhow::Error::msg)
+                .context("rebase update-refs recorded an invalid rewritten object");
+        }
+        if current == newbase.to_string() {
+            return Ok(newbase);
+        }
+        current = aux.rewrite_aliases.get(current).with_context(|| {
+            format!("rebase update-refs has no rewrite recorded for commit {current}")
+        })?;
+    }
+}
+
+fn record_rebase_rewrite(
+    original: ObjectHash,
+    previous_tip: ObjectHash,
+    rewritten: ObjectHash,
+    folds_previous: bool,
+) -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    if folds_previous {
+        let previous = previous_tip.to_string();
+        for target in aux.rewrites.values_mut() {
+            if *target == previous {
+                *target = rewritten.to_string();
+            }
+        }
+    }
+    aux.rewrites
+        .insert(original.to_string(), rewritten.to_string());
+    aux.save()
+}
+
+async fn run_sandboxed_rebase_exec(
+    command: &str,
+) -> Result<crate::internal::ai::sandbox::SandboxExecOutput, String> {
+    use crate::internal::ai::sandbox::{
+        NetworkAccess, SandboxEnforcement, SandboxPermissions, SandboxPolicy, SandboxRuntimeConfig,
+        ToolSandboxContext, run_shell_command,
+    };
+
+    let cwd = util::working_dir();
+    let sandbox = ToolSandboxContext {
+        policy: SandboxPolicy::WorkspaceWrite {
+            writable_roots: vec![cwd.clone()],
+            network_access: NetworkAccess::Denied,
+            exclude_tmpdir_env_var: true,
+            exclude_slash_tmp: true,
+        },
+        permissions: SandboxPermissions::UseDefault,
+    };
+    let runtime = SandboxRuntimeConfig {
+        enforcement: SandboxEnforcement::Required,
+        use_linux_sandbox_bwrap: true,
+        ..Default::default()
+    };
+    run_shell_command(
+        command,
+        &cwd,
+        Some(15 * 60 * 1000),
+        1024 * 1024,
+        Some(sandbox),
+        Some(&runtime),
+    )
+    .await
+}
+
+async fn run_pending_rebase_exec(state: &mut RebaseState) -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    let Some(mut index) = aux.pending_exec else {
+        return Ok(());
+    };
+    while index < aux.exec_commands.len() {
+        let command = aux.exec_commands[index].clone();
+        aux.pending_exec = Some(index);
+        aux.save()?;
+        let result = run_sandboxed_rebase_exec(&command)
+            .await
+            .map_err(|detail| RebaseError::ExecFailed {
+                commit: state.current_head.to_string(),
+                command: command.clone(),
+                exit_code: -1,
+                detail: format!(": {detail}"),
+            })?;
+        reconcile_rebase_exec_head(state, &mut aux).await?;
+        if result.exit_code != 0 || result.timed_out {
+            let detail_text = if !result.stderr.trim().is_empty() {
+                result.stderr.trim()
+            } else {
+                result.stdout.trim()
+            };
+            let detail = if result.timed_out && detail_text.is_empty() {
+                ": command timed out after 900 seconds".to_string()
+            } else if detail_text.is_empty() {
+                String::new()
+            } else {
+                format!(": {detail_text}")
+            };
+            return Err(RebaseError::ExecFailed {
+                commit: state.current_head.to_string(),
+                command,
+                exit_code: result.exit_code,
+                detail,
+            });
+        }
+        let quiet_output = OutputConfig {
+            quiet: true,
+            ..Default::default()
+        };
+        switch::ensure_clean_status(&quiet_output)
+            .await
+            .map_err(|error| RebaseError::ExecFailed {
+                commit: state.current_head.to_string(),
+                command: command.clone(),
+                exit_code: 0,
+                detail: format!(": command left tracked changes: {error}"),
+            })?;
+        index += 1;
+        aux.pending_exec = (index < aux.exec_commands.len()).then_some(index);
+        aux.save()?;
+    }
+
+    Ok(())
+}
+
+async fn reconcile_rebase_exec_head(
+    state: &mut RebaseState,
+    aux: &mut RebaseAuxState,
+) -> Result<(), RebaseError> {
+    let actual_tip = Head::current_commit()
+        .await
+        .ok_or_else(|| RebaseError::ExecFailed {
+            commit: state.current_head.to_string(),
+            command: "<post-exec HEAD check>".to_string(),
+            exit_code: 0,
+            detail: ": command left HEAD unborn".to_string(),
+        })?;
+    if actual_tip != state.current_head {
+        let previous = state.current_head.to_string();
+        for target in aux.rewrites.values_mut() {
+            if *target == previous {
+                *target = actual_tip.to_string();
+            }
+        }
+        aux.save()?;
+        state.current_head = actual_tip;
+        state.save().await.map_err(RebaseError::StateSave)?;
+    }
+    Ok(())
+}
+
+async fn schedule_rebase_exec(state: &mut RebaseState) -> Result<(), RebaseError> {
+    let Some(mut aux) = RebaseAuxState::load_optional()? else {
+        return Ok(());
+    };
+    if aux.exec_commands.is_empty() {
+        return Ok(());
+    }
+    aux.pending_exec = Some(0);
+    aux.save()?;
+    run_pending_rebase_exec(state).await
+}
+
+async fn upstream_reflog_name(upstream: &str) -> Result<Option<String>, RebaseError> {
+    if upstream.starts_with("refs/heads/") || upstream.starts_with("refs/remotes/") {
+        return Ok(Some(upstream.to_string()));
+    }
+    if Branch::find_branch_result(upstream, None)
+        .await
+        .map_err(|error| {
+            RebaseError::StateLoad(format!(
+                "failed to resolve --fork-point upstream reflog: {error}"
+            ))
+        })?
+        .is_some()
+    {
+        return Ok(Some(format!("refs/heads/{upstream}")));
+    }
+    let matches = Branch::search_branch_result(upstream)
+        .await
+        .map_err(|error| {
+            RebaseError::StateLoad(format!(
+                "failed to resolve --fork-point upstream reflog: {error}"
+            ))
+        })?;
+    Ok(matches.into_iter().find_map(|branch| {
+        branch
+            .remote
+            .map(|remote| format!("refs/remotes/{remote}/{}", branch.name))
+    }))
+}
+
+async fn reflog_fork_point(
+    upstream: &str,
+    upstream_id: ObjectHash,
+    head: ObjectHash,
+) -> Result<Option<ObjectHash>, RebaseError> {
+    let Some(ref_name) = upstream_reflog_name(upstream).await? else {
+        return Ok(None);
+    };
+    let db = get_db_conn_instance().await;
+    let entries = reflog_model::Entity::find()
+        .filter(reflog_model::Column::RefName.eq(ref_name))
+        .order_by_desc(reflog_model::Column::Timestamp)
+        .order_by_desc(reflog_model::Column::Id)
+        .all(&db)
+        .await
+        .map_err(|error| {
+            RebaseError::StateLoad(format!(
+                "failed to read upstream reflog for --fork-point: {error}"
+            ))
+        })?;
+    let mut candidates = vec![upstream_id];
+    for entry in entries {
+        for value in [entry.new_oid, entry.old_oid] {
+            if let Ok(candidate) = ObjectHash::from_str(&value) {
+                candidates.push(candidate);
+            }
+        }
+    }
+    let mut seen = HashSet::new();
+    let mut best = None;
+    for candidate in candidates {
+        if !seen.insert(candidate) {
+            continue;
+        }
+        let is_ancestor =
+            crate::internal::merge_base::is_ancestor(&candidate, &head).map_err(|error| {
+                RebaseError::CommitLoad {
+                    commit: candidate.to_string(),
+                    detail: format!("checking --fork-point ancestry: {error}"),
+                }
+            })?;
+        if is_ancestor {
+            let replace = match best {
+                None => true,
+                Some(current) => crate::internal::merge_base::is_ancestor(&current, &candidate)
+                    .map_err(|error| RebaseError::CommitLoad {
+                        commit: candidate.to_string(),
+                        detail: format!("ranking --fork-point candidates: {error}"),
+                    })?,
+            };
+            if replace {
+                best = Some(candidate);
+            }
+        }
+    }
+    Ok(best)
+}
+
 async fn run_rebase_start(
     upstream: &str,
     onto: Option<&str>,
     autosquash: bool,
     _reapply_cherry_picks: bool,
+    no_keep_empty: bool,
+    empty_mode: RebaseEmptyMode,
+    fork_point: bool,
 ) -> Result<RebaseOutput, RebaseError> {
     let db = get_db_conn_instance().await;
 
@@ -1434,13 +2265,21 @@ async fn run_rebase_start(
             None => upstream_id,
         };
 
-    let base_id = find_merge_base(&head_to_rebase_id, &upstream_id)
-        .await
-        .map_err(|detail| RebaseError::CommitLoad {
+    // The true lowest common ancestor (shared with `merge-base` / `diff A...B`),
+    // not a first-meet BFS — correct for criss-cross histories.
+    let ordinary_base = crate::internal::merge_base::merge_base(&head_to_rebase_id, &upstream_id)
+        .map_err(|error| RebaseError::CommitLoad {
             commit: head_to_rebase_id.to_string(),
-            detail,
+            detail: format!("computing merge base with {upstream_id}: {error}"),
         })?
         .ok_or(RebaseError::NoCommonAncestor)?;
+    let base_id = if fork_point {
+        reflog_fork_point(upstream, upstream_id, head_to_rebase_id)
+            .await?
+            .unwrap_or(ordinary_base)
+    } else {
+        ordinary_base
+    };
 
     // Fast-forward and already-up-to-date short-circuits apply only to a plain
     // rebase (no explicit --onto). With --onto, an explicit landing point must
@@ -1516,6 +2355,7 @@ async fn run_rebase_start(
             previous_commit: Some(head_to_rebase_id.to_string()),
             restored: None,
             applied_commits: Vec::new(),
+            dropped_commits: Vec::new(),
             skipped_commit: None,
             skipped_subject: None,
             remaining: Some(0),
@@ -1535,6 +2375,7 @@ async fn run_rebase_start(
             previous_commit: Some(head_to_rebase_id.to_string()),
             restored: None,
             applied_commits: Vec::new(),
+            dropped_commits: Vec::new(),
             skipped_commit: None,
             skipped_subject: None,
             remaining: Some(0),
@@ -1547,13 +2388,39 @@ async fn run_rebase_start(
             commit: head_to_rebase_id.to_string(),
             detail,
         })?;
+    let original_commits_to_replay = commits_to_replay.clone();
+    // `--no-keep-empty`: drop commits that are ALREADY empty in the original
+    // history (their tree equals their first parent's tree — i.e. they introduce
+    // no change). Filtering the replay list up front means the persisted todo is
+    // already pruned, so `--continue` honors it without extra state. (Commits that
+    // only BECOME empty after replay are a separate concept — `--empty=drop` — and
+    // are not handled here.)
+    //
+    // `had_commits_before_filter` distinguishes "nothing to rebase" (collect
+    // returned empty — head is already on/behind the base) from "everything was an
+    // empty commit we just dropped". In the latter case the branch must still be
+    // moved to the new base, so the early no-commits return below is skipped.
+    let had_commits_before_filter = !commits_to_replay.is_empty();
+    if no_keep_empty {
+        let mut kept = Vec::with_capacity(commits_to_replay.len());
+        for commit_id in commits_to_replay {
+            if !commit_starts_empty(&commit_id).await {
+                kept.push(commit_id);
+            }
+        }
+        commits_to_replay = kept;
+    }
     let mut todo_actions = VecDeque::from(vec![RebaseTodoAction::Pick; commits_to_replay.len()]);
     if autosquash {
         let planned_todo = autosquash_commits(commits_to_replay)?;
         commits_to_replay = planned_todo.iter().map(|item| item.commit).collect();
         todo_actions = planned_todo.iter().map(|item| item.action).collect();
     }
-    if commits_to_replay.is_empty() {
+    // Only genuinely-nothing-to-rebase (collect returned empty) returns early and
+    // leaves the branch put. If `--no-keep-empty` emptied a non-empty range, fall
+    // through to the normal setup so the branch is still rebased onto newbase
+    // (replaying zero commits) — otherwise the dropped empties would silently stay.
+    if commits_to_replay.is_empty() && !had_commits_before_filter {
         return Ok(RebaseOutput {
             action: "start".to_string(),
             status: "no-commits".to_string(),
@@ -1566,11 +2433,19 @@ async fn run_rebase_start(
             previous_commit: Some(head_to_rebase_id.to_string()),
             restored: None,
             applied_commits: Vec::new(),
+            dropped_commits: Vec::new(),
             skipped_commit: None,
             skipped_subject: None,
             remaining: Some(0),
         });
     }
+
+    capture_rebase_update_refs(&original_commits_to_replay, &current_branch_name).await?;
+    record_start_empty_rewrite_aliases(
+        &original_commits_to_replay,
+        &commits_to_replay,
+        newbase_id,
+    )?;
 
     // Build the worktree guard against the LANDING (newbase) tree, since the
     // start detaches HEAD onto `newbase_id` before replaying. For a plain rebase
@@ -1624,6 +2499,7 @@ async fn run_rebase_start(
         stopped_sha: None,
         current_head: newbase_id,
         autosquash,
+        empty_mode,
     };
 
     state.save().await.map_err(RebaseError::StateSave)?;
@@ -1643,6 +2519,7 @@ async fn run_rebase_start(
         previous_commit: Some(head_to_rebase_id.to_string()),
         restored: None,
         applied_commits: replay.applied_commits,
+        dropped_commits: replay.dropped_commits,
         skipped_commit: None,
         skipped_subject: None,
         remaining: Some(state.todo.len()),
@@ -1679,7 +2556,17 @@ pub(crate) struct PullRebaseSummary {
 /// with structured hints — pull just wraps it in its own error
 /// variant so the `phase=rebase` detail can be attached.
 pub(crate) async fn run_rebase_for_pull(upstream: &str) -> Result<PullRebaseSummary, RebaseError> {
-    let output = run_rebase_start(upstream, None, false, false).await?;
+    // `pull --rebase` keeps Libra's default (keep become-empty commits).
+    let output = run_rebase_start(
+        upstream,
+        None,
+        false,
+        false,
+        false,
+        RebaseEmptyMode::Keep,
+        false,
+    )
+    .await?;
     let old_commit = output
         .previous_commit
         .clone()
@@ -1719,9 +2606,42 @@ async fn continue_replay(
             .front()
             .copied()
             .unwrap_or(RebaseTodoAction::Pick);
-        match replay_commit_with_conflict_detection(&commit_id, &state.current_head, action).await {
+        match replay_commit_with_conflict_detection(
+            &commit_id,
+            &state.current_head,
+            action,
+            state.empty_mode,
+        )
+        .await
+        {
+            ReplayResult::BecameEmptyDropped { subject } => {
+                // `--empty=drop`: the commit became empty after replay; skip it
+                // without advancing `current_head` (the new parent is unchanged).
+                state.todo.pop_front();
+                state.todo_actions.pop_front();
+                state.stopped_sha = None;
+                record_rebase_rewrite(commit_id, state.current_head, state.current_head, false)?;
+                if emit_human {
+                    println!(
+                        "dropping {} {} -- patch contents already upstream",
+                        commit_id, subject
+                    );
+                }
+                summary.dropped_commits.push(RebaseDroppedCommitOutput {
+                    commit: commit_id.to_string(),
+                    subject,
+                });
+                if let Err(e) = state.save().await {
+                    if emit_human {
+                        emit_warning(format!("failed to save rebase state: {}", e));
+                    } else {
+                        return Err(RebaseError::StateSave(e));
+                    }
+                }
+            }
             ReplayResult::Success(replayed_commit_id) => {
                 let subject = commit_subject_lossy(&commit_id, emit_human);
+                let previous_tip = state.current_head;
                 state.current_head = replayed_commit_id;
                 // Move commit from todo to done
                 state.todo.pop_front();
@@ -1752,6 +2672,16 @@ async fn continue_replay(
                     } else {
                         return Err(RebaseError::StateSave(e));
                     }
+                }
+                record_rebase_rewrite(
+                    commit_id,
+                    previous_tip,
+                    replayed_commit_id,
+                    action.folds_into_previous(),
+                )?;
+                schedule_rebase_exec(state).await?;
+                if let Some(applied) = summary.applied_commits.last_mut() {
+                    applied.commit = state.current_head.to_string();
                 }
             }
             ReplayResult::Conflict { paths, message } => {
@@ -1830,6 +2760,48 @@ async fn continue_replay(
 async fn finalize_rebase(state: &RebaseState, emit_human: bool) -> anyhow::Result<()> {
     let db = get_db_conn_instance().await;
     let final_commit_id = state.current_head;
+    let aux = RebaseAuxState::load_optional().context("failed to load rebase auxiliary state")?;
+    let mut ref_updates = Vec::new();
+    if let Some(aux) = aux.as_ref()
+        && aux.update_refs
+    {
+        for update in &aux.refs_to_update {
+            let old_oid = ObjectHash::from_str(&update.old_oid)
+                .map_err(anyhow::Error::msg)
+                .with_context(|| {
+                    format!(
+                        "rebase update-refs recorded an invalid old object for branch '{}'",
+                        update.branch
+                    )
+                })?;
+            let new_oid = resolve_rebase_rewrite(aux, &update.old_oid, state.onto)
+                .with_context(|| format!("failed to retarget branch '{}'", update.branch))?;
+            ref_updates.push((update.branch.clone(), old_oid, new_oid));
+        }
+    }
+
+    // Prepare the index/worktree before moving any refs. If materialization
+    // fails, the branch tips remain untouched and `--continue` can retry.
+    let final_commit: Commit =
+        load_object(&state.current_head).context("failed to load final commit for rebase")?;
+    let final_tree: Tree =
+        load_object(&final_commit.tree_id).context("failed to load final tree for rebase")?;
+
+    let index_file = path::index();
+    let current_index = git_internal::internal::index::Index::load(&index_file)
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("failed to load current index before rebase finish")?;
+    let mut index = git_internal::internal::index::Index::new();
+    rebuild_index_from_tree(&final_tree, &mut index, "")
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("failed to rebuild index from final tree")?;
+    reset_workdir_tracked_only(&current_index, &index)
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("failed to reset working directory after rebase")?;
+    index
+        .save(&index_file)
+        .map_err(|error| anyhow::anyhow!(error))
+        .context("failed to save index after rebase")?;
 
     let finish_action = ReflogAction::Rebase {
         state: "finish".to_string(),
@@ -1842,19 +2814,91 @@ async fn finalize_rebase(state: &RebaseState, emit_human: bool) -> anyhow::Resul
     };
 
     let branch_name_cloned = state.head_name.clone();
+    let expected_branch_tip = state.orig_head;
     if let Err(e) = with_reflog(
         finish_context,
         move |txn: &sea_orm::DatabaseTransaction| {
+            let ref_updates = ref_updates.clone();
             Box::pin(async move {
-                // This is the crucial step: move the original branch from its old position
-                // to the final replayed commit.
-                Branch::update_branch_with_conn(
+                let live_branch = Branch::find_branch_result_with_conn(
                     txn,
                     &branch_name_cloned,
-                    &final_commit_id.to_string(),
                     None,
                 )
-                .await?;
+                .await
+                .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
+                .ok_or_else(|| {
+                    sea_orm::DbErr::Custom(format!(
+                        "rebased branch '{}' disappeared before finalization",
+                        branch_name_cloned
+                    ))
+                })?;
+                if live_branch.commit != expected_branch_tip
+                    && live_branch.commit != final_commit_id
+                {
+                    return Err(sea_orm::DbErr::Custom(format!(
+                        "rebased branch '{}' moved from {} to {} while the rebase was running",
+                        branch_name_cloned, expected_branch_tip, live_branch.commit
+                    )));
+                }
+
+                for (branch, old_oid, new_oid) in ref_updates {
+                    let live = Branch::find_branch_result_with_conn(txn, &branch, None)
+                        .await
+                        .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
+                        .ok_or_else(|| {
+                            sea_orm::DbErr::Custom(format!(
+                                "branch '{branch}' disappeared during rebase --update-refs"
+                            ))
+                        })?;
+                    if live.commit == new_oid {
+                        continue;
+                    }
+                    if live.commit != old_oid {
+                        return Err(sea_orm::DbErr::Custom(format!(
+                            "branch '{branch}' moved from {old_oid} to {} during rebase --update-refs",
+                            live.commit
+                        )));
+                    }
+                    Branch::update_branch_with_conn(
+                        txn,
+                        &branch,
+                        &new_oid.to_string(),
+                        None,
+                    )
+                    .await?;
+                    let context = ReflogContext {
+                        old_oid: old_oid.to_string(),
+                        new_oid: new_oid.to_string(),
+                        action: ReflogAction::Rebase {
+                            state: "update-refs".to_string(),
+                            details: format!("updating refs/heads/{branch}"),
+                        },
+                    };
+                    reflog::Reflog::insert_single_entry(
+                        txn,
+                        &context,
+                        &format!("refs/heads/{branch}"),
+                    )
+                    .await
+                    .map_err(|error| {
+                        sea_orm::DbErr::Custom(format!(
+                            "failed to record update-refs reflog for '{branch}': {error}"
+                        ))
+                    })?;
+                }
+
+                // This is the crucial step: move the original branch from its old position
+                // to the final replayed commit.
+                if live_branch.commit != final_commit_id {
+                    Branch::update_branch_with_conn(
+                        txn,
+                        &branch_name_cloned,
+                        &final_commit_id.to_string(),
+                        None,
+                    )
+                    .await?;
+                }
 
                 // Also, re-attach HEAD to the newly moved branch.
                 Head::update_with_conn(txn, Head::Branch(branch_name_cloned.clone()), None).await;
@@ -1866,37 +2910,18 @@ async fn finalize_rebase(state: &RebaseState, emit_human: bool) -> anyhow::Resul
     .await
     {
         // Attempt to restore HEAD to a safe state
-        Head::update_with_conn(&db, Head::Detached(state.onto), None).await;
+        Head::update_with_conn(&db, Head::Detached(final_commit_id), None).await;
         return Err(e).context("failed to record reflog for rebase finish");
     }
 
-    // Reset the working directory and index to match the final state
-    // This ensures that the workspace reflects the rebased commits
-    let final_commit: Commit =
-        load_object(&state.current_head).context("failed to load final commit for rebase")?;
-    let final_tree: Tree =
-        load_object(&final_commit.tree_id).context("failed to load final tree for rebase")?;
-
-    let index_file = path::index();
-    let current_index = git_internal::internal::index::Index::load(&index_file)
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("failed to load current index before rebase finish")?;
-    let mut index = git_internal::internal::index::Index::new();
-    rebuild_index_from_tree(&final_tree, &mut index, "")
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("failed to rebuild index from final tree")?;
-    index
-        .save(&index_file)
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("failed to save index after rebase")?;
-    reset_workdir_tracked_only(&current_index, &index)
-        .map_err(|e| anyhow::anyhow!(e))
-        .context("failed to reset working directory after rebase")?;
-
-    // Clean up rebase state
-    if let Err(e) = RebaseState::cleanup().await {
-        emit_warning(format!("failed to clean up rebase state: {}", e));
-    }
+    RebaseState::cleanup()
+        .await
+        .map_err(anyhow::Error::msg)
+        .context("failed to clean up completed rebase state")?;
+    resolve_rebase_autostash()
+        .await
+        .context("failed to restore rebase autostash")?;
+    RebaseAuxState::cleanup().context("failed to clean up rebase auxiliary state")?;
 
     if emit_human {
         println!(
@@ -1915,6 +2940,40 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
     let branch = state.head_name.clone();
     let onto_display = short_object_id(&state.onto);
     let mut applied_commits = Vec::new();
+    let mut dropped_commits = Vec::new();
+
+    if RebaseAuxState::load_optional()?
+        .and_then(|aux| aux.pending_exec)
+        .is_some()
+    {
+        run_pending_rebase_exec(&mut state).await?;
+        if state.todo.is_empty() {
+            finalize_rebase(&state, false)
+                .await
+                .map_err(|error| RebaseError::Finalize(error.to_string()))?;
+        } else {
+            let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
+            applied_commits.extend(replay.applied_commits);
+            dropped_commits.extend(replay.dropped_commits);
+        }
+        return Ok(RebaseOutput {
+            action: "continue".to_string(),
+            status: "completed".to_string(),
+            branch,
+            commit: state.current_head.to_string(),
+            upstream: None,
+            onto: Some(state.onto.to_string()),
+            common_ancestor: None,
+            replay_count: None,
+            previous_commit: Some(previous_commit),
+            restored: None,
+            applied_commits,
+            dropped_commits,
+            skipped_commit: None,
+            skipped_subject: None,
+            remaining: Some(state.todo.len()),
+        });
+    }
 
     if let Some(stopped_sha) = state.stopped_sha {
         // Create a commit from the current index after the user has resolved
@@ -1925,6 +2984,12 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
 
         if has_unmerged_entries(&index) {
             return Err(RebaseError::UnresolvedConflicts);
+        }
+
+        // rerere: the conflict is resolved — record its postimage so an identical
+        // conflict is auto-resolved next time. A no-op unless `rerere.enabled`.
+        if let Err(error) = crate::command::rerere::auto_update(false).await {
+            tracing::warn!("rerere auto-update on rebase --continue failed: {error}");
         }
 
         let new_tree_id =
@@ -1951,6 +3016,7 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
         save_object(&new_commit, &new_commit.id)
             .map_err(|e| RebaseError::CommitSave(e.to_string()))?;
 
+        let previous_tip = state.current_head;
         state.current_head = new_commit.id;
         state.todo.pop_front();
         state.todo_actions.pop_front();
@@ -1965,6 +3031,17 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
             commit: state.current_head.to_string(),
             subject,
         });
+        state.save().await.map_err(RebaseError::StateSave)?;
+        record_rebase_rewrite(
+            stopped_sha,
+            previous_tip,
+            state.current_head,
+            action.folds_into_previous(),
+        )?;
+        schedule_rebase_exec(&mut state).await?;
+        if let Some(applied) = applied_commits.last_mut() {
+            applied.commit = state.current_head.to_string();
+        }
     }
 
     if state.todo.is_empty() {
@@ -1975,6 +3052,7 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
         state.save().await.map_err(RebaseError::StateSave)?;
         let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
         applied_commits.extend(replay.applied_commits);
+        dropped_commits.extend(replay.dropped_commits);
     }
 
     Ok(RebaseOutput {
@@ -1989,6 +3067,7 @@ async fn run_rebase_continue() -> Result<RebaseOutput, RebaseError> {
         previous_commit: Some(previous_commit),
         restored: None,
         applied_commits,
+        dropped_commits,
         skipped_commit: None,
         skipped_subject: None,
         remaining: Some(state.todo.len()),
@@ -2003,60 +3082,11 @@ async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
     }
 
     let state = RebaseState::load().await.map_err(RebaseError::StateLoad)?;
-
-    let db = get_db_conn_instance().await;
-
-    // Restore HEAD to original branch
-    let abort_action = ReflogAction::Rebase {
-        state: "abort".to_string(),
-        details: format!("returning to refs/heads/{}", state.head_name),
-    };
-    let abort_context = ReflogContext {
-        old_oid: state.current_head.to_string(),
-        new_oid: state.orig_head.to_string(),
-        action: abort_action,
-    };
-
-    let branch_name_cloned = state.head_name.clone();
     let orig_head = state.orig_head;
     let orig_head_str = orig_head.to_string();
-    let orig_head_str_for_txn = orig_head_str.clone();
-    let reflog_result = with_reflog(
-        abort_context,
-        move |txn: &sea_orm::DatabaseTransaction| {
-            Box::pin(async move {
-                Branch::update_branch_with_conn(
-                    txn,
-                    &branch_name_cloned,
-                    &orig_head_str_for_txn,
-                    None,
-                )
-                .await?;
-                Head::update_with_conn(txn, Head::Branch(branch_name_cloned), None).await;
-                Ok(())
-            })
-        },
-        true,
-    )
-    .await;
-    match reflog_result {
-        Ok(()) => {}
-        Err(e) => {
-            emit_warning(format!("failed to record reflog: {e}"));
-            // Continue anyway; ensure branch ref is corrected.
-            if let Err(err) =
-                Branch::update_branch_with_conn(&db, &state.head_name, &orig_head_str, None).await
-            {
-                return Err(RebaseError::BranchRestore {
-                    branch: state.head_name.clone(),
-                    detail: err.to_string(),
-                });
-            }
-        }
-    }
-    Head::update_with_conn(&db, Head::Branch(state.head_name.clone()), None).await;
 
-    // Reset working directory to original HEAD
+    // Restore files and index before changing HEAD. A materialization failure
+    // leaves the branch/ref state untouched and the abort can be retried.
     let orig_commit: Commit =
         load_object(&orig_head).map_err(|error| RebaseError::OriginalCommitLoad {
             commit: orig_head.to_string(),
@@ -2067,25 +3097,94 @@ async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
             tree: orig_commit.tree_id.to_string(),
             detail: error.to_string(),
         })?;
-
     let index_file = path::index();
     let current_index = git_internal::internal::index::Index::load(&index_file)
         .map_err(|error| RebaseError::IndexLoad(error.to_string()))?;
     let mut index = git_internal::internal::index::Index::new();
-    if let Err(e) = rebuild_index_from_tree(&orig_tree, &mut index, "") {
-        return Err(RebaseError::IndexRebuild(e));
-    }
-    if let Err(e) = index.save(&index_file) {
-        return Err(RebaseError::IndexSave(e.to_string()));
-    }
-    if let Err(e) = reset_workdir_tracked_only(&current_index, &index) {
-        return Err(RebaseError::WorkdirReset(e));
-    }
+    rebuild_index_from_tree(&orig_tree, &mut index, "").map_err(RebaseError::IndexRebuild)?;
+    reset_workdir_tracked_only(&current_index, &index).map_err(RebaseError::WorkdirReset)?;
+    index
+        .save(&index_file)
+        .map_err(|error| RebaseError::IndexSave(error.to_string()))?;
 
-    // Clean up rebase state
-    if let Err(e) = RebaseState::cleanup().await {
-        emit_warning(format!("failed to clean up rebase state: {}", e));
-    }
+    // Restore HEAD to original branch
+    let abort_action = ReflogAction::Rebase {
+        state: "abort".to_string(),
+        details: format!("returning to refs/heads/{}", state.head_name),
+    };
+    let abort_context = ReflogContext {
+        old_oid: state.current_head.to_string(),
+        new_oid: orig_head_str.clone(),
+        action: abort_action,
+    };
+
+    let branch_name_cloned = state.head_name.clone();
+    let replay_tip = state.current_head;
+    with_reflog(
+        abort_context,
+        move |txn: &sea_orm::DatabaseTransaction| {
+            Box::pin(async move {
+                let live = Branch::find_branch_result_with_conn(txn, &branch_name_cloned, None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))?
+                    .ok_or_else(|| {
+                        sea_orm::DbErr::Custom(format!(
+                            "branch '{}' disappeared during rebase abort",
+                            branch_name_cloned
+                        ))
+                    })?;
+                if live.commit != orig_head && live.commit != replay_tip {
+                    return Err(sea_orm::DbErr::Custom(format!(
+                        "branch '{}' moved from {} to {} while the rebase was running",
+                        branch_name_cloned, orig_head, live.commit
+                    )));
+                }
+                if live.commit == replay_tip && replay_tip != orig_head {
+                    Branch::update_branch_with_conn(
+                        txn,
+                        &branch_name_cloned,
+                        &orig_head.to_string(),
+                        None,
+                    )
+                    .await?;
+                    let context = ReflogContext {
+                        old_oid: replay_tip.to_string(),
+                        new_oid: orig_head.to_string(),
+                        action: ReflogAction::Rebase {
+                            state: "abort".to_string(),
+                            details: format!("returning to refs/heads/{branch_name_cloned}"),
+                        },
+                    };
+                    reflog::Reflog::insert_single_entry(
+                        txn,
+                        &context,
+                        &format!("refs/heads/{branch_name_cloned}"),
+                    )
+                    .await
+                    .map_err(|error| {
+                        sea_orm::DbErr::Custom(format!(
+                            "failed to record abort reflog for '{}': {error}",
+                            branch_name_cloned
+                        ))
+                    })?;
+                }
+                Head::update_with_conn(txn, Head::Branch(branch_name_cloned), None).await;
+                Ok(())
+            })
+        },
+        false,
+    )
+    .await
+    .map_err(|error| RebaseError::BranchRestore {
+        branch: state.head_name.clone(),
+        detail: error.to_string(),
+    })?;
+
+    RebaseState::cleanup()
+        .await
+        .map_err(RebaseError::StateSave)?;
+    resolve_rebase_autostash().await?;
+    RebaseAuxState::cleanup()?;
 
     Ok(RebaseOutput {
         action: "abort".to_string(),
@@ -2099,6 +3198,7 @@ async fn run_rebase_abort() -> Result<RebaseOutput, RebaseError> {
         previous_commit: Some(state.current_head.to_string()),
         restored: Some(true),
         applied_commits: Vec::new(),
+        dropped_commits: Vec::new(),
         skipped_commit: None,
         skipped_subject: None,
         remaining: None,
@@ -2112,6 +3212,52 @@ async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
     let branch = state.head_name.clone();
     let onto_display = short_object_id(&state.onto);
 
+    if let Some(mut aux) = RebaseAuxState::load_optional()?
+        && aux.pending_exec.is_some()
+    {
+        reconcile_rebase_exec_head(&mut state, &mut aux).await?;
+        let quiet_output = OutputConfig {
+            quiet: true,
+            ..Default::default()
+        };
+        switch::ensure_clean_status(&quiet_output)
+            .await
+            .map_err(|error| RebaseError::WorktreeDirty {
+                action: "skip the failed exec command".to_string(),
+                detail: error.to_string(),
+            })?;
+        aux.pending_exec = None;
+        aux.save()?;
+        let mut applied_commits = Vec::new();
+        let mut dropped_commits = Vec::new();
+        if state.todo.is_empty() {
+            finalize_rebase(&state, false)
+                .await
+                .map_err(|error| RebaseError::Finalize(error.to_string()))?;
+        } else {
+            let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
+            applied_commits.extend(replay.applied_commits);
+            dropped_commits.extend(replay.dropped_commits);
+        }
+        return Ok(RebaseOutput {
+            action: "skip".to_string(),
+            status: "completed".to_string(),
+            branch,
+            commit: state.current_head.to_string(),
+            upstream: None,
+            onto: Some(state.onto.to_string()),
+            common_ancestor: None,
+            replay_count: None,
+            previous_commit: Some(previous_commit),
+            restored: None,
+            applied_commits,
+            dropped_commits,
+            skipped_commit: None,
+            skipped_subject: None,
+            remaining: Some(state.todo.len()),
+        });
+    }
+
     let skipped_sha = state
         .stopped_sha
         .or_else(|| state.todo.front().cloned())
@@ -2120,6 +3266,7 @@ async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
         Ok(commit) => Some(commit_subject_from_message(&commit.message)),
         Err(_) => None,
     };
+    record_rebase_rewrite(skipped_sha, state.current_head, state.current_head, false)?;
 
     state.todo.pop_front();
     let skipped_action = state.todo_actions.pop_front();
@@ -2152,6 +3299,7 @@ async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
         .map_err(|e| RebaseError::WorkdirReset(e.to_string()))?;
 
     let mut applied_commits = Vec::new();
+    let mut dropped_commits = Vec::new();
     if state.todo.is_empty() {
         finalize_rebase(&state, false)
             .await
@@ -2160,6 +3308,7 @@ async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
         state.save().await.map_err(RebaseError::StateSave)?;
         let replay = continue_replay(&mut state, &branch, &onto_display, false).await?;
         applied_commits.extend(replay.applied_commits);
+        dropped_commits.extend(replay.dropped_commits);
     }
 
     Ok(RebaseOutput {
@@ -2174,6 +3323,7 @@ async fn run_rebase_skip() -> Result<RebaseOutput, RebaseError> {
         previous_commit: Some(previous_commit),
         restored: None,
         applied_commits,
+        dropped_commits,
         skipped_commit: Some(skipped_sha.to_string()),
         skipped_subject,
         remaining: Some(state.todo.len()),
@@ -2983,6 +4133,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn create_tree_from_items_map_preserves_blob_modes() {
         let repo = tempdir().expect("temp repo");
         setup_with_new_libra_in(repo.path()).await;
@@ -3268,6 +4419,7 @@ async fn replay_commit_with_conflict_detection(
     commit_to_replay_id: &ObjectHash,
     new_parent_id: &ObjectHash,
     action: RebaseTodoAction,
+    empty_mode: RebaseEmptyMode,
 ) -> ReplayResult {
     let index_file = path::index();
     let current_index = match git_internal::internal::index::Index::load(&index_file) {
@@ -3452,6 +4604,13 @@ async fn replay_commit_with_conflict_detection(
             }
         }
 
+        // rerere: record the preimage of each just-written conflict and replay a
+        // recorded resolution if one matches. A no-op unless `rerere.enabled`;
+        // staging of a replayed file follows `rerere.autoUpdate` (rebase does not
+        // expose a per-invocation `--rerere-autoupdate`).
+        if let Err(error) = crate::command::rerere::auto_update(false).await {
+            tracing::warn!("rerere auto-update after rebase conflict failed: {error}");
+        }
         return ReplayResult::conflict(conflicts);
     }
 
@@ -3460,6 +4619,21 @@ async fn replay_commit_with_conflict_detection(
         Ok(id) => id,
         Err(e) => return ReplayResult::internal(ReplayErrorKind::TreeCreate, e.to_string()),
     };
+
+    // `--empty=drop`: a commit that BECOMES empty after replay (the merged tree
+    // equals the new parent's tree — its changes are already on the new base) is
+    // skipped. This is distinct from a commit that BEGINS empty (handled by
+    // `--no-keep-empty` up front): `their_tree != base_tree` confirms the original
+    // commit DID introduce a change, so emptiness arose from the replay. The
+    // index/worktree already equal the new parent (new_tree == our_tree), so no
+    // mutation is needed before skipping.
+    if empty_mode == RebaseEmptyMode::Drop
+        && new_tree_id == our_tree.id
+        && their_tree.id != base_tree.id
+    {
+        let subject = commit_subject_from_message(&commit_to_replay.message);
+        return ReplayResult::BecameEmptyDropped { subject };
+    }
 
     let new_commit =
         match create_replayed_commit(&commit_to_replay, new_tree_id, *new_parent_id, action) {
@@ -3549,60 +4723,31 @@ fn amend_replacement_message(message: &str) -> String {
     }
 }
 
-/// Find the merge base (common ancestor) of two commits
-///
-/// This function implements a simple merge base algorithm:
-/// 1. Traverse all ancestors of the first commit and store them in a set
-/// 2. Traverse ancestors of the second commit until we find one in the set
-/// 3. Return the first common ancestor found
-///
-/// Note: This returns the first common ancestor found, not necessarily the
-/// best common ancestor. A more sophisticated algorithm would find the
-/// lowest common ancestor (LCA).
-///
-/// TODO: Implement proper LCA algorithm for better merge base detection
-/// TODO: Optimize performance for large repositories with many commits
-async fn find_merge_base(
-    commit1_id: &ObjectHash,
-    commit2_id: &ObjectHash,
-) -> Result<Option<ObjectHash>, String> {
-    let mut visited1 = HashSet::new();
-    let mut visited2 = HashSet::new();
-    let mut queue1 = vec![*commit1_id];
-    let mut queue2 = vec![*commit2_id];
-    while !queue1.is_empty() || !queue2.is_empty() {
-        // Process one level of ancestors for commit1
-        if let Some(current_id) = queue1.pop() {
-            if visited2.contains(&current_id) {
-                return Ok(Some(current_id)); // Found common ancestor
-            }
-            if visited1.insert(current_id) {
-                let commit: Commit = load_object(&current_id).map_err(|e| e.to_string())?;
-                for parent_id in &commit.parent_commit_ids {
-                    queue1.push(*parent_id);
-                }
-            }
-        }
-        // Process one level of ancestors for commit2
-        if let Some(current_id) = queue2.pop() {
-            if visited1.contains(&current_id) {
-                return Ok(Some(current_id)); // Found common ancestor
-            }
-            if visited2.insert(current_id) {
-                let commit: Commit = load_object(&current_id).map_err(|e| e.to_string())?;
-                for parent_id in &commit.parent_commit_ids {
-                    queue2.push(*parent_id);
-                }
-            }
-        }
-    }
-    Ok(None)
-}
-
 /// Collect all commits from base (exclusive) to head (inclusive) that need to be replayed
 ///
 /// This function walks backwards from the head commit to the base commit,
 /// collecting all commits in between. These are the commits that will be
+/// Whether `commit_id` is empty in the original history — i.e. it introduces no
+/// change relative to its first parent (its tree equals the parent's tree). A
+/// root commit (no parent) is empty iff its tree has no entries. Used by
+/// `rebase --no-keep-empty` to drop such commits before replay. A load failure
+/// conservatively reports `false` (keep the commit) so a transient error never
+/// silently discards work.
+async fn commit_starts_empty(commit_id: &ObjectHash) -> bool {
+    let Ok(commit) = load_object::<Commit>(commit_id) else {
+        return false;
+    };
+    match commit.parent_commit_ids.first() {
+        Some(parent_id) => match load_object::<Commit>(parent_id) {
+            Ok(parent) => commit.tree_id == parent.tree_id,
+            Err(_) => false,
+        },
+        None => load_object::<Tree>(&commit.tree_id)
+            .map(|tree| tree.tree_items.is_empty())
+            .unwrap_or(false),
+    }
+}
+
 /// replayed onto the new upstream base.
 ///
 /// The commits are returned in chronological order (oldest first) so they
@@ -3611,15 +4756,28 @@ async fn collect_commits_to_replay(
     base_id: &ObjectHash,
     head_id: &ObjectHash,
 ) -> Result<Vec<ObjectHash>, String> {
+    // The shared-history boundary: the base and every one of its ancestors.
+    // Stopping the first-parent walk at the FIRST commit already reachable from
+    // the base (rather than only at `base_id` exactly) keeps a base that is not
+    // on head's first-parent chain — a multiple-LCA criss-cross merge base —
+    // from overshooting toward the root and replaying shared commits.
+    let base_history: HashSet<ObjectHash> =
+        crate::command::log::get_reachable_commits(base_id.to_string(), None)
+            .await
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|commit| commit.id)
+            .collect();
+
     let mut commits = Vec::new();
     let mut current_id = *head_id;
 
-    // Walk backwards from head to base, collecting commit IDs
-    while current_id != *base_id {
+    // Walk backwards from head, collecting commits until the shared history.
+    while !base_history.contains(&current_id) {
         commits.push(current_id);
         let commit: Commit = load_object(&current_id).map_err(|e| e.to_string())?;
         if commit.parent_commit_ids.is_empty() {
-            break; // Reached root commit
+            break; // Reached a root without meeting the base's history
         }
         current_id = commit.parent_commit_ids[0]; // Follow first parent
         // TODO: Handle merge commits properly - currently only follows first parent
@@ -3888,6 +5046,7 @@ mod rebuild_index_tests {
     };
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn rebuild_index_from_tree_preserves_executable_and_symlink_modes() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -3920,6 +5079,7 @@ mod rebuild_index_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn rebuild_index_from_tree_returns_path_context_for_missing_blob() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;
@@ -3942,6 +5102,7 @@ mod rebuild_index_tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn rebuild_index_from_tree_rejects_gitlink_entries() {
         let repo = tempdir().unwrap();
         setup_with_new_libra_in(repo.path()).await;

@@ -21,6 +21,9 @@ and `--name-only` control how much diff context is shown. For annotated tags the
 tagger metadata and message are printed, followed by the target object. Trees
 list their entries and blobs print their text content (or a binary summary).
 
+When stdout is piped and the downstream command exits early, `libra show` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
+
 ## Options
 
 | Flag | Short | Description |
@@ -28,12 +31,21 @@ list their entries and blobs print their text content (or a binary summary).
 | `<OBJECT>` | | Object name (commit, tag, tree, blob) or `<object>:<path>`. Defaults to `HEAD`. |
 | `--no-patch` | `-s` | Skip patch output and only show object metadata. |
 | `--oneline` | | Shorthand for `--pretty=oneline` -- prints hash and subject on one line. |
-| `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`) or a `%`-placeholder template (`format:`/`tformat:`/bare). |
+| `--pretty <FORMAT>` | | Format the commit header with a preset (`oneline`, `short`, `full`, `fuller`, `reference`, `raw`) or a `%`-placeholder template (`format:`/`tformat:`/bare). Uses the same custom placeholders as `libra log --format`, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, `%aI`, `%cI`, `%at`, `%ct`, `%D`, `%m`, and color placeholders. |
 | `--format <FORMAT>` | | Alias for `--pretty=<FORMAT>` (Git's `--format`). Mutually exclusive with `--pretty`. |
+| `--date <FORMAT>` | | Select the human date mode (`default`, `short`, `iso`, `iso-strict`, `rfc`, `unix`, or `raw`). Overrides `log.date`. |
 | `--abbrev-commit` | | Abbreviate the commit object name in the default header to a 7-character prefix. |
+| `--no-abbrev-commit` | | Show the full (unabbreviated) commit object name, countermanding an earlier `--abbrev-commit` (last one wins). The full hash is the default, so on its own this is a no-op. |
 | `--name-only` | | Show only changed file names (no diff hunks). |
 | `--name-status` | | Show changed file names prefixed by a status letter (`A`/`M`/`D`), tab-separated. |
+| `--raw` | | Show the raw diff format `:<old-mode> <new-mode> <old-sha> <new-sha> <status>\t<path>` (object ids abbreviated to 7) instead of a patch, like `git show --raw`. |
 | `--stat` | | Show diff statistics (insertions / deletions per file). |
+| `--patch-with-stat` | | Show the diffstat block followed by the full patch (Git's legacy synonym for `-p --stat`). |
+| `--summary` | | Show a condensed summary of created and deleted files (their mode and path), like `git show --summary`. Created/deleted files only — no rename/copy detection. |
+| `--no-expand-tabs` | | Do not expand tabs in the commit message. Accepted no-op: Libra's show prints tabs verbatim. |
+| `--no-notes` | | Do not show commit notes. Accepted no-op: Libra's show never displays notes inline. |
+| `--no-mailmap` | | Do not apply a `.mailmap`. Accepted no-op: Libra's show shows the raw recorded identities. |
+| `--no-show-signature` | | Do not display the GPG signature of signed commits. Accepted no-op: Libra's show never displays commit signatures inline. (Git's `--show-signature` is not implemented.) |
 | `<PATHS>...` | | Limit output to matching paths (pathspec filter for commit diffs). |
 
 ### Examples
@@ -68,6 +80,8 @@ libra show HEAD:Cargo.toml          # print a file at HEAD
 libra show --name-only HEAD         # list changed files
 libra show --name-status HEAD       # list changed files with A/M/D status
 libra show --stat HEAD              # diff statistics
+libra show --patch-with-stat HEAD   # diffstat followed by the full patch
+libra show --summary HEAD           # created/deleted file mode summary
 libra --json show HEAD              # structured JSON output
 ```
 
@@ -187,8 +201,18 @@ naturally to the internal tree-walk operation that Libra already performs.
 
 `--pretty=<fmt>` and its alias `--format=<fmt>` render the commit header with the
 `oneline` preset or a `%`-placeholder template (`format:`/`tformat:`/bare), sharing
-`libra log`'s formatter. The named presets `short` / `full` / `fuller` / `raw` are
-not yet rendered distinctly. For programmatic consumers, `--json` remains the
+`libra log`'s formatter. The named presets `short`, `full`, `fuller`, `reference`,
+and `raw` are rendered distinctly (matching Git's preset structure); `medium`
+maps to the default format and retains the full commit id. (This is separate
+from the `--raw` diff format —
+see the `--raw` option — which selects the raw `:<old-mode> <new-mode> …` diff
+format instead of a preset.) Without an explicit `--oneline`, `--pretty`, or
+`--format`, `format.pretty` supplies the human commit-header default. Likewise,
+`log.date` supplies the human date mode unless `--date` is present. Both keys
+use the strict local→global→system cascade; invalid/read-failed values stop
+before commit/tag output with `LBR-CLI-002`/`LBR-IO-001`. Tree, blob,
+`REV:path`, quiet validation, and structured JSON do not read these
+commit-display defaults. For programmatic consumers, `--json` remains the
 recommended interface: it gives every field in a well-typed, type-discriminated
 schema (typed fields vs. string parsing), avoiding format-string fragility.
 
@@ -211,8 +235,10 @@ but I expected it" bugs in agent tooling.
 | `--no-patch` / `-s` | Yes | Yes | N/A |
 | `--oneline` | Yes | Yes | N/A (use `jj log --template`) |
 | `--name-only` | Yes | Yes | N/A |
+| `--name-status` | Yes | Yes | N/A |
 | `--stat` | Yes | Yes | N/A (`jj diff --stat -r REV`) |
-| `--pretty` / `--format` | Yes (`oneline` + `%`-templates; presets pending) | Yes | No (use templates) |
+| `--patch-with-stat` | Yes | Yes | N/A |
+| `--pretty` / `--format` | Yes (named presets + `%`-templates) | Yes | No (use templates) |
 | `--abbrev-commit` | Yes | Yes | N/A |
 | `--quiet` | Yes (validates only) | No | N/A |
 | JSON output | `--json` with typed schema | No | No |

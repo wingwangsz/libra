@@ -822,6 +822,9 @@ async fn test_log_patch_no_pathspec() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -853,6 +856,9 @@ async fn test_log_patch_no_pathspec() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -945,6 +951,9 @@ async fn test_log_patch_with_pathspec() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1076,6 +1085,9 @@ async fn test_log_stat() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1106,6 +1118,9 @@ async fn test_log_stat() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1147,6 +1162,118 @@ async fn test_log_stat() {
 
 #[tokio::test]
 #[serial]
+async fn test_log_patch_with_stat_shows_diffstat_before_patch() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = ChangeDirGuard::new(temp_path.path());
+
+    test::ensure_file("file1.txt", Some("line1\nline2\n"));
+    add::execute(AddArgs {
+        pathspec: vec![String::from("file1.txt")],
+        all: false,
+        update: false,
+        refresh: false,
+        force: false,
+        verbose: false,
+        dry_run: false,
+        ignore_errors: false,
+        pathspec_from_file: None,
+        pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
+    })
+    .await;
+    commit::execute(CommitArgs {
+        message: Some("add file1".to_string()),
+        file: None,
+        allow_empty: false,
+        conventional: false,
+        no_edit: false,
+        amend: false,
+        signoff: false,
+        disable_pre: false,
+        all: false,
+        no_verify: false,
+        author: None,
+        ..Default::default()
+    })
+    .await;
+
+    test::ensure_file("file1.txt", Some("line1\nline2\nline3\n"));
+    add::execute(AddArgs {
+        pathspec: vec![String::from("file1.txt")],
+        all: false,
+        update: false,
+        refresh: false,
+        force: false,
+        verbose: false,
+        dry_run: false,
+        ignore_errors: false,
+        pathspec_from_file: None,
+        pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
+    })
+    .await;
+    commit::execute(CommitArgs {
+        message: Some("extend file1".to_string()),
+        file: None,
+        allow_empty: false,
+        conventional: false,
+        no_edit: false,
+        amend: false,
+        signoff: false,
+        disable_pre: false,
+        all: false,
+        no_verify: false,
+        author: None,
+        ..Default::default()
+    })
+    .await;
+
+    // `--patch-with-stat` emits the diffstat block, then the patch.
+    let out = run_libra_command(&["log", "--patch-with-stat", "-1"], temp_path.path());
+    assert_cli_success(&out, "log --patch-with-stat");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let stat_pos = stdout
+        .find("1 file changed")
+        .expect("diffstat summary present");
+    let patch_pos = stdout.find("diff --git").expect("patch body present");
+    assert!(
+        stat_pos < patch_pos,
+        "diffstat must precede the patch body:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("+line3"),
+        "patch shows the added line:\n{stdout}"
+    );
+
+    // `-p --stat` is the same thing and likewise shows both, in stat-then-patch order.
+    let combo = run_libra_command(&["log", "-p", "--stat", "-1"], temp_path.path());
+    assert_cli_success(&combo, "log -p --stat");
+    let combo_out = String::from_utf8_lossy(&combo.stdout);
+    let combo_stat = combo_out.find("1 file changed").expect("stat present");
+    let combo_patch = combo_out.find("diff --git").expect("patch present");
+    assert!(
+        combo_stat < combo_patch,
+        "-p --stat: stat before patch:\n{combo_out}"
+    );
+
+    // Plain `-p` still shows the patch with no diffstat summary line.
+    let patch_only = run_libra_command(&["log", "-p", "-1"], temp_path.path());
+    assert_cli_success(&patch_only, "log -p");
+    let patch_only_out = String::from_utf8_lossy(&patch_only.stdout);
+    assert!(patch_only_out.contains("diff --git"));
+    assert!(
+        !patch_only_out.contains("1 file changed"),
+        "plain -p has no diffstat summary:\n{patch_only_out}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_log_stat_with_modifications() {
     let temp_path = tempdir().unwrap();
     test::setup_with_new_libra_in(temp_path.path()).await;
@@ -1164,6 +1291,9 @@ async fn test_log_stat_with_modifications() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1194,6 +1324,9 @@ async fn test_log_stat_with_modifications() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1403,6 +1536,9 @@ async fn test_log_graph_simple_chain() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1433,6 +1569,9 @@ async fn test_log_graph_simple_chain() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1481,6 +1620,9 @@ async fn test_log_stat_and_graph_combined() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1614,6 +1756,9 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1645,6 +1790,9 @@ async fn test_log_double_dash_disables_short_number_rewrite() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1892,6 +2040,9 @@ async fn test_log_grep_filtering() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1923,6 +2074,9 @@ async fn test_log_grep_filtering() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1954,6 +2108,9 @@ async fn test_log_grep_filtering() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2040,6 +2197,9 @@ async fn test_log_reverse_outputs_oldest_first() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2061,6 +2221,9 @@ async fn test_log_reverse_outputs_oldest_first() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2098,6 +2261,9 @@ async fn test_log_range_excludes_start_commit() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2120,6 +2286,9 @@ async fn test_log_range_excludes_start_commit() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2156,6 +2325,9 @@ async fn test_log_all_includes_branches() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2166,6 +2338,9 @@ async fn test_log_all_includes_branches() {
     .await;
 
     execute(BranchArgs {
+        subcommand: None,
+        format: None,
+        no_column: false,
         new_branch: Some("side".to_string()),
         commit_hash: None,
         list: false,
@@ -2173,6 +2348,7 @@ async fn test_log_all_includes_branches() {
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -2203,6 +2379,9 @@ async fn test_log_all_includes_branches() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2242,6 +2421,9 @@ async fn test_log_follow_detects_rename() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2264,6 +2446,9 @@ async fn test_log_follow_detects_rename() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2301,6 +2486,9 @@ async fn test_log_line_range_flag_accepted() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2621,4 +2809,500 @@ fn log_no_notes_flag_is_accepted_noop() {
         !String::from_utf8_lossy(&plain.stdout).contains("a note"),
         "Libra log does not display notes inline"
     );
+}
+
+#[test]
+fn log_no_mailmap_flag_is_accepted_noop() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let plain = run_libra_command(&["log"], p);
+    assert_cli_success(&plain, "log");
+    // `--no-mailmap` is accepted and a no-op: Libra's log never applies a
+    // mailmap, so the output is unchanged.
+    let out = run_libra_command(&["log", "--no-mailmap"], p);
+    assert_cli_success(&out, "log --no-mailmap");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&plain.stdout),
+        "log --no-mailmap matches plain log (no-op)"
+    );
+}
+
+#[test]
+fn log_no_show_signature_flag_is_accepted_noop() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let plain = run_libra_command(&["log"], p);
+    assert_cli_success(&plain, "log");
+    // `--no-show-signature` is accepted and a no-op: Libra's log never displays
+    // commit signatures inline, so the output is unchanged.
+    let out = run_libra_command(&["log", "--no-show-signature"], p);
+    assert_cli_success(&out, "log --no-show-signature");
+    assert_eq!(
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&plain.stdout),
+        "log --no-show-signature matches plain log (no-op)"
+    );
+}
+
+#[test]
+fn test_log_pretty_named_presets() {
+    use std::fs;
+
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Add a commit with a subject and a body to exercise body display.
+    fs::write(p.join("x.txt"), "x").expect("write x");
+    assert_cli_success(&run_libra_command(&["add", "x.txt"], p), "add x");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "-m",
+                "feat: the subject\n\nbody text here",
+                "--no-verify",
+            ],
+            p,
+        ),
+        "commit with body",
+    );
+
+    let run = |preset: &str| -> String {
+        let out = run_libra_command(&["log", &format!("--pretty={preset}"), "-1"], p);
+        assert_cli_success(&out, preset);
+        String::from_utf8_lossy(&out.stdout).to_string()
+    };
+
+    // short: commit + Author, NO Date / NO Commit, subject only (no body).
+    let short = run("short");
+    assert!(short.contains("commit "), "short header: {short}");
+    assert!(short.contains("Author: "), "short Author: {short}");
+    assert!(!short.contains("Date:"), "short has no Date: {short}");
+    assert!(!short.contains("Commit:"), "short has no Commit: {short}");
+    assert!(
+        short.contains("    feat: the subject"),
+        "short subject: {short}"
+    );
+    assert!(
+        !short.contains("body text here"),
+        "short omits the body: {short}"
+    );
+
+    // full: Author + Commit (no Date), subject + body.
+    let full = run("full");
+    assert!(full.contains("Author: "), "full Author: {full}");
+    assert!(full.contains("Commit: "), "full Commit: {full}");
+    assert!(!full.contains("Date:"), "full has no Date: {full}");
+    assert!(
+        full.contains("    body text here"),
+        "full shows body: {full}"
+    );
+
+    // fuller: Author/AuthorDate/Commit/CommitDate (labels aligned), subject + body.
+    let fuller = run("fuller");
+    assert!(
+        fuller.contains("Author:     "),
+        "fuller Author pad: {fuller}"
+    );
+    assert!(
+        fuller.contains("AuthorDate: "),
+        "fuller AuthorDate: {fuller}"
+    );
+    assert!(
+        fuller.contains("Commit:     "),
+        "fuller Commit pad: {fuller}"
+    );
+    assert!(
+        fuller.contains("CommitDate: "),
+        "fuller CommitDate: {fuller}"
+    );
+    assert!(
+        fuller.contains("    body text here"),
+        "fuller body: {fuller}"
+    );
+
+    // reference: one-line `<hash> (<subject>, <date>)`, no header block.
+    let reference = run("reference");
+    assert!(
+        reference.contains("(feat: the subject, "),
+        "reference one-liner: {reference}"
+    );
+    assert!(
+        !reference.contains("Author:"),
+        "reference is compact: {reference}"
+    );
+    assert!(
+        !reference.contains("commit "),
+        "reference is compact: {reference}"
+    );
+
+    // raw: object headers (tree/author/committer) + indented message.
+    let raw = run("raw");
+    assert!(raw.contains("commit "), "raw header: {raw}");
+    assert!(raw.contains("\ntree "), "raw tree line: {raw}");
+    assert!(raw.contains("\nauthor "), "raw author line: {raw}");
+    assert!(raw.contains("\ncommitter "), "raw committer line: {raw}");
+    assert!(raw.contains("    feat: the subject"), "raw message: {raw}");
+
+    // medium is Git's default format: commit + Author + Date + subject + body.
+    let medium = run("medium");
+    assert!(medium.contains("Author: "), "medium Author: {medium}");
+    assert!(medium.contains("Date:   "), "medium Date line: {medium}");
+    assert!(
+        !medium.contains("Commit:"),
+        "medium has no Commit line: {medium}"
+    );
+    assert!(
+        medium.contains("    body text here"),
+        "medium shows body: {medium}"
+    );
+}
+
+/// Helper: stage a file and commit it, returning the new HEAD commit hash.
+async fn commit_file(path: &str, content: &str, message: &str) -> String {
+    test::ensure_file(path, Some(content));
+    add::execute(AddArgs {
+        pathspec: vec![path.into()],
+        all: false,
+        update: false,
+        refresh: false,
+        force: false,
+        verbose: false,
+        dry_run: false,
+        ignore_errors: false,
+        pathspec_from_file: None,
+        pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
+    })
+    .await;
+    commit::execute(CommitArgs {
+        message: Some(message.to_string()),
+        no_verify: true,
+        ..Default::default()
+    })
+    .await;
+    Head::current_commit().await.unwrap().to_string()
+}
+
+/// `log` accepts a positional revision range (`A..B`, `A...B`), a positional
+/// single revision, `^EXCLUDE` plus an include, and a range followed by a
+/// pathspec — matching Git's `log [<revision>...] [<path>...]` (previously these
+/// only worked via the `--range` flag).
+#[tokio::test]
+#[serial]
+async fn test_log_positional_revision_range() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = ChangeDirGuard::new(temp_path.path());
+
+    let base = commit_file("a.txt", "a\n", "base").await;
+    let _mid = commit_file("a.txt", "a\nb\n", "mid").await;
+    let _tip = commit_file("c.txt", "c\n", "tip").await;
+    let p = temp_path.path();
+
+    // Positional `A..HEAD` range: includes mid+tip, excludes base.
+    let (st, out, err) = run_log_cmd(&["--oneline", &format!("{base}..HEAD")], p);
+    assert!(st.success(), "positional range should succeed: {err}");
+    assert!(
+        out.contains("tip") && out.contains("mid"),
+        "range includes tip+mid: {out}"
+    );
+    assert!(!out.contains("base"), "range excludes base: {out}");
+
+    // Positional single revision: history from `base` back (just base here).
+    let (st, out, _) = run_log_cmd(&["--oneline", &base], p);
+    assert!(st.success(), "positional single rev should succeed");
+    assert!(out.contains("base"), "single rev shows base: {out}");
+    assert!(
+        !out.contains("tip"),
+        "single rev excludes later commits: {out}"
+    );
+
+    // Positional symmetric range `A...HEAD`.
+    let (st, out, _) = run_log_cmd(&["--oneline", &format!("{base}...HEAD")], p);
+    assert!(
+        st.success() && out.contains("tip"),
+        "symmetric range includes tip: {out}"
+    );
+
+    // `^EXCLUDE INCLUDE` positional form.
+    let (st, out, _) = run_log_cmd(&["--oneline", &format!("^{base}"), "HEAD"], p);
+    assert!(st.success(), "^exclude + include should succeed");
+    assert!(
+        out.contains("tip") && !out.contains("base"),
+        "^base HEAD excludes base: {out}"
+    );
+
+    // Range followed by a pathspec: only commits touching a.txt in the range.
+    let (st, out, _) = run_log_cmd(&["--oneline", &format!("{base}..HEAD"), "a.txt"], p);
+    assert!(st.success(), "range + pathspec should succeed");
+    assert!(out.contains("mid"), "a.txt changed in mid: {out}");
+    assert!(!out.contains("tip"), "tip did not touch a.txt: {out}");
+}
+
+/// A bare positional argument that is BOTH a valid revision and an existing path
+/// is rejected as ambiguous (matching Git's refusal to guess); `--range`
+/// disambiguates.
+#[tokio::test]
+#[serial]
+async fn test_log_positional_ambiguous_rev_and_path_errors() {
+    let temp_path = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp_path.path()).await;
+    let _guard = ChangeDirGuard::new(temp_path.path());
+
+    commit_file("a.txt", "a\n", "base").await;
+    // A worktree file literally named "HEAD": both a revision and a path.
+    test::ensure_file("HEAD", Some("not a ref\n"));
+
+    let p = temp_path.path();
+    let (st, _out, err) = run_log_cmd(&["HEAD"], p);
+    assert!(!st.success(), "ambiguous name should be rejected");
+    assert!(
+        err.contains("ambiguous") && err.contains("--range"),
+        "error should flag ambiguity and suggest --range: {err}"
+    );
+
+    // `--range HEAD` disambiguates to the revision and succeeds.
+    let (st, _out, err) = run_log_cmd(&["--oneline", "--range", "HEAD"], p);
+    assert!(
+        st.success(),
+        "--range HEAD should resolve the revision: {err}"
+    );
+}
+
+/// Positional `A...B` is a true symmetric difference and `A..B` / `^A` exclude
+/// the full ancestor closure of the excluded side, verified on a DIVERGENT
+/// history (a regression guard for both the symmetric-range and exclusion fixes).
+#[test]
+#[serial]
+fn test_log_positional_symmetric_and_exclusion_divergent() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    let run = |args: &[&str]| run_libra_command(args, p);
+    run(&["config", "set", "user.name", "t"]);
+    run(&["config", "set", "user.email", "t@t"]);
+
+    std::fs::write(p.join("f.txt"), "base\n").unwrap();
+    run(&["add", "f.txt"]);
+    run(&["commit", "-m", "base", "--no-verify"]);
+    run(&["branch", "side"]);
+    std::fs::write(p.join("f.txt"), "main1\n").unwrap();
+    run(&["add", "f.txt"]);
+    run(&["commit", "-m", "mainA", "--no-verify"]);
+    run(&["switch", "side"]);
+    std::fs::write(p.join("g.txt"), "side1\n").unwrap();
+    run(&["add", "g.txt"]);
+    run(&["commit", "-m", "sideA", "--no-verify"]);
+    run(&["switch", "main"]);
+
+    // A...B symmetric difference: both unique tips, never the shared base.
+    let out =
+        String::from_utf8_lossy(&run(&["log", "main...side", "--pretty=%s"]).stdout).to_string();
+    assert!(
+        out.contains("mainA") && out.contains("sideA"),
+        "symmetric includes both: {out}"
+    );
+    assert!(
+        !out.contains("base"),
+        "symmetric excludes shared base: {out}"
+    );
+
+    // A..B excludes everything reachable from A (including the shared base).
+    let out =
+        String::from_utf8_lossy(&run(&["log", "main..side", "--pretty=%s"]).stdout).to_string();
+    assert!(out.contains("sideA"), "main..side includes sideA: {out}");
+    assert!(
+        !out.contains("mainA") && !out.contains("base"),
+        "main..side excludes mainA+base: {out}"
+    );
+
+    // ^A B positional form behaves like A..B.
+    let out =
+        String::from_utf8_lossy(&run(&["log", "^main", "side", "--pretty=%s"]).stdout).to_string();
+    assert!(
+        out.contains("sideA") && !out.contains("base"),
+        "^main side excludes base: {out}"
+    );
+}
+
+/// A pathspec that merely contains `..` (a parent-directory path) is NOT
+/// misclassified as a revision range — it falls back to a pathspec filter.
+#[test]
+#[serial]
+fn test_log_positional_parent_dir_path_not_misclassified() {
+    let repo = tempdir().unwrap();
+    init_repo_via_cli(repo.path());
+    let p = repo.path();
+    let run = |args: &[&str]| run_libra_command(args, p);
+    run(&["config", "set", "user.name", "t"]);
+    run(&["config", "set", "user.email", "t@t"]);
+    std::fs::write(p.join("f.txt"), "1\n").unwrap();
+    run(&["add", "f.txt"]);
+    run(&["commit", "-m", "c1", "--no-verify"]);
+
+    // Run from a subdirectory with `../f.txt` as the pathspec: it contains `..`
+    // but is a path, not a range, so it must succeed and filter by that file.
+    let sub = p.join("sub");
+    std::fs::create_dir_all(&sub).unwrap();
+    let out = run_libra_command(&["log", "../f.txt", "--pretty=%s"], &sub);
+    assert!(
+        out.status.success(),
+        "../f.txt pathspec should not error: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("c1"),
+        "should list commits touching f.txt: {stdout}"
+    );
+
+    // A range-syntax token that is NEITHER a valid revision NOR an existing path
+    // is a typoed revision and must error (not silently filter by a missing path).
+    let out = run_libra_command(&["log", "definitely-not-a-ref..HEAD", "--pretty=%s"], p);
+    assert!(!out.status.success(), "typoed revision range should error");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("unknown revision or path"),
+        "typo error should mention unknown revision or path: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
+// `log --trailer` / `--only-trailers` (Libra extensions, lore.md §1.9).
+// ---------------------------------------------------------------------------
+
+/// Three commits: one with a Reviewed-by trailer (via commit --trailer), one
+/// with -s + --trailer combined (regression: must form ONE trailer block), one
+/// with no trailers.
+fn trailer_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let commit_with = |file: &str, args: &[&str]| {
+        std::fs::write(p.join(file), file).unwrap();
+        assert_cli_success(&run_libra_command(&["add", file], p), "add");
+        let mut argv = vec!["commit", "--no-verify"];
+        argv.extend_from_slice(args);
+        assert_cli_success(&run_libra_command(&argv, p), "commit");
+    };
+    commit_with(
+        "a.txt",
+        &[
+            "-m",
+            "add a",
+            "--trailer",
+            "Reviewed-by: Alice <alice@example.com>",
+        ],
+    );
+    commit_with(
+        "b.txt",
+        &["-m", "add b", "-s", "--trailer", "Change-Id: I12345"],
+    );
+    commit_with("c.txt", &["-m", "add c"]);
+    repo
+}
+
+#[test]
+#[serial]
+fn test_log_trailer_filter_and_json() {
+    let repo = trailer_repo();
+    let p = repo.path();
+    // Key filter: only the Reviewed-by commit.
+    let out = run_libra_command(&["log", "--trailer", "reviewed-by", "--no-pager"], p);
+    assert_cli_success(&out, "trailer key filter");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("add a") && !text.contains("add b") && !text.contains("add c"));
+    // Key=value exact filter.
+    let out = run_libra_command(&["log", "--trailer", "Change-Id=I12345", "--no-pager"], p);
+    assert!(String::from_utf8_lossy(&out.stdout).contains("add b"));
+    let out = run_libra_command(&["log", "--trailer", "Change-Id=WRONG", "--no-pager"], p);
+    assert!(!String::from_utf8_lossy(&out.stdout).contains("add b"));
+    // -s + --trailer roundtrip: BOTH trailers live in one block, so filtering
+    // by the custom key finds the commit even though -s appended afterward.
+    let out = run_libra_command(&["log", "--trailer", "signed-off-by", "--no-pager"], p);
+    assert!(
+        String::from_utf8_lossy(&out.stdout).contains("add b"),
+        "-s + --trailer form one Git-parseable block"
+    );
+    // JSON: additive trailers field, empty for trailer-less commits.
+    let out = run_libra_command(&["--json", "log"], p);
+    assert_cli_success(&out, "json log");
+    let json = parse_json_stdout(&out);
+    let commits = json["data"]["commits"].as_array().expect("commits");
+    let by_subject = |subj: &str| {
+        commits
+            .iter()
+            .find(|c| c["subject"].as_str() == Some(subj))
+            .unwrap_or_else(|| panic!("missing {subj}"))
+    };
+    let a = by_subject("add a");
+    assert_eq!(a["trailers"][0]["key"].as_str(), Some("Reviewed-by"));
+    assert_eq!(
+        a["trailers"][0]["value"].as_str(),
+        Some("Alice <alice@example.com>")
+    );
+    let b = by_subject("add b");
+    let keys: Vec<&str> = b["trailers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|t| t["key"].as_str())
+        .collect();
+    assert!(
+        keys.contains(&"Change-Id") && keys.contains(&"Signed-off-by"),
+        "one block carries both: {keys:?}"
+    );
+    let c = by_subject("add c");
+    assert!(
+        c["trailers"].as_array().is_some_and(|a| a.is_empty()),
+        "trailer-less commit has an empty array"
+    );
+    // Filtered JSON agrees with the human path.
+    let out = run_libra_command(&["--json", "log", "--trailer", "reviewed-by"], p);
+    let json = parse_json_stdout(&out);
+    assert_eq!(json["data"]["commits"].as_array().unwrap().len(), 1);
+}
+
+#[test]
+#[serial]
+fn test_log_only_trailers_display_and_errors() {
+    let repo = trailer_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["log", "--only-trailers", "--no-pager"], p);
+    assert_cli_success(&out, "--only-trailers");
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        text.contains("Reviewed-by: Alice <alice@example.com>"),
+        "trailer lines shown: {text}"
+    );
+    assert!(
+        !text.contains("add a\n") || !text.contains("    add a"),
+        "message bodies replaced by trailer blocks"
+    );
+    // Key-filtered display via --trailer.
+    let out = run_libra_command(
+        &[
+            "log",
+            "--only-trailers",
+            "--trailer",
+            "change-id",
+            "--no-pager",
+        ],
+        p,
+    );
+    let text = String::from_utf8_lossy(&out.stdout);
+    assert!(text.contains("Change-Id: I12345"));
+    assert!(
+        !text.contains("Signed-off-by"),
+        "display filtered to the selected key: {text}"
+    );
+    // clap exclusions + empty key usage error.
+    let out = run_libra_command(&["log", "--only-trailers", "--oneline"], p);
+    assert_eq!(out.status.code(), Some(129), "conflicts with --oneline");
+    let out = run_libra_command(&["log", "--trailer", "=x", "--no-pager"], p);
+    assert_eq!(out.status.code(), Some(129), "empty key is a usage error");
 }

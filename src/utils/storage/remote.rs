@@ -169,6 +169,32 @@ impl Storage for RemoteStorage {
         self.inner.head(&path).await.is_ok()
     }
 
+    async fn delete_payload(&self, hash: &ObjectHash) -> Result<(), GitError> {
+        let path = self.hash_to_path(hash);
+        match self.inner.delete(&path).await {
+            Ok(()) => Ok(()),
+            // Idempotent: an already-absent blob is a success.
+            Err(object_store::Error::NotFound { .. }) => Ok(()),
+            Err(error) => Err(GitError::IOError(std::io::Error::other(format!(
+                "failed to delete durable-tier payload for {hash}: {error}"
+            )))),
+        }
+    }
+
+    async fn exist_checked(&self, hash: &ObjectHash) -> Result<bool, GitError> {
+        let path = self.hash_to_path(hash);
+        match self.inner.head(&path).await {
+            Ok(_) => Ok(true),
+            // A confirmed miss — the only case that may gate an eviction.
+            Err(object_store::Error::NotFound { .. }) => Ok(false),
+            // Everything else (outage, credentials, throttling) is an ERROR,
+            // never conflated with absence.
+            Err(error) => Err(GitError::IOError(std::io::Error::other(format!(
+                "durable-tier probe failed for {hash}: {error}"
+            )))),
+        }
+    }
+
     async fn search(&self, prefix: &str) -> Vec<ObjectHash> {
         let list_prefix = if prefix.len() >= 2 {
             // Optimization: Git objects are stored in xx/yyyy...
@@ -215,5 +241,20 @@ impl Storage for RemoteStorage {
             }
         }
         results
+    }
+
+    /// Bounded-concurrency batch existence probe (`lore.md` §0.6): fire up to
+    /// `max_connections()` HEAD requests at once instead of `N` sequential round
+    /// trips, preserving input order. Each probe inherits object_store's
+    /// 429/`SlowDown`/5xx backoff (lore.md §0.2). The concurrency cap is the
+    /// global `--max-connections` / `LIBRA_MAX_CONNECTIONS` limit (lore.md §0.9),
+    /// so a large batch on a big repo or CI run cannot exhaust connections.
+    async fn exist_batch(&self, hashes: &[ObjectHash]) -> Vec<bool> {
+        let max_concurrent = crate::utils::resource_limits::max_connections();
+        futures::stream::iter(hashes.iter().copied())
+            .map(|hash| async move { self.exist(&hash).await })
+            .buffered(max_concurrent)
+            .collect()
+            .await
     }
 }

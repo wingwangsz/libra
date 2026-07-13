@@ -73,10 +73,10 @@ pub const AI_SESSION_SCHEMA: &str = "libra.ai_session.v2";
 ///
 /// - [`HookTarget::AiIntent`] — the canonical `refs/libra/intent` writer used
 ///   by `libra code` and the existing Claude/Gemini hook configs.
-/// - [`HookTarget::AgentTraces`] — the new external-Agent capture writer
-///   that lives on `refs/libra/traces`. **Phase 1 stub**: the variant
-///   exists for API surface stability, but the runtime currently rejects it
-///   with a clear "not yet wired" message; Phase 2 lands the actual writer.
+/// - [`HookTarget::AgentTraces`] — the external-Agent capture writer that
+///   lives on `refs/libra/traces`. Fully wired: the runtime ingests the
+///   lifecycle event into `agent_session` and writes an E4-libra checkpoint
+///   commit on `SessionEnd` (see [`ingest_agent_traces_payload`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HookTarget {
     AiIntent,
@@ -162,16 +162,24 @@ pub async fn process_hook_event_from_stdin(
     process_hook_event_with_target(command, expected_kind, provider, HookTarget::AiIntent).await
 }
 
+/// Marker error for hook-envelope validation failures (size / UTF-8 / empty
+/// / JSON / schema / transcript-path). A0-03: the command layer
+/// (`command/agent/hooks.rs`) maps any ingest error whose chain carries this
+/// to the stable `LBR-AGENT-008` (`AgentHookEnvelopeInvalid`) code; genuine
+/// runtime failures (DB open, storage resolution, redaction) stay generic
+/// fatals so an envelope reject never masquerades as an internal error.
+#[derive(Debug, thiserror::Error)]
+#[error("{0}")]
+pub struct HookEnvelopeInvalid(pub String);
+
 /// Parametric form of [`process_hook_event_from_stdin`] that selects the
 /// writer destination via [`HookTarget`].
 ///
-/// CEX-EntireIO Phase 1.5: this is the seam Phase 2 grows into. For
-/// [`HookTarget::AiIntent`] the function is exactly the historical behaviour
-/// (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the function
-/// runs a Phase 1 minimal ingest — stdin parse, validate, redact, and
-/// upsert into `agent_session` — and returns. Phase 2 will extend the
-/// AgentTraces branch to additionally generate checkpoint commits on
-/// `refs/libra/traces`.
+/// For [`HookTarget::AiIntent`] the function is exactly the historical
+/// behaviour (1:1 byte-compatible). For [`HookTarget::AgentTraces`] the
+/// function runs the external-Agent capture ingest — stdin parse, validate,
+/// redact, upsert into `agent_session`, and (on `SessionEnd`) write an
+/// E4-libra checkpoint commit on `refs/libra/traces`.
 pub async fn process_hook_event_with_target(
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -405,13 +413,13 @@ pub async fn process_hook_event_with_target(
     Ok(())
 }
 
-/// Load `core.objectformat` from the local repository and pin the global hash kind.
-/// CEX-EntireIO Phase 1: minimal AgentTraces ingest.
+/// External-Agent capture ingest (`refs/libra/traces`).
 ///
 /// Reads the hook envelope from stdin, validates, parses to a
 /// [`LifecycleEvent`], redacts free-form fields, and upserts into
-/// `agent_session`. Does NOT yet generate checkpoint commits on
-/// `refs/libra/traces` — that is Phase 2 work.
+/// `agent_session`. On `SessionEnd` it also writes an E4-libra checkpoint
+/// commit on `refs/libra/traces` (it resolves the storage path and calls
+/// [`ingest_agent_traces_payload`] with `Some(repo_path)`).
 ///
 /// Boundary conditions:
 /// - Idempotent on repeated `SessionStart` for the same provider session
@@ -430,7 +438,10 @@ async fn ingest_agent_traces(
         .read_to_end(&mut stdin_bytes)
         .context("failed to read stdin")?;
     if stdin_bytes.len() > MAX_STDIN_BYTES {
-        bail!("hook input exceeds {MAX_STDIN_BYTES} bytes");
+        // A0-03: envelope-size reject → LBR-AGENT-008 at the command layer.
+        return Err(
+            HookEnvelopeInvalid(format!("hook input exceeds {MAX_STDIN_BYTES} bytes")).into(),
+        );
     }
 
     // Resolve storage and pin hash kind, exactly as the AiIntent flow does,
@@ -458,19 +469,21 @@ async fn ingest_agent_traces(
     .await
 }
 
-/// Connection-bound core of [`ingest_agent_traces`]. `pub(crate)` so unit
-/// tests in this module can drive the function without stubbing stdin or
-/// the process-wide working directory; it is intentionally NOT re-exported
-/// from the crate root. Fully deterministic given `payload`, the
-/// connection, and (optionally) `repo_path` — round-2 BLOCK #10 acceptance
-/// criterion.
+/// Connection-bound core of [`ingest_agent_traces`]. `pub` for the AG-19
+/// span integration tests (`tests/agent_hook_span_test.rs`), which must
+/// drive an in-process ingest under a fake tracing sink — NOT a stable
+/// API, and intentionally not re-exported from the crate root. Unit tests
+/// in this module use it for the same reason: no stdin stubbing, no
+/// process-wide working-directory mutation. Fully deterministic given
+/// `payload`, the connection, and (optionally) `repo_path` — round-2
+/// BLOCK #10 acceptance criterion.
 ///
 /// `repo_path` is the `.libra` directory used to resolve the Git object
 /// store for checkpoint commit creation (Phase 2.1). Passing `None` skips
 /// the checkpoint commit step on `SessionEnd` and only persists the
 /// `agent_session` summary; tests use that path so they don't need a live
 /// `libra init` workspace.
-pub(crate) async fn ingest_agent_traces_payload(
+pub async fn ingest_agent_traces_payload(
     payload: &[u8],
     command: super::provider::ProviderHookCommand,
     expected_kind: LifecycleEventKind,
@@ -482,17 +495,68 @@ pub(crate) async fn ingest_agent_traces_payload(
 
     use crate::internal::ai::observed_agents::{RedactionMatch, Redactor};
 
+    // AG-19 observability (`agent.md` 落地执行补充规格 §6): one span per
+    // ingest with required fields present and raw stdin / tool_input
+    // deliberately absent. Fields unknown at open time are recorded later.
+    let ingest_span = tracing::info_span!(
+        "agent.hook.ingest",
+        provider = provider.provider_name(),
+        verb = %command,
+        event_kind = tracing::field::Empty,
+        frame_bytes = payload.len() as u64,
+        validated = tracing::field::Empty,
+        partial = tracing::field::Empty,
+    );
+
+    // A0-03: every envelope-content validation failure carries
+    // [`HookEnvelopeInvalid`] so the command layer maps it to
+    // `LBR-AGENT-008`, distinct from downstream store/runtime failures.
     if payload.len() > MAX_STDIN_BYTES {
-        bail!("hook input exceeds {MAX_STDIN_BYTES} bytes");
+        ingest_span.record("validated", false);
+        return Err(
+            HookEnvelopeInvalid(format!("hook input exceeds {MAX_STDIN_BYTES} bytes")).into(),
+        );
     }
-    let stdin = std::str::from_utf8(payload).context("hook input is not valid UTF-8")?;
+    let stdin = std::str::from_utf8(payload)
+        .map_err(|err| HookEnvelopeInvalid(format!("hook input is not valid UTF-8: {err}")))?;
     if stdin.trim().is_empty() {
-        bail!("hook input is empty");
+        ingest_span.record("validated", false);
+        return Err(HookEnvelopeInvalid("hook input is empty".to_string()).into());
     }
 
-    let envelope: SessionHookEnvelope =
-        serde_json::from_str(stdin).map_err(|err| anyhow!("invalid hook JSON payload: {err}"))?;
-    validate_session_hook_envelope(&envelope, MAX_TRANSCRIPT_PATH_BYTES)?;
+    let envelope: SessionHookEnvelope = serde_json::from_str(stdin)
+        .map_err(|err| HookEnvelopeInvalid(format!("invalid hook JSON payload: {err}")))?;
+    if let Err(err) = validate_session_hook_envelope(&envelope, MAX_TRANSCRIPT_PATH_BYTES) {
+        ingest_span.record("validated", false);
+        return Err(HookEnvelopeInvalid(format!("{err}")).into());
+    }
+    ingest_span.record("validated", true);
+
+    // Test-only crash knob (强制补强项 #10, `tests/agent_hook_crash_test.rs`):
+    // panic after the payload has been fully read and validated but before
+    // any database write, so crash-regression tests can prove a mid-ingest
+    // failure leaves no partial session/checkpoint state and echoes no raw
+    // stdin bytes. Mirrors the `LIBRA_TEST_*` env convention; never set in
+    // production.
+    if std::env::var_os("LIBRA_TEST_HOOK_PANIC_AFTER_READ").is_some() {
+        panic!("test-injected hook panic (LIBRA_TEST_HOOK_PANIC_AFTER_READ)");
+    }
+
+    // AG-19 forward compatibility: an event name this build does not know
+    // (newer upstream agent) is skipped-and-logged — never a panic, never
+    // a checkpoint write, never a blocker for later known events.
+    if !provider.recognizes_event(&envelope.hook_event_name) {
+        ingest_span.record("partial", true);
+        let _entered = ingest_span.enter();
+        tracing::warn!(
+            target: "agent.hook.ingest",
+            provider = provider.provider_name(),
+            hook_event_name = %envelope.hook_event_name,
+            reason = "unknown_event_type",
+            "skipping unrecognized lifecycle event name"
+        );
+        return Ok(());
+    }
 
     let mut event = provider.parse_hook_event(&envelope.hook_event_name, &envelope)?;
     if event.kind != expected_kind {
@@ -503,31 +567,53 @@ pub(crate) async fn ingest_agent_traces_payload(
             envelope.hook_event_name
         );
     }
+    ingest_span.record("event_kind", tracing::field::display(event.kind));
+    ingest_span.record("partial", false);
 
-    // Redact free-form text fields before they get anywhere near durable
-    // storage. We aggregate the per-field reports into a single JSON document
-    // that lands in `agent_session.redaction_report` so the persisted row is
-    // observably scrubbed (Codex round-3 review: "assert observable redaction
+    // Redact every free-form text field before it gets anywhere near
+    // durable storage (AG-19 redaction-before-persist: prompt, tool
+    // input/response and assistant message alike). We aggregate the
+    // per-field reports into a single JSON document that lands in
+    // `agent_session.redaction_report` so the persisted row is observably
+    // scrubbed (Codex round-3 review: "assert observable redaction
     // outcome").
-    let redactor = Redactor::new_default();
-    let mut all_matches: Vec<RedactionMatch> = Vec::new();
-    let mut bytes_scanned: usize = 0;
-    let mut bytes_redacted: usize = 0;
-    if let Some(prompt) = event.prompt.take() {
-        let (redacted, report) = redactor.redact(prompt.as_bytes());
-        event.prompt = Some(String::from_utf8_lossy(redacted.bytes()).into_owned());
-        bytes_scanned += report.bytes_scanned;
-        bytes_redacted += report.bytes_redacted;
-        all_matches.extend(report.matches);
-    }
-    if let Some(input) = event.tool_input.take() {
-        let serialized = serde_json::to_vec(&input).unwrap_or_default();
-        let (redacted, report) = redactor.redact(&serialized);
-        event.tool_input = serde_json::from_slice(redacted.bytes()).ok();
-        bytes_scanned += report.bytes_scanned;
-        bytes_redacted += report.bytes_redacted;
-        all_matches.extend(report.matches);
-    }
+    let redaction_span = tracing::info_span!(
+        "agent.redaction.apply",
+        rules_hit = tracing::field::Empty,
+        size_cap_triggered = false,
+        fail_closed = false,
+    );
+    let (all_matches, bytes_scanned, bytes_redacted) = redaction_span.in_scope(|| {
+        let redactor = Redactor::new_default();
+        let mut all_matches: Vec<RedactionMatch> = Vec::new();
+        let mut bytes_scanned: usize = 0;
+        let mut bytes_redacted: usize = 0;
+        let mut redact_string = |value: &mut Option<String>| {
+            if let Some(text) = value.take() {
+                let (redacted, report) = redactor.redact(text.as_bytes());
+                *value = Some(String::from_utf8_lossy(redacted.bytes()).into_owned());
+                bytes_scanned += report.bytes_scanned;
+                bytes_redacted += report.bytes_redacted;
+                all_matches.extend(report.matches);
+            }
+        };
+        redact_string(&mut event.prompt);
+        redact_string(&mut event.assistant_message);
+        let mut redact_value = |value: &mut Option<serde_json::Value>| {
+            if let Some(inner) = value.take() {
+                let serialized = serde_json::to_vec(&inner).unwrap_or_default();
+                let (redacted, report) = redactor.redact(&serialized);
+                *value = serde_json::from_slice(redacted.bytes()).ok();
+                bytes_scanned += report.bytes_scanned;
+                bytes_redacted += report.bytes_redacted;
+                all_matches.extend(report.matches);
+            }
+        };
+        redact_value(&mut event.tool_input);
+        redact_value(&mut event.tool_response);
+        (all_matches, bytes_scanned, bytes_redacted)
+    });
+    redaction_span.record("rules_hit", all_matches.len() as u64);
     let redaction_report_json = serde_json::to_string(&serde_json::json!({
         "matches": all_matches,
         "bytes_scanned": bytes_scanned,
@@ -562,6 +648,56 @@ pub(crate) async fn ingest_agent_traces_payload(
         "gemini" => "gemini",
         other => other,
     };
+
+    // AG-19 owner filtering: first-writer-wins by recorded owner agent
+    // kind per provider session id, so two adapters forwarding the same
+    // underlying session cannot double-write checkpoints. SessionStart /
+    // TurnStart are exempt (they may establish a claim); every other
+    // event from a non-owner agent kind is skipped-and-logged, never a
+    // hard error (`agent.md` AG-19 owner-filtering row).
+    //
+    // Ownership is `rowid ASC` — true insertion order. `agent_session` is
+    // an ordinary rowid table and the UPSERT preserves rowids, so the
+    // first physically-inserted claim wins permanently. The previous
+    // `(started_at ASC, session_id ASC)` ordering used second-granularity
+    // timestamps: a later-arriving row inserted within the same second
+    // could win the lexicographic tiebreak AFTER the earlier row's owner
+    // had already confirmed and written a checkpoint, yielding
+    // checkpoints from two agent kinds for one provider session (caught
+    // by `agent_lifecycle_event_test::
+    // simultaneous_stop_race_yields_single_owner_checkpoints`).
+    if !matches!(
+        event.kind,
+        LifecycleEventKind::SessionStart | LifecycleEventKind::TurnStart
+    ) {
+        let owner_row = conn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT agent_kind FROM agent_session WHERE provider_session_id = ? \
+                 ORDER BY rowid ASC LIMIT 1",
+                [envelope.session_id.clone().into()],
+            ))
+            .await
+            .context("failed to query agent_session owner claim")?;
+        if let Some(row) = owner_row {
+            let owner_kind: String = row
+                .try_get("", "agent_kind")
+                .context("failed to read agent_session owner kind")?;
+            if owner_kind != agent_kind {
+                ingest_span.record("partial", true);
+                let _entered = ingest_span.enter();
+                tracing::warn!(
+                    target: "agent.hook.ingest",
+                    provider = provider.provider_name(),
+                    owner = %owner_kind,
+                    event_kind = %event.kind,
+                    reason = "owner_mismatch",
+                    "skipping non-owner lifecycle event (first-writer-wins)"
+                );
+                return Ok(());
+            }
+        }
+    }
 
     let new_state = match event.kind {
         LifecycleEventKind::SessionStart => "active",
@@ -631,21 +767,84 @@ pub(crate) async fn ingest_agent_traces_payload(
     // checkpoints give `libra agent checkpoint rewind` turn-level granularity.
     if matches!(
         event.kind,
-        LifecycleEventKind::SessionEnd | LifecycleEventKind::TurnEnd
+        LifecycleEventKind::SessionEnd
+            | LifecycleEventKind::TurnEnd
+            | LifecycleEventKind::SubagentStart
+            | LifecycleEventKind::SubagentEnd
     ) && let Some(repo) = repo_path
     {
-        write_committed_checkpoint(
-            conn,
-            repo,
-            &session_id,
-            &envelope,
-            agent_kind,
-            event.prompt.as_deref(),
-            &redaction_report_json,
-            &all_matches,
-            now,
-        )
-        .await?;
+        // AG-19 owner-race closure: the pre-upsert owner check above is a
+        // fast path, but two providers racing on a fresh provider session
+        // can BOTH pass it (each sees no owner) and both upsert. Re-read
+        // the claim now that our row is durably in place. Ordering by
+        // `rowid ASC` makes this confirmation *monotone*: an existing
+        // row's rowid never changes and no later insert can obtain a
+        // smaller one, so once a racer confirms itself as owner no
+        // subsequently-arriving row can flip the answer — exactly one of
+        // the racers writes the checkpoint. The loser keeps its metadata
+        // row but is skipped fail-closed here.
+        let confirmed_owner: String = conn
+            .query_one(Statement::from_sql_and_values(
+                backend,
+                "SELECT agent_kind FROM agent_session WHERE provider_session_id = ? \
+                 ORDER BY rowid ASC LIMIT 1",
+                [envelope.session_id.clone().into()],
+            ))
+            .await
+            .context("failed to re-confirm agent_session owner claim")?
+            .map(|row| row.try_get("", "agent_kind"))
+            .transpose()
+            .context("failed to read confirmed agent_session owner kind")?
+            .unwrap_or_else(|| agent_kind.to_string());
+        if confirmed_owner != agent_kind {
+            ingest_span.record("partial", true);
+            let _entered = ingest_span.enter();
+            tracing::warn!(
+                target: "agent.hook.ingest",
+                provider = provider.provider_name(),
+                owner = %confirmed_owner,
+                event_kind = %event.kind,
+                reason = "owner_mismatch",
+                "skipping checkpoint write for non-owner (post-upsert confirmation)"
+            );
+            return Ok(());
+        }
+        // A0-02: `SubagentStart` / `SubagentEnd` boundaries materialise an
+        // independent `scope='subagent'` checkpoint (its own `traces`
+        // commit + `agent_checkpoint` row) that carries parent session /
+        // checkpoint linkage, so `checkpoint list/show/export/prune` and
+        // `doctor` surface nested runs as first-class checkpoints instead of
+        // leaving them as bounded `subagent_events` metadata on the main
+        // checkpoint. `SessionEnd` / `TurnEnd` keep the `committed` path.
+        if matches!(
+            event.kind,
+            LifecycleEventKind::SubagentStart | LifecycleEventKind::SubagentEnd
+        ) {
+            write_subagent_checkpoint(
+                conn,
+                repo,
+                &session_id,
+                &envelope,
+                agent_kind,
+                &event,
+                &redaction_report_json,
+                now,
+            )
+            .await?;
+        } else {
+            write_committed_checkpoint(
+                conn,
+                repo,
+                &session_id,
+                &envelope,
+                agent_kind,
+                &event,
+                &redaction_report_json,
+                &all_matches,
+                now,
+            )
+            .await?;
+        }
     }
 
     Ok(())
@@ -727,10 +926,24 @@ async fn session_concurrent_active(
 }
 
 /// Write a `committed` checkpoint (for a `TurnEnd` or `SessionEnd` event):
-/// materialise the redacted transcript + metadata blobs, append a commit on
+/// materialise the E4-libra tree (metadata.json, manifest.json,
+/// events/lifecycle.jsonl, transcript/<agent_kind>.jsonl,
+/// redaction_report.json, content_hash.txt), append a commit on
 /// `refs/libra/traces`, and insert the corresponding `agent_checkpoint`
 /// row. Errors are surfaced verbatim — a failure here means the ingest cannot
 /// acknowledge the checkpoint to the caller.
+///
+/// `event` is the (already-redacted) triggering lifecycle event; it feeds
+/// both the canonical `events/lifecycle.jsonl` line and metadata.json's
+/// `model` field, and its redacted prompt is the transcript fallback when
+/// the adapter advertises no readable transcript.
+///
+/// Write sequence + crash windows (AG-20, see the write-sequence matrix in
+/// `docs/development/tracing/agent.md`): an in-flight marker is (best-effort)
+/// persisted BEFORE stage (a) and cleared AFTER stage (d); between ref CAS
+/// (c) and catalog INSERT (d) the catalog is probed by `traces_commit` so a
+/// retry — or a doctor repair that already backfilled the row — never
+/// double-inserts.
 #[allow(clippy::too_many_arguments)]
 async fn write_committed_checkpoint(
     conn: &sea_orm::DatabaseConnection,
@@ -738,17 +951,17 @@ async fn write_committed_checkpoint(
     libra_session_id: &str,
     envelope: &SessionHookEnvelope,
     agent_kind: &str,
-    redacted_prompt: Option<&str>,
+    event: &LifecycleEvent,
     redaction_report_json: &str,
     redaction_matches: &[crate::internal::ai::observed_agents::RedactionMatch],
     now: i64,
 ) -> Result<()> {
-    use sea_orm::{ConnectionTrait, Statement};
-
     use crate::internal::ai::{
-        history::{CheckpointCommitParams, CheckpointScope, HistoryManager},
+        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
         observed_agents::{AgentKind, AgentSessionCtx, RedactedBytes, Redactor, agent_for},
     };
+
+    let redacted_prompt = event.prompt.as_deref();
 
     // Capture the agent's full on-disk transcript for the checkpoint blob.
     // The prompt-only stopgap is replaced by the adapter's `read_transcript`:
@@ -763,6 +976,10 @@ async fn write_committed_checkpoint(
         .unwrap_or_else(|_| serde_json::json!({}));
     let prompt_fallback =
         || RedactedBytes::new_unchecked(redacted_prompt.unwrap_or("").as_bytes().to_vec());
+    // AG-21: keep the raw transcript bytes in scope (never persisted) so
+    // the adapter's extraction capabilities can derive metadata from them
+    // after the redacted blob is produced.
+    let mut transcript_raw_for_extraction: Option<Vec<u8>> = None;
     let transcript_redacted = match AgentKind::from_db_str(agent_kind) {
         Some(kind) => {
             let adapter = agent_for(kind);
@@ -791,6 +1008,7 @@ async fn write_committed_checkpoint(
                     Ok(Some(raw)) if !raw.is_empty() => {
                         let (redacted, report) = Redactor::new_default().redact(&raw);
                         merge_redaction_report_into(&mut report_value, &report);
+                        transcript_raw_for_extraction = Some(raw);
                         redacted
                     }
                     Ok(_) => prompt_fallback(),
@@ -809,20 +1027,35 @@ async fn write_committed_checkpoint(
         None => prompt_fallback(),
     };
 
-    // Build a minimal metadata.json. Phase 2 keeps the schema small; later
-    // phases extend with model_info, tool_use_id, subagent links, etc.
+    // Build metadata.json (external schema v2 — v1 fields plus `model`;
+    // strictly additive so v1 readers keep working). `model` mirrors the
+    // E4-entire tolerance: taken from the triggering lifecycle event when
+    // present, else the literal "unknown".
+    let redaction_report_value = report_value.clone();
+    // AG-21 transcript intelligence: derive token usage / model / skill
+    // events from the raw transcript via the adapter's capability
+    // accessors. Strictly fail-open — extraction problems mark the
+    // metadata `partial` with redacted warnings and never block the
+    // checkpoint write (redaction/path/write paths stay fail-closed).
+    let extraction_value =
+        build_extraction_metadata(agent_kind, transcript_raw_for_extraction.as_deref());
     let metadata = serde_json::json!({
-        "schema_version": 1,
+        "schema_version": history::CHECKPOINT_METADATA_SCHEMA_VERSION,
         "checkpoint_id": null, // filled in below once we have the UUID
         "session_id": libra_session_id,
         "agent_kind": agent_kind,
         "scope": "committed",
         "provider_session_id": envelope.session_id,
         "working_dir": envelope.cwd,
+        "model": checkpoint_model_field(event.model.as_ref()),
         "redaction_report": report_value,
         "created_at": now,
+        "extraction": extraction_value,
     });
 
+    // Fresh id per write attempt — it names both the catalog row and the
+    // tree path, so it must exist before any blob/tree is built. Retry
+    // dedup happens later at the traces_commit probe, not here.
     let checkpoint_id = uuid::Uuid::new_v4().to_string();
     let mut metadata = metadata;
     if let Some(obj) = metadata.as_object_mut() {
@@ -833,8 +1066,62 @@ async fn write_committed_checkpoint(
     }
     let metadata_bytes =
         serde_json::to_vec_pretty(&metadata).context("serialize checkpoint metadata")?;
+    // AG-19 / G4 redaction-before-persist: every blob entering the traces
+    // writer is a `RedactedBytes`, so no `&[u8]` can reach the checkpoint
+    // sink. The pass is idempotent defense-in-depth — these buffers are
+    // already built from redacted extraction outputs / rule-hit statistics,
+    // and the redactor skips existing `<REDACTED:…>` spans.
+    let (metadata_redacted, _) = Redactor::new_default().redact(&metadata_bytes);
 
-    let provider_name = envelope_provider_slug(agent_kind);
+    // Canonical E3-JSONL evidence line(s) for events/lifecycle.jsonl —
+    // exactly the redacted triggering event today; the slice API keeps
+    // multi-event batches source-compatible.
+    let canonical_ctx = super::lifecycle::CanonicalEventContext {
+        agent_kind,
+        session_id: libra_session_id,
+        provider_session_id: &envelope.session_id,
+        provenance: serde_json::json!({
+            "channel": "hook",
+            "hook_event_name": envelope.hook_event_name,
+        }),
+    };
+    let lifecycle_events_jsonl =
+        super::lifecycle::lifecycle_events_to_canonical_jsonl(&[event], &canonical_ctx);
+    let (lifecycle_events_redacted, _) = Redactor::new_default().redact(&lifecycle_events_jsonl);
+    let redaction_report_bytes = serde_json::to_vec_pretty(&redaction_report_value)
+        .context("serialize checkpoint redaction_report.json")?;
+    let (redaction_report_redacted, _) = Redactor::new_default().redact(&redaction_report_bytes);
+
+    // AG-20 observability (`agent.md` §6): one span per checkpoint write.
+    // Required fields: checkpoint_id, session_id, stage (progression),
+    // cas_retries, object_count. The transcript body is deliberately never
+    // recorded.
+    let write_span = tracing::info_span!(
+        "agent.checkpoint.write",
+        checkpoint_id = %checkpoint_id,
+        session_id = %libra_session_id,
+        stage = tracing::field::Empty,
+        cas_retries = tracing::field::Empty,
+        object_count = tracing::field::Empty,
+    );
+    write_span.record("stage", "marker");
+
+    // Window A/B guard: persist the in-flight marker BEFORE stage (a).
+    // Best-effort — a marker failure warns and continues (the checkpoint
+    // must not be lost over its advisory guard), but when the call
+    // succeeds the marker IS durably in SQLite before any blob exists.
+    let marker = history::TracesInflightMarker::new(
+        libra_session_id,
+        &checkpoint_id,
+        Utc::now().timestamp_millis(),
+    );
+    if let Err(err) = history::write_traces_inflight_marker(conn, &marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to persist traces in-flight marker; continuing without window guard"
+        );
+    }
 
     let objects_dir = repo_path.join("objects");
     std::fs::create_dir_all(&objects_dir).context("create objects dir for checkpoint commit")?;
@@ -878,6 +1165,8 @@ async fn write_committed_checkpoint(
             }
         };
 
+    // Stages (a)–(c): blobs, trees, commit, ref CAS.
+    write_span.record("stage", "append");
     let written = manager
         .append_checkpoint_commit(CheckpointCommitParams {
             checkpoint_id: &checkpoint_id,
@@ -886,38 +1175,717 @@ async fn write_committed_checkpoint(
             parent_commit: parent_commit.as_deref(),
             scope: CheckpointScope::Committed,
             tool_use_id: None,
-            metadata_json: &metadata_bytes,
+            metadata_json: &metadata_redacted,
             transcript_redacted: &transcript_redacted,
-            provider_name,
-            events_jsonl: None,
+            lifecycle_events_jsonl: &lifecycle_events_redacted,
+            redaction_report_json: &redaction_report_redacted,
         })
         .await
         .context("failed to append checkpoint commit on traces")?;
+    write_span.record("cas_retries", written.cas_retries);
+    write_span.record("object_count", written.object_count);
+    write_span.record("stage", "ref_cas_done");
 
-    let parent_commit_value: sea_orm::Value = parent_commit.clone().into();
-    conn.execute(Statement::from_sql_and_values(
-        conn.get_database_backend(),
-        "INSERT INTO agent_checkpoint (
-            checkpoint_id, session_id, scope, parent_commit, tree_oid,
-            metadata_blob_oid, traces_commit, created_at
-         ) VALUES (?, ?, 'committed', ?, ?, ?, ?, ?)",
-        [
-            checkpoint_id.into(),
-            libra_session_id.into(),
-            parent_commit_value,
-            written.tree_oid.to_string().into(),
-            written.metadata_blob_oid.to_string().into(),
-            written.commit_hash.to_string().into(),
-            now.into(),
-        ],
-    ))
-    .await
-    .context("failed to insert agent_checkpoint row")?;
+    // Extend the marker with the CAS'd commit + top OIDs (best-effort) so
+    // a window-B prune can protect the exact commit until stage (d) lands.
+    let mut committed_marker = marker.clone();
+    committed_marker.commit = Some(written.commit_hash.to_string());
+    committed_marker.oids = vec![
+        written.tree_oid.to_string(),
+        written.metadata_blob_oid.to_string(),
+    ];
+    if let Err(err) = history::write_traces_inflight_marker(conn, &committed_marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to refresh traces in-flight marker after ref CAS"
+        );
+    }
+
+    // Stage (d), idempotent.
+    write_span.record("stage", "catalog");
+    let inserted = insert_agent_checkpoint_row_idempotent(
+        conn,
+        &AgentCheckpointRow {
+            checkpoint_id: &checkpoint_id,
+            session_id: libra_session_id,
+            parent_commit: parent_commit.as_deref(),
+            tree_oid: &written.tree_oid.to_string(),
+            metadata_blob_oid: &written.metadata_blob_oid.to_string(),
+            traces_commit: &written.commit_hash.to_string(),
+            created_at: now,
+        },
+    )
+    .await?;
+    if !inserted {
+        write_span.record("stage", "catalog_deduped");
+    }
+
+    // Stage (d) complete — release the window guard (best-effort; an
+    // orphaned marker expires via its TTL).
+    if let Err(err) =
+        history::clear_traces_inflight_marker(conn, libra_session_id, &checkpoint_id).await
+    {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to clear traces in-flight marker after catalog insert"
+        );
+    }
+    write_span.record("stage", "done");
 
     // Suppress the unused-warning for redaction_matches; reserved for a
     // Phase 3 enhancement that adds per-rule counters to metadata.
     let _ = redaction_matches;
     Ok(())
+}
+
+/// A0-02: materialise an independent `scope='subagent'` checkpoint at a
+/// `SubagentStart` / `SubagentEnd` boundary.
+///
+/// Unlike [`write_committed_checkpoint`], this path deliberately does NOT
+/// re-read the parent agent's on-disk transcript — a subagent boundary event
+/// carries no separate transcript, and the parent session's `committed`
+/// checkpoints already capture the full transcript. The subagent checkpoint's
+/// tree carries a compact `metadata.json` describing the boundary (kind,
+/// tool, source, timestamp, parent linkage) with an empty transcript blob, so
+/// it is fully `list/show/export/prune/doctor`-able while staying cheap to
+/// write. Parent linkage (`parent_checkpoint_id`) points at the session's
+/// most recent `committed` checkpoint so `checkpoint show` can walk from a
+/// nested run back to the enclosing turn/session checkpoint.
+///
+/// Crash-safety mirrors the committed path: an in-flight marker is persisted
+/// before the traces commit and cleared after the catalog INSERT, so a
+/// concurrent prune in the ref-CAS→catalog window cannot drop the commit.
+#[allow(clippy::too_many_arguments)]
+async fn write_subagent_checkpoint(
+    conn: &sea_orm::DatabaseConnection,
+    repo_path: &std::path::Path,
+    libra_session_id: &str,
+    envelope: &SessionHookEnvelope,
+    agent_kind: &str,
+    event: &LifecycleEvent,
+    redaction_report_json: &str,
+    now: i64,
+) -> Result<()> {
+    use crate::internal::ai::{
+        history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
+        observed_agents::{RedactedBytes, Redactor},
+    };
+
+    // Resolve the parent `committed` checkpoint (if any) for linkage.
+    let parent_checkpoint_id = latest_committed_checkpoint_id(conn, libra_session_id).await?;
+
+    let boundary = match event.kind {
+        LifecycleEventKind::SubagentStart => "start",
+        _ => "end",
+    };
+    // The subagent boundary hook envelope carries only `session_id` + `cwd`
+    // (see the Codex `SubagentStop` row in agent.md) — no distinct subagent
+    // id and no tool-use id. We therefore leave `subagent_session_id` /
+    // `tool_use_id` NULL rather than inventing them: in particular
+    // `event.session_ref` is filled from the transcript PATH by
+    // `build_lifecycle_event`, so persisting it as a subagent id would both
+    // mislabel the column and leak a filesystem path. The tool NAME (if the
+    // provider ever surfaces one) is recorded in the metadata / description
+    // for context only; the id columns stay reserved for a future provider
+    // that emits a real subagent/tool-use id.
+    let tool_name = event.tool_name.clone();
+    let subagent_session_id: Option<String> = None;
+    let tool_use_id: Option<String> = None;
+    // Redact the description before it lands in either the catalog row or
+    // metadata.json — `tool_name` is event-derived and could carry a path.
+    // Redacting once keeps the row's `description` column and the
+    // metadata.json `description` (which doctor rebuilds the row from) byte
+    // -identical.
+    let description = redact_extracted_string(&match tool_name.as_deref() {
+        Some(t) => format!("subagent {boundary} via {t}"),
+        None => format!("subagent {boundary}"),
+    });
+
+    let checkpoint_id = uuid::Uuid::new_v4().to_string();
+
+    // Compact metadata.json. Boundary/source/tool are event-derived and may
+    // reference file paths, so the whole object passes the default redactor
+    // before persist (same discipline as the committed writer's metadata).
+    let source_redacted = event.source.clone().map(redact_extracted_json);
+    let metadata = serde_json::json!({
+        "schema_version": 1,
+        "checkpoint_id": checkpoint_id,
+        "session_id": libra_session_id,
+        "agent_kind": agent_kind,
+        "scope": "subagent",
+        "provider_session_id": envelope.session_id,
+        "working_dir": envelope.cwd,
+        "created_at": now,
+        // Flat linkage fields (A0-02): the subagent-scope class-2 doctor
+        // repair rebuilds the catalog row straight from these, mirroring the
+        // committed path's metadata-driven repair.
+        "parent_checkpoint_id": parent_checkpoint_id,
+        "subagent_session_id": subagent_session_id,
+        "tool_use_id": tool_use_id,
+        "description": description,
+        "subagent": {
+            "boundary": boundary,
+            "kind": event.kind.to_string(),
+            "tool": tool_name,
+            "source": source_redacted,
+            "timestamp": event.timestamp.to_rfc3339(),
+        },
+    });
+    let metadata_bytes =
+        serde_json::to_vec_pretty(&metadata).context("serialize subagent checkpoint metadata")?;
+    let (metadata_redacted, _) = Redactor::new_default().redact(&metadata_bytes);
+
+    // Empty transcript — the boundary carries no separate transcript body.
+    let transcript_redacted = RedactedBytes::new_unchecked(Vec::new());
+
+    // One canonical lifecycle evidence line for the boundary event.
+    let canonical_ctx = super::lifecycle::CanonicalEventContext {
+        agent_kind,
+        session_id: libra_session_id,
+        provider_session_id: &envelope.session_id,
+        provenance: serde_json::json!({
+            "channel": "hook",
+            "hook_event_name": envelope.hook_event_name,
+        }),
+    };
+    // Defense-in-depth (Codex A0-02 re-review): `build_lifecycle_event`
+    // fills `session_ref` from the transcript PATH, and the default redactor
+    // does not reliably scrub arbitrary absolute paths — so a `SubagentStop`
+    // serialized verbatim would persist that local path in the syncable
+    // `events/lifecycle.jsonl` blob. Clear `session_ref` (and the unused
+    // prompt body) on a sanitized copy before serialization; a subagent
+    // boundary marker needs neither field.
+    let mut sidecar_event = event.clone();
+    sidecar_event.session_ref = None;
+    sidecar_event.prompt = None;
+    let lifecycle_events_jsonl =
+        super::lifecycle::lifecycle_events_to_canonical_jsonl(&[&sidecar_event], &canonical_ctx);
+    let (lifecycle_events_redacted, _) = Redactor::new_default().redact(&lifecycle_events_jsonl);
+
+    let report_value = serde_json::from_str::<serde_json::Value>(redaction_report_json)
+        .unwrap_or_else(|_| serde_json::json!({}));
+    let redaction_report_bytes = serde_json::to_vec_pretty(&report_value)
+        .context("serialize subagent checkpoint redaction_report.json")?;
+    let (redaction_report_redacted, _) = Redactor::new_default().redact(&redaction_report_bytes);
+
+    // Parent user-branch HEAD (same semantics/tolerance as committed path).
+    let parent_commit: Option<String> =
+        match crate::internal::head::Head::current_commit_result_with_conn(conn).await {
+            Ok(commit) => commit.map(|h| h.to_string()),
+            Err(crate::internal::branch::BranchStoreError::Corrupt { detail, .. })
+                if detail.contains("HEAD reference is missing") =>
+            {
+                None
+            }
+            Err(err) => {
+                return Err(anyhow!(
+                    "failed to resolve HEAD while writing subagent checkpoint: {err}"
+                ));
+            }
+        };
+
+    let marker = history::TracesInflightMarker::new(
+        libra_session_id,
+        &checkpoint_id,
+        Utc::now().timestamp_millis(),
+    );
+    if let Err(err) = history::write_traces_inflight_marker(conn, &marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to persist subagent traces in-flight marker; continuing"
+        );
+    }
+
+    let objects_dir = repo_path.join("objects");
+    std::fs::create_dir_all(&objects_dir)
+        .context("create objects dir for subagent checkpoint commit")?;
+    let storage = std::sync::Arc::new(crate::utils::client_storage::ClientStorage::init(
+        objects_dir,
+    ));
+    let manager = HistoryManager::new_with_ref(
+        storage,
+        repo_path.to_path_buf(),
+        std::sync::Arc::new(conn.clone()),
+        crate::internal::branch::TRACES_BRANCH,
+    );
+
+    let written = manager
+        .append_checkpoint_commit(CheckpointCommitParams {
+            checkpoint_id: &checkpoint_id,
+            session_id: libra_session_id,
+            agent_kind,
+            parent_commit: parent_commit.as_deref(),
+            scope: CheckpointScope::Subagent,
+            tool_use_id: tool_use_id.as_deref(),
+            metadata_json: &metadata_redacted,
+            transcript_redacted: &transcript_redacted,
+            lifecycle_events_jsonl: &lifecycle_events_redacted,
+            redaction_report_json: &redaction_report_redacted,
+        })
+        .await
+        .context("failed to append subagent checkpoint commit on traces")?;
+
+    let mut committed_marker = marker.clone();
+    committed_marker.commit = Some(written.commit_hash.to_string());
+    committed_marker.oids = vec![
+        written.tree_oid.to_string(),
+        written.metadata_blob_oid.to_string(),
+    ];
+    if let Err(err) = history::write_traces_inflight_marker(conn, &committed_marker).await {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to refresh subagent traces in-flight marker after ref CAS"
+        );
+    }
+
+    insert_subagent_checkpoint_row_idempotent(
+        conn,
+        &SubagentCheckpointRow {
+            checkpoint_id: &checkpoint_id,
+            session_id: libra_session_id,
+            parent_commit: parent_commit.as_deref(),
+            parent_checkpoint_id: parent_checkpoint_id.as_deref(),
+            subagent_session_id: subagent_session_id.as_deref(),
+            tool_use_id: tool_use_id.as_deref(),
+            description: Some(&description),
+            tree_oid: &written.tree_oid.to_string(),
+            metadata_blob_oid: &written.metadata_blob_oid.to_string(),
+            traces_commit: &written.commit_hash.to_string(),
+            created_at: now,
+        },
+    )
+    .await?;
+
+    if let Err(err) =
+        history::clear_traces_inflight_marker(conn, libra_session_id, &checkpoint_id).await
+    {
+        tracing::warn!(
+            checkpoint_id = %checkpoint_id,
+            error = %format!("{err:#}"),
+            "failed to clear subagent traces in-flight marker after catalog insert"
+        );
+    }
+
+    Ok(())
+}
+
+/// Most-recent `committed` checkpoint id for a session, used as the
+/// `parent_checkpoint_id` linkage of a freshly-materialised subagent
+/// checkpoint. Returns `None` when the session has no committed checkpoint
+/// yet (the subagent ran before the first turn/session checkpoint landed).
+async fn latest_committed_checkpoint_id(
+    conn: &sea_orm::DatabaseConnection,
+    session_id: &str,
+) -> Result<Option<String>> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    let row = conn
+        .query_one(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "SELECT checkpoint_id FROM agent_checkpoint \
+             WHERE session_id = ? AND scope = 'committed' \
+             ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            [session_id.into()],
+        ))
+        .await
+        .context("failed to resolve latest committed checkpoint for subagent linkage")?;
+    row.map(|r| r.try_get::<String>("", "checkpoint_id"))
+        .transpose()
+        .context("failed to read parent committed checkpoint id")
+}
+
+/// Column values for one `scope='subagent'` `agent_checkpoint` row (A0-02).
+/// Carries the subagent-specific linkage columns the committed path leaves
+/// NULL: `parent_checkpoint_id`, `subagent_session_id`, `tool_use_id`,
+/// `description`.
+#[derive(Debug)]
+pub struct SubagentCheckpointRow<'a> {
+    pub checkpoint_id: &'a str,
+    pub session_id: &'a str,
+    pub parent_commit: Option<&'a str>,
+    pub parent_checkpoint_id: Option<&'a str>,
+    pub subagent_session_id: Option<&'a str>,
+    pub tool_use_id: Option<&'a str>,
+    pub description: Option<&'a str>,
+    pub tree_oid: &'a str,
+    pub metadata_blob_oid: &'a str,
+    /// `CheckpointCommit.commit_hash` — lands in the `traces_commit` column.
+    pub traces_commit: &'a str,
+    pub created_at: i64,
+}
+
+/// Idempotent INSERT of a `scope='subagent'` catalog row, mirroring
+/// [`insert_agent_checkpoint_row_idempotent`]: probe by `traces_commit`
+/// first (a crash-retry or doctor backfill must not double-insert), then
+/// INSERT with an `ON CONFLICT(checkpoint_id) DO NOTHING` backstop. Returns
+/// `true` when this call inserted the row.
+pub async fn insert_subagent_checkpoint_row_idempotent(
+    conn: &sea_orm::DatabaseConnection,
+    row: &SubagentCheckpointRow<'_>,
+) -> Result<bool> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    use crate::internal::ai::history;
+
+    if let Some(existing_id) =
+        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+    {
+        tracing::info!(
+            checkpoint_id = %row.checkpoint_id,
+            existing_checkpoint_id = %existing_id,
+            "agent_checkpoint subagent row already present for traces commit; skipping INSERT"
+        );
+        return Ok(false);
+    }
+    let parent_commit_value: sea_orm::Value = row.parent_commit.map(str::to_string).into();
+    let parent_checkpoint_value: sea_orm::Value =
+        row.parent_checkpoint_id.map(str::to_string).into();
+    let subagent_session_value: sea_orm::Value = row.subagent_session_id.map(str::to_string).into();
+    let tool_use_value: sea_orm::Value = row.tool_use_id.map(str::to_string).into();
+    let description_value: sea_orm::Value = row.description.map(str::to_string).into();
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, parent_checkpoint_id, scope, parent_commit,
+                tree_oid, metadata_blob_oid, traces_commit, tool_use_id,
+                subagent_session_id, description, created_at
+             ) VALUES (?, ?, ?, 'subagent', ?, ?, ?, ?, ?, ?, ?, ?)
+             ON CONFLICT(checkpoint_id) DO NOTHING",
+            [
+                row.checkpoint_id.into(),
+                row.session_id.into(),
+                parent_checkpoint_value,
+                parent_commit_value,
+                row.tree_oid.into(),
+                row.metadata_blob_oid.into(),
+                row.traces_commit.into(),
+                tool_use_value,
+                subagent_session_value,
+                description_value,
+                row.created_at.into(),
+            ],
+        ))
+        .await
+        .context("failed to insert subagent agent_checkpoint row")?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Column values for one `agent_checkpoint` row (scope is always
+/// `committed` on this path).
+#[derive(Debug)]
+pub struct AgentCheckpointRow<'a> {
+    pub checkpoint_id: &'a str,
+    pub session_id: &'a str,
+    pub parent_commit: Option<&'a str>,
+    pub tree_oid: &'a str,
+    pub metadata_blob_oid: &'a str,
+    /// `CheckpointCommit.commit_hash` — lands in the `traces_commit` column.
+    pub traces_commit: &'a str,
+    pub created_at: i64,
+}
+
+/// Stage (d) of the checkpoint write sequence, made idempotent (AG-20):
+/// probe the catalog by `traces_commit` first — a crash-retry of the
+/// ingest, or a doctor repair that already backfilled the row from the
+/// ref, must not insert a second row for the same commit — then INSERT
+/// with an `ON CONFLICT(checkpoint_id) DO NOTHING` backstop covering a
+/// racer inserting the same checkpoint id between probe and INSERT.
+///
+/// Returns `true` when this call inserted the row, `false` when an
+/// existing row (either match) made it a no-op. `pub` for the AG-20
+/// crash-retry integration tests (`tests/agent_checkpoint_export_test.rs`)
+/// — NOT a stable API.
+pub async fn insert_agent_checkpoint_row_idempotent(
+    conn: &sea_orm::DatabaseConnection,
+    row: &AgentCheckpointRow<'_>,
+) -> Result<bool> {
+    use sea_orm::{ConnectionTrait, Statement};
+
+    use crate::internal::ai::history;
+
+    if let Some(existing_id) =
+        history::agent_checkpoint_id_for_traces_commit(conn, row.traces_commit).await?
+    {
+        tracing::info!(
+            checkpoint_id = %row.checkpoint_id,
+            existing_checkpoint_id = %existing_id,
+            "agent_checkpoint row already present for traces commit; skipping INSERT"
+        );
+        return Ok(false);
+    }
+    let parent_commit_value: sea_orm::Value = row.parent_commit.map(str::to_string).into();
+    let result = conn
+        .execute(Statement::from_sql_and_values(
+            conn.get_database_backend(),
+            "INSERT INTO agent_checkpoint (
+                checkpoint_id, session_id, scope, parent_commit, tree_oid,
+                metadata_blob_oid, traces_commit, created_at
+             ) VALUES (?, ?, 'committed', ?, ?, ?, ?, ?)
+             ON CONFLICT(checkpoint_id) DO NOTHING",
+            [
+                row.checkpoint_id.into(),
+                row.session_id.into(),
+                parent_commit_value,
+                row.tree_oid.into(),
+                row.metadata_blob_oid.into(),
+                row.traces_commit.into(),
+                row.created_at.into(),
+            ],
+        ))
+        .await
+        .context("failed to insert agent_checkpoint row")?;
+    Ok(result.rows_affected() > 0)
+}
+
+/// Extract metadata.json's `model` field from a lifecycle event's `model`
+/// value, mirroring the E4-entire missing-`model` tolerance: absent or
+/// unrecognisable shapes become the literal `"unknown"` rather than an
+/// error. Providers emit either a plain string or an object carrying an
+/// id/name-ish key.
+/// Redact a single extracted string (model id, file path) through the
+/// default `Redactor` before it lands in checkpoint metadata. Extraction
+/// fields are derived from the raw (un-redacted) transcript, so they must
+/// pass the same scrubbing the transcript blob does.
+fn redact_extracted_string(value: &str) -> String {
+    use crate::internal::ai::observed_agents::Redactor;
+    let (bytes, _report) = Redactor::new_default().redact(value.as_bytes());
+    String::from_utf8_lossy(bytes.as_ref()).into_owned()
+}
+
+/// Recursively redact every string leaf of a JSON value (used for the
+/// skill-events array so anchors / names are scrubbed uniformly).
+fn redact_extracted_json(value: serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::String(text) => {
+            serde_json::Value::String(redact_extracted_string(&text))
+        }
+        serde_json::Value::Array(items) => {
+            serde_json::Value::Array(items.into_iter().map(redact_extracted_json).collect())
+        }
+        serde_json::Value::Object(map) => serde_json::Value::Object(
+            map.into_iter()
+                .map(|(k, v)| (k, redact_extracted_json(v)))
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
+/// AG-21: run the adapter's transcript-intelligence capabilities over the
+/// raw transcript and shape the result for `metadata.json`'s additive
+/// `extraction` object. Fail-open by construction:
+///
+/// - no adapter / no raw transcript → `{present:false, partial:true}` with
+///   an explanatory (non-sensitive) warning;
+/// - individual extractor failure → warning + `partial:true`, remaining
+///   dimensions still recorded;
+/// - warnings pass through the default `Redactor` before persistence so a
+///   pathological error string can never leak transcript content.
+///
+/// Prompt TEXT is deliberately NOT persisted here — only the prompt count.
+/// The redacted transcript blob remains the sole persisted content
+/// carrier; extraction stores derived, low-sensitivity facts (usage
+/// numbers, model id, file paths, curated skill events).
+fn build_extraction_metadata(agent_kind: &str, raw: Option<&[u8]>) -> serde_json::Value {
+    use crate::internal::ai::observed_agents::{AgentKind, agent_for};
+
+    let mut partial = false;
+    let mut warnings: Vec<String> = Vec::new();
+    let mut value = serde_json::json!({
+        "schema_version": 1,
+        "present": false,
+        "partial": false,
+        "warnings": [],
+    });
+
+    let adapter = AgentKind::from_db_str(agent_kind).map(agent_for);
+    let (Some(adapter), Some(raw)) = (adapter, raw) else {
+        partial = true;
+        warnings.push(if adapter.is_none() {
+            format!("unknown agent kind '{agent_kind}'; extraction skipped")
+        } else {
+            "no raw transcript available; extraction skipped".to_string()
+        });
+        finalize_extraction(&mut value, partial, warnings);
+        return value;
+    };
+
+    let object = value
+        .as_object_mut()
+        .expect("extraction value is an object");
+    object.insert("present".into(), serde_json::Value::Bool(true));
+
+    if let Some(calculator) = adapter.as_token_calculator() {
+        match calculator.calculate_token_usage(raw, 0) {
+            Ok(usage) => {
+                object.insert(
+                    "token_usage".into(),
+                    serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("token usage extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_model_extractor() {
+        match extractor.extract_model(raw) {
+            Ok(Some(model)) => {
+                object.insert(
+                    "model".into(),
+                    serde_json::Value::String(redact_extracted_string(&model)),
+                );
+            }
+            Ok(None) => {}
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("model extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_prompt_extractor() {
+        match extractor.extract_prompts(raw, 0) {
+            Ok(prompts) => {
+                object.insert("prompt_count".into(), serde_json::json!(prompts.len()));
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("prompt extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_subagent_aware_extractor() {
+        match extractor.total_token_usage_including_subagents(raw) {
+            Ok(usage) => {
+                object.insert(
+                    "subagent_token_usage".into(),
+                    serde_json::to_value(&usage).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("subagent usage extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(analyzer) = adapter.as_transcript_analyzer() {
+        match analyzer.extract_modified_files_from_offset(raw, 0) {
+            Ok(files) => {
+                // File paths are derived from untrusted tool_use input —
+                // redact them before persistence (a path can embed a
+                // secret, e.g. a token in a URL-like path segment).
+                let list: Vec<String> = files
+                    .iter()
+                    .map(|path| redact_extracted_string(&path.display().to_string()))
+                    .collect();
+                object.insert(
+                    "modified_files".into(),
+                    serde_json::to_value(list).unwrap_or(serde_json::Value::Null),
+                );
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("modified-files extraction failed: {err:#}"));
+            }
+        }
+    }
+    if let Some(extractor) = adapter.as_skill_event_extractor() {
+        match extractor.extract_skill_events(raw, 0) {
+            Ok(events) => {
+                // Skill events carry curated slash-command names + opaque
+                // anchors; redact the serialized form defensively so any
+                // transcript-derived string is scrubbed uniformly.
+                let value = serde_json::to_value(&events).unwrap_or(serde_json::Value::Null);
+                object.insert("skill_events".into(), redact_extracted_json(value));
+            }
+            Err(err) => {
+                partial = true;
+                warnings.push(format!("skill event extraction failed: {err:#}"));
+            }
+        }
+    }
+
+    // The per-format parsers may themselves flag partial results (e.g.
+    // undecodable lines) — surface their warnings through the same
+    // channel. They live on the summary the extractors already consumed;
+    // recompute cheaply through the analyzer-agnostic path.
+    let format_summary = match AgentKind::from_db_str(agent_kind) {
+        Some(AgentKind::ClaudeCode) => {
+            Some(crate::internal::ai::observed_agents::extract::extract_claude_code(raw))
+        }
+        Some(AgentKind::Codex) => {
+            Some(crate::internal::ai::observed_agents::extract::extract_codex(raw))
+        }
+        Some(AgentKind::OpenCode) => {
+            Some(crate::internal::ai::observed_agents::extract::extract_opencode(raw))
+        }
+        _ => None,
+    };
+    if let Some(summary) = format_summary {
+        if summary.partial {
+            partial = true;
+        }
+        // Additive E6 count fields (numbers only — no redaction needed).
+        object.insert(
+            "api_call_count".into(),
+            serde_json::json!(summary.api_call_count),
+        );
+        // The generic E6 path (codex/opencode) folds the wire
+        // `subagent_tokens` into `subagent_usage` but exposes no
+        // `SubagentAwareExtractor`, so persist it here when the
+        // accessor block above did not already write it.
+        if !object.contains_key("subagent_token_usage")
+            && let Some(subagent) = &summary.subagent_usage
+        {
+            object.insert(
+                "subagent_token_usage".into(),
+                serde_json::to_value(subagent).unwrap_or(serde_json::Value::Null),
+            );
+        }
+        warnings.extend(summary.warnings);
+    }
+
+    finalize_extraction(&mut value, partial, warnings);
+    value
+}
+
+/// Stamp `partial` + redacted warnings onto the extraction object.
+fn finalize_extraction(value: &mut serde_json::Value, partial: bool, warnings: Vec<String>) {
+    use crate::internal::ai::observed_agents::Redactor;
+    let redactor = Redactor::new_default();
+    let redacted: Vec<String> = warnings
+        .into_iter()
+        .map(|warning| {
+            let (bytes, _report) = redactor.redact(warning.as_bytes());
+            String::from_utf8_lossy(bytes.as_ref()).into_owned()
+        })
+        .collect();
+    if let Some(object) = value.as_object_mut() {
+        object.insert("partial".into(), serde_json::Value::Bool(partial));
+        object.insert(
+            "warnings".into(),
+            serde_json::to_value(redacted).unwrap_or_else(|_| serde_json::json!([])),
+        );
+    }
+}
+
+fn checkpoint_model_field(model: Option<&serde_json::Value>) -> String {
+    match model {
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => name.clone(),
+        Some(serde_json::Value::Object(obj)) => ["id", "model", "name", "display_name"]
+            .iter()
+            .find_map(|key| obj.get(*key).and_then(serde_json::Value::as_str))
+            .filter(|name| !name.trim().is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| "unknown".to_string()),
+        _ => "unknown".to_string(),
+    }
 }
 
 /// Merge a [`RedactionReport`](crate::internal::ai::observed_agents::RedactionReport)
@@ -953,8 +1921,22 @@ fn transcript_path_within_provider_root(
         return false;
     };
     adapter.protected_dirs().iter().any(|dir| {
-        home.join(dir)
-            .canonicalize()
+        // Codex relocates its whole home via `$CODEX_HOME` and every other
+        // part of the codex chain honors it (`resolve_codex_home` in
+        // providers/codex/settings.rs). The trust gate must resolve the
+        // same root, or sessions under a relocated CODEX_HOME are silently
+        // captured with empty transcripts (found by the A6.5 real-CLI
+        // smoke, which isolates CODEX_HOME). Only an absolute override is
+        // honored, mirroring `resolve_codex_home`'s validation.
+        let root = if *dir == ".codex" {
+            match std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from) {
+                Some(path) if path.is_absolute() => path,
+                _ => home.join(dir),
+            }
+        } else {
+            home.join(dir)
+        };
+        root.canonicalize()
             .map(|root| canonical_path.starts_with(root))
             .unwrap_or(false)
     })
@@ -991,14 +1973,6 @@ fn merge_redaction_report_into(
             .unwrap_or(0);
         obj.insert(key.to_string(), serde_json::json!(current + added as u64));
     }
-}
-
-/// Map `agent_session.agent_kind` (the closed enum stored in the database)
-/// onto the file-name component used inside the checkpoint tree
-/// (`transcript/<provider>` and `events/<provider>.jsonl`). For Phase 1's
-/// stable agents (claude_code, gemini) the slug equals the kind string.
-fn envelope_provider_slug(agent_kind: &str) -> &str {
-    agent_kind
 }
 
 ///
@@ -1079,7 +2053,10 @@ fn transition_phase(session: &mut SessionState, event_kind: LifecycleEventKind) 
         | LifecycleEventKind::CompactionCompleted
         | LifecycleEventKind::PermissionRequest
         | LifecycleEventKind::SourceEnabled
-        | LifecycleEventKind::SourceDisabled => SessionPhase::Active,
+        | LifecycleEventKind::SourceDisabled
+        // AG-19: nested sub-agent activity keeps the parent session live.
+        | LifecycleEventKind::SubagentStart
+        | LifecycleEventKind::SubagentEnd => SessionPhase::Active,
         LifecycleEventKind::ModelUpdate => current_phase.unwrap_or(SessionPhase::Active),
     };
 
@@ -1361,6 +2338,55 @@ mod tests {
 
     use super::*;
     use crate::internal::ai::hooks::providers::{claude_provider, gemini_provider};
+
+    /// AG-21 metadata persistence (codex review R2 P1): the generic E6
+    /// path (codex/opencode) must persist `subagent_token_usage` and
+    /// `api_call_count` into the checkpoint metadata `extraction` block —
+    /// not just into the in-memory summary. Drives the exact
+    /// `build_extraction_metadata` path a checkpoint write uses.
+    #[test]
+    fn extraction_metadata_persists_generic_subagent_and_api_count() {
+        let transcript = concat!(
+            r#"{"role":"user","content":"/review"}"#,
+            "\n",
+            r#"{"model":"gpt-5.3-codex","usage":{"input_tokens":10,"output_tokens":4,"api_call_count":5,"subagent_tokens":30}}"#,
+            "\n",
+        );
+        let value = build_extraction_metadata("codex", Some(transcript.as_bytes()));
+        let extraction = value.as_object().expect("extraction object");
+        assert_eq!(extraction["present"], serde_json::json!(true));
+        assert_eq!(
+            extraction["api_call_count"],
+            serde_json::json!(5),
+            "wire api_call_count persisted (not +1): {value}"
+        );
+        let subagent = &extraction["subagent_token_usage"];
+        assert_eq!(
+            subagent["input_tokens"],
+            serde_json::json!(30),
+            "generic-path subagent tokens persisted: {value}"
+        );
+
+        // Claude uses the SubagentAwareExtractor accessor — its
+        // subagent_token_usage must be written by that block and NOT
+        // double-written by the generic fallback (value stays the
+        // accessor's, and the key exists exactly once in a JSON object).
+        let claude_line = serde_json::json!({
+            "type": "assistant",
+            "message": {
+                "role": "assistant",
+                "model": "claude-sonnet-5",
+                "content": [{"type": "tool_use", "name": "Task", "input": {"prompt": "x"}}],
+                "usage": {"input_tokens": 7, "output_tokens": 2}
+            }
+        });
+        let claude =
+            build_extraction_metadata("claude_code", Some(format!("{claude_line}\n").as_bytes()));
+        assert!(
+            claude["subagent_token_usage"].is_object(),
+            "claude subagent usage present via accessor: {claude}"
+        );
+    }
 
     // Scenario: pushing many keys past the cap evicts the oldest, never exceeding
     // `MAX_PROCESSED_EVENT_KEYS`.
@@ -2283,6 +3309,59 @@ mod tests {
         assert!(
             body.contains("deploy with") && body.contains("please"),
             "the redacted transcript must retain the non-secret text, got: {body}",
+        );
+    }
+
+    /// A6.5 regression: codex relocates its whole home via `$CODEX_HOME`
+    /// and every other part of the codex chain honors it
+    /// (`resolve_codex_home`), so the transcript trust gate must resolve
+    /// the same root — otherwise sessions under a relocated CODEX_HOME are
+    /// silently captured with empty transcripts (exactly what the A6.5
+    /// real-CLI smoke observed with its isolated CODEX_HOME).
+    #[test]
+    #[serial]
+    fn codex_transcript_root_honors_codex_home_override() {
+        let adapter = crate::internal::ai::observed_agents::agent_for(
+            crate::internal::ai::observed_agents::AgentKind::Codex,
+        );
+        let codex_home = tempfile::tempdir().expect("codex home tempdir");
+        let sessions = codex_home.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let rollout = sessions.join("rollout-test.jsonl");
+        std::fs::write(&rollout, "{}\n").unwrap();
+
+        // Fake $HOME so the real ~/.codex can never accidentally match.
+        let home = tempfile::tempdir().expect("fake home tempdir");
+        let prior_home = std::env::var_os("LIBRA_TEST_HOME");
+        let prior_codex = std::env::var_os("CODEX_HOME");
+        // SAFETY: test-only env mutation, restored below; serialised via
+        // #[serial] so it cannot race other env readers.
+        unsafe {
+            std::env::set_var("LIBRA_TEST_HOME", home.path());
+            std::env::set_var("CODEX_HOME", codex_home.path());
+        }
+        let trusted = transcript_path_within_provider_root(adapter, &rollout);
+        unsafe {
+            std::env::remove_var("CODEX_HOME");
+        }
+        let untrusted = transcript_path_within_provider_root(adapter, &rollout);
+        unsafe {
+            match prior_codex {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+            match prior_home {
+                Some(value) => std::env::set_var("LIBRA_TEST_HOME", value),
+                None => std::env::remove_var("LIBRA_TEST_HOME"),
+            }
+        }
+        assert!(
+            trusted,
+            "a rollout under $CODEX_HOME must pass the provider-root gate"
+        );
+        assert!(
+            !untrusted,
+            "without the override the relocated rollout stays untrusted"
         );
     }
 

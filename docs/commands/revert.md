@@ -5,8 +5,11 @@ Revert some existing commits.
 ## Synopsis
 
 ```
-libra revert [-n | --no-commit] [-m | --mainline <parent-number>] [-s | --signoff] [--no-edit] [--json] [--quiet] <commit>...
+libra revert [-n | --no-commit] [-m | --mainline <parent-number>] [-s | --signoff]
+             [-e | --edit] [--no-edit] [-X <ours|theirs>] [--cleanup=<mode>]
+             [--no-rerere-autoupdate] [--json] [--quiet] <commit>...
 libra revert --continue
+libra revert --skip
 libra revert --abort
 ```
 
@@ -16,15 +19,23 @@ libra revert --abort
 
 The command works by computing the diff between the target commit and its parent, then applying the inverse of that diff to the current working tree and index. If the resulting state is clean, a new commit is recorded with a message of the form `Revert "<original subject>"`.
 
+The revert commit uses the current author and committer identity/date, honoring
+`GIT_AUTHOR_*` and `GIT_COMMITTER_*` through the same environment rules as
+`libra commit` when it creates the commit. The generated subject is derived from
+the target commit's de-signed message body, so an embedded `gpgsig` block is not
+used as the original subject.
+
 Reverting a root commit (one with no parent) produces an empty tree, effectively undoing the initial commit's changes.
 
 To revert a **merge commit** (one with more than one parent), pass `-m <parent-number>` to choose which parent is the mainline; the merge's changes are then computed relative to that parent. See [`-m`, `--mainline`](#-m---mainline-parent-number) below.
 
 The command requires an active branch (not detached HEAD). It accepts one or more
 commit references, reverting them in order (each as its own revert commit); a
-conflict stops the sequence, to be finished with `libra revert --continue` or
-undone with `libra revert --abort`. `-n/--no-commit` and `-m/--mainline` apply
-only to a single commit.
+conflict stops the sequence, to be finished with `libra revert --continue`,
+skipped with `libra revert --skip`, or undone with `libra revert --abort`. When a
+conflict interrupts a multi-commit revert, the commits still pending behind it are
+remembered and reverted automatically once `--continue`/`--skip` resumes the
+sequence. `-n/--no-commit` and `-m/--mainline` apply only to a single commit.
 
 ## Options
 
@@ -60,7 +71,7 @@ libra revert -m 1 <merge-commit>
 
 One or more commit references to revert, applied in the given order. Each can be a
 full SHA-1 hash, an abbreviated hash, a branch name, `HEAD`, or any ref that
-resolves to a commit. (The positional is optional only with `--continue`/`--abort`.)
+resolves to a commit. (The positional is optional only with `--continue`/`--skip`/`--abort`.)
 
 ```bash
 # Revert the most recent commit
@@ -81,12 +92,39 @@ Emit machine-readable JSON output instead of human-readable text. See [Structure
 
 Suppress all human-readable output. Exit code still indicates success or failure.
 
+### `-e`, `--edit`
+
+Open the editor on the auto-generated revert message (`Revert "<subject>"`)
+before committing, using the same cascade as `commit` (`$GIT_EDITOR`,
+`core.editor`, `$VISUAL`, `$EDITOR`). The edited message has `#` comment lines
+stripped and surrounding blank lines trimmed; an empty result aborts the revert.
+Unlike Git, Libra's revert does **not** open an editor by default — `--edit` is
+opt-in. When a revert conflicts, `--edit` is remembered so `--continue` also
+opens the editor. Mutually exclusive with `--no-edit`.
+
+```bash
+libra revert HEAD --edit
+```
+
 ### `--no-edit`
 
 Accept the auto-generated revert message (`Revert "<subject>"`) without launching
-an editor. Libra never opens an editor for revert, so this is accepted for Git
-parity and is a no-op. The `--edit` counterpart is not provided; to customize the
-message, use `-n` and then `libra commit -m`.
+an editor. This is Libra's default behavior, so the flag is a no-op accepted for
+Git parity; pass `-e`/`--edit` to open the editor instead.
+
+### `-X <ours|theirs>`, `--strategy-option=<ours|theirs>`
+
+Resolve only overlapping inverse-merge hunks in favor of the selected side: `ours` is the current HEAD content and `theirs` is the reverted commit's selected parent (the desired inverse side). Clean inverse hunks are still applied. The option is repeatable and the last value wins; add/add and modify/delete conflicts select the requested whole side. The effective value is persisted across a conflict sequencer resume.
+
+### `--cleanup=<mode>`
+
+Clean the generated or `--edit`-modified revert message using `strip`, `whitespace`, `verbatim`, `scissors`, or `default`. Without an editor, `default`/`scissors` use `whitespace`; with an editor, scissors truncation and comment stripping follow the selected mode. An invalid mode is rejected before any sequencer action (`LBR-CLI-002`, exit 129). The mode is stored in `revert-state.json`, so conflict → `--continue` applies the same cleanup policy.
+
+### `--no-rerere-autoupdate`
+
+Do not update the rerere (reuse recorded resolution) index. Accepted no-op for
+Git parity: Libra has no rerere, so there is nothing to update. (Git's
+`--rerere-autoupdate` is not exposed.)
 
 ## Common Commands
 
@@ -159,10 +197,13 @@ When `--no-commit` is used, `new_commit` and `short_new` are `null`:
 
 `libra revert <commit1> <commit2> ...` reverts a sequence of commits in order,
 each as its own revert commit relative to the previous result. If a revert in the
-sequence conflicts, the operation stops there; already-completed reverts are kept,
-and you finish the conflicting one with `libra revert --continue` (or undo it with
-`--abort`). Note that `-n/--no-commit` and `-m/--mainline` apply only to a single
-commit and are rejected when multiple commits are given.
+sequence conflicts, the operation stops there; already-completed reverts are kept
+and the commits still pending behind the conflict are remembered. You then finish
+the conflicting one with `libra revert --continue` (after resolving), discard it
+with `libra revert --skip`, or undo with `libra revert --abort`; `--continue` and
+`--skip` automatically revert the remembered pending commits before completing.
+Note that `-n/--no-commit` and `-m/--mainline` apply only to a single commit and
+are rejected when multiple commits are given.
 
 ### Merge commit support (`--mainline`)
 
@@ -173,17 +214,23 @@ Git's `--mainline <parent-number>` selects which parent of a merge commit to dif
 
 The generated revert commit still records a single parent (the current `HEAD`), matching Git.
 
-### Conflict handling (`--continue`, `--abort`)
+### Conflict handling (`--continue`, `--skip`, `--abort`)
 
 A revert that conflicts writes three-way conflict markers to the working tree,
 records revert state in `revert-state.json`, and returns `LBR-CONFLICT-001`. You
-then resolve the conflicts and run `libra revert --continue` to finish, or
+then resolve the conflicts and run `libra revert --continue` to finish,
+`libra revert --skip` to discard the current commit and move on, or
 `libra revert --abort` to restore the pre-revert state.
 
 1. **Explicit, agent-friendly errors.** The specific path and error code are
    reported so an agent can resolve the conflict programmatically and continue.
 2. **Predictable state.** Revert state lives in a single `revert-state.json`
    file rather than scattered implicit markers.
+3. **Sequence-aware.** When the conflict interrupts a multi-commit revert, the
+   still-pending commits are stored in the state file (`remaining`), so
+   `--continue` (after resolving) and `--skip` (discarding the current commit)
+   both finish the rest of the sequence automatically. `--skip` with nothing left
+   simply clears the state without creating a commit.
 
 ### Conflict model (three-way merge)
 
@@ -191,8 +238,10 @@ Libra's revert applies the inverse change with a path-level three-way merge. Whe
 the result is unambiguous the file is updated cleanly; when it overlaps with later
 changes, standard conflict markers are written to the working tree, the unmerged
 state and revert progress are saved in `revert-state.json`, and `LBR-CONFLICT-001`
-is returned. You resolve the markers and run `libra revert --continue` (or
-`libra revert --abort`).
+is returned. You resolve the markers and run `libra revert --continue`, skip the
+commit with `libra revert --skip`, or unwind with `libra revert --abort`.
+Passing `-X ours` or `-X theirs` resolves overlapping regions during that
+three-way merge while preserving every clean inverse hunk.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -200,14 +249,16 @@ is returned. You resolve the markers and run `libra revert --continue` (or
 |-----------|-----|-----|-------|
 | Positional commit(s) | `git revert <commit>...` | N/A (uses `jj backout`) | `libra revert <commit>...` (multiple, reverted in order) |
 | No-commit mode | `--no-commit` / `-n` | N/A | `--no-commit` / `-n` |
-| Accept default message | `--no-edit` | N/A | `--no-edit` (accepted no-op; Libra never opens an editor) |
-| Edit message | `--edit` | N/A | Not supported (use `-n` then `commit -m`) |
+| Accept default message | `--no-edit` | N/A | `--no-edit` (accepted no-op; Libra does not open an editor by default — use `-e`/`--edit` to opt in) |
+| No rerere autoupdate | `--no-rerere-autoupdate` | N/A | `--no-rerere-autoupdate` (accepted no-op; no rerere) |
+| Edit message | `-e`/`--edit` | N/A | `-e`/`--edit` (open the editor on the message; unlike Git, Libra does not open one by default — opt-in) |
+| Cleanup mode | `--cleanup=<mode>` | N/A | `strip`/`whitespace`/`verbatim`/`scissors`/`default`; persisted through conflicts |
 | Mainline parent | `--mainline <n>` / `-m <n>` | N/A | `--mainline <n>` / `-m <n>` (required for merge commits) |
-| Continue after conflict | `--continue` | N/A | `--continue` (after resolving conflicts) |
+| Continue after conflict | `--continue` | N/A | `--continue` (after resolving; auto-continues remaining commits) |
 | Abort in-progress | `--abort` | N/A | `--abort` (restores the pre-revert state) |
-| Skip current commit | `--skip` | N/A | Not supported |
+| Skip current commit | `--skip` | N/A | `--skip` (discards the conflicted commit, continues the sequence) |
 | Strategy | `--strategy <s>` | N/A | Not supported |
-| Strategy option | `-X <option>` | N/A | Not supported |
+| Strategy option | `-X <option>` | N/A | `-X ours/theirs` (repeatable; last wins; conflict hunks only) |
 | GPG sign | `--gpg-sign` / `-S` | N/A | Not supported (planned) |
 | JSON output | N/A | N/A | `--json` |
 | Quiet mode | `--quiet` | N/A | `--quiet` |
@@ -222,7 +273,8 @@ is returned. You resolve the markers and run `libra revert --continue` (or
 | `LBR-REPO-001` | Not inside a libra repository | Initialize with `libra init` or navigate to a repo |
 | `LBR-REPO-003` | HEAD is detached (not on a branch) | Switch to a branch with `libra switch <branch>` |
 | `LBR-CLI-003` | Cannot resolve the commit reference | Use `libra log` to find valid commit references |
-| `LBR-CLI-002` | Merge commit without `-m`, `-m` on a non-merge commit, or out-of-range parent number (exit 128) | Pass a valid `-m <parent-number>` for merge commits; omit `-m` for non-merge commits |
-| `LBR-CONFLICT-001` | File was modified by a later commit, creating a conflict | Resolve conflicts, then `libra revert --continue` (or `libra revert --abort`) |
+| `LBR-CLI-002` | Merge commit without `-m`, invalid mainline, invalid `--cleanup`, or an editor/empty-message failure | Pass a valid mainline/cleanup mode; for `--edit`, configure an editor and save a non-empty message |
+| `LBR-CONFLICT-001` | File was modified by a later commit, creating a conflict | Resolve conflicts then `libra revert --continue`, skip the commit with `libra revert --skip`, or cancel with `libra revert --abort` |
+| `LBR-REPO-002` | The index is corrupt or unreadable during apply/continue/skip/abort | Repair or restore `.libra/index`; the revert state is retained so recovery can be retried |
 | `LBR-IO-001` | Failed to load object (commit, tree, blob) | Check repository integrity |
 | `LBR-IO-002` | Failed to save object, index, or update HEAD | Check filesystem permissions and repository writability |

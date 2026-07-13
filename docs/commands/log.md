@@ -7,7 +7,7 @@ Show commit history.
 ## Synopsis
 
 ```
-libra log [OPTIONS] [-- PATHS...]
+libra log [OPTIONS] [<revision-range>] [[--] <path>...]
 ```
 
 ## Description
@@ -20,6 +20,9 @@ JSON. Commits can be filtered by author, date range, and file paths. Diff output
 Human mode preserves the current `--oneline`, `--graph`, `--pretty`, `--stat`, `--patch`, and
 related output styles. `--quiet` suppresses human output but still validates the requested
 history range.
+
+When stdout is piped and the downstream command exits early, `libra log` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
 
 ## Options
 
@@ -65,6 +68,68 @@ Show full commit hashes. Overrides `--abbrev-commit`.
 libra log --no-abbrev-commit
 ```
 
+### `--pretty=<format>` / `--format=<format>`
+
+Choose the commit display format. Accepts the named presets and the
+`format:`/`tformat:` custom-template prefixes (and a bare `%`-placeholder
+template). `--format` is Git's alias for `--pretty`.
+
+| Preset | Output |
+|---|---|
+| `oneline` | `<hash> <subject>` on one line |
+| `medium` (default) | `commit` + `Author` + `Date` + indented message |
+| `short` | `commit` + `Author` + indented subject (no date, no body) |
+| `full` | `commit` + `Author` + `Commit` + indented message (no dates) |
+| `fuller` | `commit` + `Author`/`AuthorDate` + `Commit`/`CommitDate` + message |
+| `reference` | one-line `<abbrev> (<subject>, <short-date>)` |
+| `raw` | the commit object's `tree`/`parent`/`author`/`committer` headers + indented message |
+
+The presets inherit `libra log`'s existing conventions (timestamps render in
+UTC `+0000`; `--pretty` abbreviates the hash; the stored message's
+subject/body blank line is collapsed), so they match Git's preset *structure*
+rather than being byte-identical. `libra show --pretty=<preset>` uses the same
+formats.
+
+Custom templates support `%H` / `%h` (full / abbreviated commit hash), `%P` /
+`%p` (full / abbreviated parent hashes), `%s` / `%f` (subject / sanitized
+subject), `%b` / `%B` (body / raw subject+body), `%n`, ASCII/control `%xNN`, `%%`, `%an` / `%ae` /
+`%ad` / `%aI` / `%at` (author), `%cn` / `%ce` / `%cd` / `%cI` / `%ct`
+(committer), `%d` / `%D` (decorations), `%m`, and common color placeholders
+such as `%Cred`, `%C(red)`, `%C(always,red)`, and `%Creset`. Unknown
+placeholders stay literal, matching Git's pretty-format behavior.
+Color reset follows Git's color policy: `%C(always,...)` can force an ANSI
+escape even when ordinary colors are disabled, while `%Creset` resets only when
+color output is enabled; use `%C(always,reset)` when a forced-color template
+also needs a forced reset.
+
+```bash
+libra log --pretty=short
+libra log --pretty=fuller
+libra log --pretty=reference
+```
+
+When no explicit `--oneline`, `--pretty`, or `--format` is present,
+`format.pretty` supplies the default for both `libra log` and `libra show`.
+The supported config values are the presets above or a non-empty custom
+template using `format:`, `tformat:`, or a `%` placeholder. Empty values and
+unknown bare preset names fail before output with `LBR-CLI-002`; an explicit
+CLI format bypasses the matching config key.
+
+### `--date=<format>`
+
+Select the human-readable author/committer date mode. Supported modes are
+`default`, `short`, `iso`/`iso8601`, `iso-strict`/`iso8601-strict`,
+`rfc`/`rfc2822`, `unix`, and `raw`. `log.date` supplies the default for human
+`log` and `show` output; an explicit `--date` wins. Valid Git modes that this
+renderer does not yet implement (`relative`, `human`, `local`, `format:*`, and
+`auto:*`) are rejected when configured instead of being silently ignored.
+Dates in structured JSON keep their schema-defined RFC3339 representation.
+
+```bash
+libra log --date=iso-strict
+libra log --pretty='format:%ad %s' --date=unix
+```
+
 ### `-p, --patch`
 
 Show the diff (patch) for each commit. Can be combined with path arguments to limit
@@ -92,6 +157,16 @@ libra log --name-status
 libra log --name-status -- src/
 ```
 
+### `-z, --null`
+
+Use NUL separators for log records and changed-path output. With `--name-only`
+or `--name-status`, the formatted commit text is terminated by `NUL`, the path
+section is separated like Git, and each path/status field is NUL-terminated.
+
+```bash
+libra log -z --name-status --format=%s
+```
+
 ### `--stat`
 
 Show diffstat (file change statistics) for each commit, showing insertions and deletions
@@ -103,9 +178,17 @@ Show only the last line of the `--stat` output: ` N files changed, M insertions(
 deletions(-)` for each commit (the insertion/deletion clauses are omitted when zero),
 without the per-file breakdown.
 
+### `--patch-with-stat`
+
+Git's synonym for `-p --stat`: show the diffstat block followed by the full patch for each
+commit. An explicit `-p --stat` combination is equivalent and likewise shows both. (The
+diffstat and patch blocks follow Libra's existing `--stat`/`-p` rendering, so they differ
+slightly from Git's formatting.)
+
 ```bash
 libra log --stat
 libra log --shortstat
+libra log --patch-with-stat -1
 libra log --range main..feature
 libra log --all --oneline
 libra log --reverse --oneline
@@ -134,6 +217,36 @@ libra log --grep fix -i              # case-insensitive
 libra log --grep WIP --invert-grep   # hide WIP commits
 ```
 
+### `--trailer <KEY[=VALUE]>` / `--only-trailers` (Libra extensions)
+
+Git has no such flags — the nearest Git equivalents are a fragile
+`--grep='^Key: '` (filtering) and `--pretty='%(trailers)'` (display).
+
+`--trailer KEY` keeps only commits whose *qualifying trailer block* (parsed
+with Git's rules: the last paragraph, never the title; keys are ASCII
+alphanumerics/dashes; a mixed block needs a recognized trailer such as
+`Signed-off-by` and ≥25% trailer lines) carries a trailer with that key
+(ASCII case-insensitive). `KEY=VALUE` additionally requires the exact unfolded
+value. Repeatable: every `--trailer` must match.
+
+`--only-trailers` replaces each commit's message with its trailer block
+(unfolded `Key: value` lines; `(cherry picked from commit …)` lines verbatim).
+It does not filter — trailer-less commits print with an empty message
+section. Combined with `--trailer`, the display shows only the selected keys.
+Mutually exclusive with `--oneline`/`--pretty`/`--format`.
+Because this is an explicit display mode, it also overrides the
+`format.pretty` and `log.date` defaults.
+
+```bash
+libra log --trailer Reviewed-by                  # commits reviewed by anyone
+libra log --trailer Change-Id=I1234              # exact value match
+libra log --only-trailers --trailer signed-off-by
+```
+
+In `--json` output every commit carries an additive `trailers` array
+(`[{"key": …, "value": …}]`, empty when the commit has no qualifying block);
+`body` still contains the trailer lines inline, unchanged.
+
 ### `--since <DATE>`
 
 Show commits more recent than the specified date.
@@ -153,12 +266,14 @@ libra log --until 2026-03-01
 
 ### `--pretty <FORMAT>`
 
-Custom pretty-print format string. Supports placeholders like `%h` (short hash), `%s`
-(subject), `%an` (author name), `%ae` (author email), `%ad` (author date), etc.
+Custom pretty-print format string. Supports the same placeholder set described
+above, including `%b`, `%B`, `%n`, ASCII/control `%xNN`, `%%`, strict ISO dates `%aI` / `%cI`, raw
+timestamps `%at` / `%ct`, raw decorations `%D`, `%m`, and color placeholders.
 
 ```bash
 libra log --pretty="%h - %s (%an)"
 libra log --pretty="format:%H %s"
+libra log --pretty=%P -1
 ```
 
 ### `--format <FORMAT>`
@@ -198,16 +313,26 @@ libra log --graph
 libra log --oneline --graph
 ```
 
-### `--range <SPEC>`
+### Revision ranges (positional or `--range <SPEC>`)
 
-Limit history to a revision range. Supported forms:
+Limit history to a revision range. The range may be given **positionally**
+(Git-style) or with the explicit `--range` flag. Supported forms:
 - `A..B` — commits reachable from `B` but not `A`.
 - `A...B` — symmetric difference (commits in `A` or `B` but not their merge base).
+- `^A` (exclude) combined with an include, e.g. `^A B`.
 - Single ref, e.g. `main` or `HEAD~3`.
 
+Positionally, leading arguments are revisions until the first one that is not;
+everything after is treated as a pathspec, so `log A..B path/` filters the range
+to commits touching `path/`. A bare name that is **both** a valid revision and an
+existing path is rejected as ambiguous — use `--range <rev>` to select the
+revision.
+
 ```bash
-libra log --range main..feature
-libra log --range HEAD~3..HEAD
+libra log main..feature            # positional range
+libra log HEAD~3..HEAD src/        # positional range + pathspec
+libra log ^v1.0 HEAD               # exclude + include
+libra log --range main..feature    # explicit flag form
 ```
 
 ### `--all`
@@ -274,13 +399,40 @@ note.)
 libra log --no-notes
 ```
 
-### `--follow <FILE>`
+### `--no-mailmap`
 
-Best-effort continuation of a file's history across renames. The file is resolved
-relative to the current directory.
+Do not use a `.mailmap` to rewrite author/committer identities. Accepted no-op
+for Git parity: Libra's log never applies a mailmap, so it already shows the raw
+recorded identities. (Git's opposite `--mailmap` is not implemented.)
+
+```bash
+libra log --no-mailmap
+```
+
+### `--no-show-signature`
+
+Do not display the GPG signature of signed commits. Accepted no-op for Git
+parity: Libra's log never displays commit signatures inline, so it already
+matches the default. (Git's opposite `--show-signature` is not implemented.)
+
+```bash
+libra log --no-show-signature
+```
+
+### `--follow <FILE>` / `--no-follow`
+
+Best-effort continuation of a file's history across renames. Paths are
+normalized from the current directory to the repository root. With
+`log.follow=true`, the same traversal is enabled automatically when exactly one
+positional path names an existing file; a single directory remains a normal
+directory filter. `--follow <FILE>` and `--no-follow` override the config. The
+config applies to human and JSON commit selection. Rename matching is exact-blob
+best effort, so content-changing and complex/non-linear renames remain outside
+the compatibility promise.
 
 ```bash
 libra log --follow src/main.rs
+libra log --no-follow src/main.rs
 ```
 
 ### `--parents` / `--children`
@@ -397,17 +549,28 @@ Graph format:
 - `-n` also applies in JSON mode
 - `total` reflects the filtered commit count only when `-n` is not supplied; with `-n`, it is always `null`
 - `--graph`, `--pretty`, and `--oneline` do not change the JSON schema
+- `format.pretty` and `log.date` do not change the JSON schema; `log.follow`
+  can change which commits are selected for a single positional path
 - `--decorate` only affects human rendering; JSON always returns a `refs` array, and auxiliary ref metadata is collected best-effort
 - `files` is always a structured change summary and never includes patch text
 
 ## Design Rationale
 
-### `--range` instead of positional revision syntax
+### Positional revision ranges and the `--range` alternative
 
-Git accepts `git log A..B` where the revision expression is a positional argument.
-Libra exposes the same semantics via `--range A..B` to keep positional arguments
-reserved for pathspecs and to avoid ambiguity with the existing `-- -N` test
-pattern.
+Git accepts `git log A..B` where the revision expression is a positional argument,
+optionally followed by pathspecs. Libra supports this positional form: leading
+arguments are classified as revisions (by resolving them) until the first
+non-revision, after which the rest are pathspecs. Because Libra cannot rely on a
+`--` separator (it is consumed before the command sees it), the split is by
+resolution: a range-syntax token (`A..B`/`A...B`/`^A`) is a revision when it
+resolves, a pathspec when it does not resolve but names an existing path (e.g.
+`../file`), and otherwise an error (a typoed revision is reported as an unknown
+revision/path rather than silently filtering by a missing path). A bare token is
+a revision only if it resolves to a commit; a bare name that is *both* a revision
+and an existing path is rejected as ambiguous. The explicit `--range A..B` flag
+remains as an unambiguous alternative and is the way to force a name that also
+matches a path to be treated as a revision.
 
 ### `--all` implementation
 
@@ -437,9 +600,10 @@ timestamp (no topological constraint).
 
 ### `--follow`
 
-`--follow` performs best-effort rename detection by walking history and matching
-removed/added blob hashes. It does not handle complex directory renames or
-content-similar renames.
+`--follow` performs best-effort rename detection by walking history backwards,
+switching to an exact-blob predecessor path at a rename. It does not handle
+complex directory renames, content-changing/content-similar renames, or every
+non-linear-history case.
 
 ### `-L`
 
@@ -477,6 +641,7 @@ flag only affects the human rendering layer.
 | Show patch | `git log -p` | `jj diff -r <rev>` (separate cmd) | `libra log -p` / `--patch` |
 | Name only | `git log --name-only` | N/A | `libra log --name-only` |
 | Name and status | `git log --name-status` | N/A | `libra log --name-status` |
+| NUL path output | `git log -z --name-status` | N/A | `libra log -z --name-status` |
 | Diffstat | `git log --stat` | `jj diff --stat -r <rev>` | `libra log --stat` |
 | Short diffstat | `git log --shortstat` | N/A | `libra log --shortstat` |
 | Filter by author | `git log --author=<pat>` | `jj log --author <pat>` (revset) | `libra log --author <pat>` |
@@ -489,7 +654,7 @@ flag only affects the human rendering layer.
 | All refs | `git log --all` | `jj log -r 'all()'` | `libra log --all` |
 | Branches only | `git log --branches` | `jj log -r 'branches()'` | N/A |
 | Remotes only | `git log --remotes` | `jj log -r 'remote_branches()'` | N/A |
-| Revision range | `git log A..B` | `jj log -r 'A..B'` | `libra log --range A..B` |
+| Revision range | `git log A..B` | `jj log -r 'A..B'` | `libra log A..B` (positional) or `libra log --range A..B` |
 | Grep message | `git log --grep=<pat>` | Revset `description()` | `libra log --grep <pat>` |
 | Case-insensitive grep | `git log -i --grep=<pat>` | N/A | `libra log -i --grep <pat>` |
 | Invert grep | `git log --invert-grep --grep=<pat>` | N/A | `libra log --invert-grep --grep <pat>` |
@@ -518,8 +683,13 @@ flag only affects the human rendering layer.
 - `--branches` and `--remotes` are not yet implemented
 - `--all` traverses local branches and lightweight tags; remote tracking refs and
   stashes are not included
-- Revision range syntax is available via `--range A..B` and `--range A...B`;
-  positional `git log A..B` syntax is not supported
+- Revision range syntax is available both positionally (`libra log A..B` /
+  `A...B` / `^A`) and via the explicit `--range A..B` flag; because the `--`
+  separator is consumed before the command, the positional rev/path split is by
+  resolution. A range-syntax token that neither resolves nor names an existing
+  path is reported as an unknown revision/path (typo guard); a bare name that is
+  both a revision and a path is rejected as ambiguous (use `--range` to force the
+  revision)
 - `--follow` uses best-effort rename detection and may miss complex renames
 - `-L` is accepted but does not yet provide blame-level line precision
 - `--reverse` is supported

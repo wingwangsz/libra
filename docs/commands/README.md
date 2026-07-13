@@ -2,6 +2,15 @@
 
 This directory contains detailed documentation for all Libra CLI commands. Each document includes a synopsis, option reference, human and structured (JSON) output examples, design rationale, and a parameter comparison with Git and jj.
 
+Compatibility is tracked at two levels: each command page describes the
+user-facing behavior of that command, while
+[`COMPATIBILITY.md`](../../COMPATIBILITY.md#sub-face-compatibility-grading-p0p1-touched-commands)
+grades the P0/P1 command surface by sub-face (`common-user-flow`,
+`porcelain-machine`, `conflict-aware`, `config-aware`, and
+`plumbing-compatible`). Use the sub-face table when a script depends on a
+specific Git-compatible surface such as porcelain output, conflict handling, or
+plumbing syntax.
+
 ## Global Flags
 
 Every Libra command accepts the following global flags:
@@ -26,6 +35,7 @@ Every Libra command accepts the following global flags:
 | `libra init` | | Create a new Libra repository with SQLite-backed metadata, vault signing, and optional Git import | [init.md](init.md) |
 | `libra clone` | | Clone a remote repository with vault bootstrapping, shallow clone, and single-branch support | [clone.md](clone.md) |
 | `libra config` | `cfg` | Manage repository-local and user-global configuration with vault-backed secret encryption | [config.md](config.md) |
+| `libra completions` | | Generate a shell completion script (`bash`/`zsh`/`fish`/`powershell`/`elvish`) from the live CLI | [completions.md](completions.md) |
 
 ### Staging & Working Tree
 
@@ -38,6 +48,11 @@ Every Libra command accepts the following global flags:
 | `libra clean` | | Remove untracked files from the working tree (requires `-n` or `-f`) | [clean.md](clean.md) |
 | `libra stash` | | Save and restore temporary changes with push/pop/list/apply/drop subcommands | [stash.md](stash.md) |
 | `libra status` | `st` | Show the state of the working tree, staging area, and upstream tracking | [status.md](status.md) |
+| `libra dirty` | | Advisory dirty-set marks for the status cache (Libra extension) | [dirty.md](dirty.md) |
+| `libra revision` | | Revision ordinal index over first-parent chains (Libra extension) | [revision.md](revision.md) |
+| `libra commit-tree` | `git commit-tree` | Create a commit object from a tree (plumbing) | [commit-tree.md](commit-tree.md) |
+| `libra auth` | | Host-scoped HTTP token auth (Libra extension) | [auth.md](auth.md) |
+| `libra service` | | Headless local service: notification bus + dirty-mark ingestion (Libra extension) | [service.md](service.md) |
 
 ### Commits & History
 
@@ -45,9 +60,15 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra commit` | `ci` | Record staged changes as a new commit with optional vault signing and conventional format | [commit.md](commit.md) |
 | `libra log` | `hist`, `history` | Show commit history with graph, patch, stat, and custom format support | [log.md](log.md) |
+| `libra logfile` | | Inspect the tracing log-file configuration (path, rotation, filter, size) | [logfile.md](logfile.md) |
 | `libra shortlog` | `slog` | Summarize reachable commits grouped by author | [shortlog.md](shortlog.md) |
 | `libra show` | | Display a commit, tag, tree, blob, or `REV:path` content | [show.md](show.md) |
 | `libra diff` | | Compare differences between HEAD, index, working tree, or two revisions | [diff.md](diff.md) |
+| `libra diff-tree` | | Diff between two trees (git diff-tree) | [diff-tree.md](diff-tree.md) |
+| `libra diff-index` | | Diff a tree against the working tree (git diff-index) | [diff-index.md](diff-index.md) |
+| `libra diff-files` | | Diff the index against the working tree (git diff-files) | [diff-files.md](diff-files.md) |
+| `libra fast-export` | | Emit history as a git fast-import stream | [fast-export.md](fast-export.md) |
+| `libra fast-import` | | Import a git fast-import stream | [fast-import.md](fast-import.md) |
 | `libra blame` | | Trace each line of a file to its introducing commit | [blame.md](blame.md) |
 | `libra describe` | `desc` | Find the nearest reachable tag and format as `tag-N-g<abbrev>` | [describe.md](describe.md) |
 | `libra grep` | | Search for patterns in tracked files with regex, revision, and index support | [grep.md](grep.md) |
@@ -60,6 +81,7 @@ Every Libra command accepts the following global flags:
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
 | `libra branch` | `br` | Create, delete, rename, list, and inspect branches | [branch.md](branch.md) |
+| `libra metadata` | | Branch/repo metadata key-value store (protect/archive/lineage foundation) | [metadata.md](metadata.md) |
 | `libra tag` | | Create, list, or delete lightweight and annotated tags | [tag.md](tag.md) |
 | `libra switch` | `sw` | Switch branches, create new branches, or detach HEAD with fuzzy suggestions | [switch.md](switch.md) |
 | `libra checkout` | | Branch compatibility surface and explicit `--` path-restore alias; prefer `switch` / `restore` | [checkout.md](checkout.md) |
@@ -70,10 +92,15 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra reset` | | Move HEAD and optionally reset index or working directory | [reset.md](reset.md) |
 | `libra merge` | | Fast-forward merge a branch into the current branch | [merge.md](merge.md) |
+| `libra merge-file` | | Three-way merge of three files (git merge-file) | [merge-file.md](merge-file.md) |
+| `libra merge-base` | | Find the best common ancestor(s) of two commits | [merge-base.md](merge-base.md) |
 | `libra rebase` | `rb` | Reapply commits on top of another base tip with conflict resolution | [rebase.md](rebase.md) |
 | `libra cherry-pick` | `cp` | Apply changes from existing commits onto the current branch | [cherry-pick.md](cherry-pick.md) |
 | `libra revert` | | Create a new commit that undoes changes from a specified commit | [revert.md](revert.md) |
+| `libra replace` | | Substitute one object for another on read (refs/replace) | [replace.md](replace.md) |
+| `libra rerere` | | Reuse recorded conflict resolutions | [rerere.md](rerere.md) |
 | `libra bisect` | | Binary search to find the commit that introduced a bug; supports `start` / `bad` / `good` / `reset` / `skip` / `log` / `run` / `view` | [bisect.md](bisect.md) |
+| `libra bundle` | | Create and inspect Git v2 bundle files (`create` / `verify` / `list-heads`) | [bundle.md](bundle.md) |
 
 ### Remote Operations
 
@@ -86,12 +113,17 @@ Every Libra command accepts the following global flags:
 | `libra pull` | | Fetch and fast-forward merge into the current branch | [pull.md](pull.md) |
 | `libra open` | | Open the repository's remote URL in the system browser | [open.md](open.md) |
 | `libra lfs` | | Manage Large File Storage: track, lock, unlock, list LFS files | [lfs.md](lfs.md) |
+| `libra credential` | | Vault-backed Git credential helper (fill/store/erase) | [credential.md](credential.md) |
+| `libra login` | | Authenticate to a Libra host (`/api/cli/*`) and store a host-scoped session token | [login.md](login.md) |
+| `libra logout` | | Clear stored Libra host session tokens (`--all` / `--local-only`) | [logout.md](logout.md) |
+| `libra whoami` | | Report the identity for a stored Libra host session token | [whoami.md](whoami.md) |
 
 ### Cloud & Storage
 
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
 | `libra cloud` | | Cloud backup and restore operations via Cloudflare D1/R2 | [cloud.md](cloud.md) |
+| `libra cache` | | Inspect the tiered-storage / LRU cache configuration (type, threshold, budget) | [cache.md](cache.md) |
 | `libra publish` | | Manage read-only Cloudflare Worker publishing | [publish.md](publish.md) |
 | `libra worktree` | `wt` | Manage multiple working trees attached to the repository | [worktree.md](worktree.md) |
 
@@ -112,9 +144,17 @@ Every Libra command accepts the following global flags:
 
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
+| `libra apply` | | Check whether a unified-diff patch applies (`--check`) | [apply.md](apply.md) |
 | `libra cat-file` | | Inspect Git objects and AI objects by type, size, or pretty-printed content | [cat-file.md](cat-file.md) |
+| `libra check-attr` | | Report Git/Libra attributes (e.g. `filter`, `diff`, `export-ignore`) for pathnames | [check-attr.md](check-attr.md) |
+| `libra check-mailmap` | | Resolve `Name <email>` contacts through `.mailmap` | [check-mailmap.md](check-mailmap.md) |
+| `libra check-ignore` | | Report which pathnames are excluded by Git/Libra ignore rules | [check-ignore.md](check-ignore.md) |
 | `libra fsck` | | Verify the integrity of objects, refs, and index in a Libra repository | [fsck.md](fsck.md) |
 | `libra hash-object` | | Compute Git-compatible blob object IDs from files or standard input | [hash-object.md](hash-object.md) |
+| `libra write-tree` | | Write the current index out as a tree object | [write-tree.md](write-tree.md) |
+| `libra read-tree` | | Read a tree object into the index (index-only) | [read-tree.md](read-tree.md) |
+| `libra update-index` | | Modify the index directly (add/remove/cacheinfo) | [update-index.md](update-index.md) |
+| `libra update-ref` | | Safely update, create, or delete a refs/heads/<branch> ref | [update-ref.md](update-ref.md) |
 | `libra verify-pack` | | Validate pack index files against their pack archives | [verify-pack.md](verify-pack.md) |
 | `libra show-ref` | | List local refs (branches, tags, HEAD) and their object IDs | [show-ref.md](show-ref.md) |
 | `libra symbolic-ref` | | Read or update the symbolic HEAD ref | [symbolic-ref.md](symbolic-ref.md) |

@@ -11,7 +11,15 @@ use super::{
     DiscoveryResult, FetchStream, ProtocolClient, generate_upload_pack_content,
     parse_discovered_references,
 };
-use crate::{command::ask_basic_auth, git_protocol::ServiceType, utils::error::emit_warning};
+use crate::{
+    command::ask_basic_auth,
+    git_protocol::ServiceType,
+    utils::{
+        backoff::{RetryOutcome, RetryPolicy, parse_retry_after, retry_idempotent},
+        error::emit_warning,
+        redact::redact_url_credentials,
+    },
+};
 
 /// A Git protocol client that communicates with a Git server over HTTPS.
 /// Only support `SmartProtocol` now, see [http-protocol](https://www.git-scm.com/docs/http-protocol) for protocol details.
@@ -48,7 +56,9 @@ static AUTH: Mutex<Option<BasicAuth>> = Mutex::new(None);
 impl BasicAuth {
     /// set username & password manually
     pub async fn set_auth(auth: BasicAuth) {
-        AUTH.lock().expect("AUTH mutex poisoned").replace(auth);
+        AUTH.lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .replace(auth);
     }
 
     /// send request with basic auth, retry 3 times
@@ -59,12 +69,71 @@ impl BasicAuth {
         const MAX_TRY: usize = 3;
         let mut res;
         let mut try_cnt = 0;
+        let mut prompted = false;
         loop {
             let mut request = request_builder().await; // RequestBuilder can't be cloned
-            if let Some(auth) = AUTH.lock().expect("AUTH mutex poisoned").deref() {
+            // Poison-tolerant: the guarded data is a plain Option swap, so a
+            // panicked writer cannot leave it inconsistent — never crash the
+            // network hot path over a poisoned mutex.
+            let interactive = AUTH
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner())
+                .deref()
+                .clone();
+            if let Some(auth) = interactive {
                 request = request.basic_auth(auth.username.clone(), Some(auth.password.clone()));
-            } // if no auth exists, try without auth (e.g. clone public)
-            res = request.send().await?;
+                res = request.send().await?;
+            } else {
+                // Stored-token attach (lore.md 1.6): split the builder so the
+                // request URL is known, then attach the host-scoped token —
+                // ONLY when the scope matches and no Authorization header is
+                // already present. Builder errors propagate exactly as
+                // .send() would have surfaced them.
+                let (client, built) = request.build_split();
+                let mut built = built?;
+                if built
+                    .headers()
+                    .get(reqwest::header::AUTHORIZATION)
+                    .is_none()
+                    && let Some(scope) =
+                        crate::internal::auth::HostScope::from_request_url(built.url())
+                {
+                    match crate::internal::auth::lookup(&scope).await {
+                        crate::internal::auth::Lookup::Valid { username, token } => {
+                            use base64::Engine;
+                            let value = format!(
+                                "Basic {}",
+                                base64::engine::general_purpose::STANDARD
+                                    .encode(format!("{username}:{token}"))
+                            );
+                            if let Ok(header) = reqwest::header::HeaderValue::from_str(&value) {
+                                let mut header = header;
+                                header.set_sensitive(true);
+                                built
+                                    .headers_mut()
+                                    .insert(reqwest::header::AUTHORIZATION, header);
+                            }
+                        }
+                        crate::internal::auth::Lookup::Expired { .. } => {
+                            emit_warning(format!(
+                                "stored token for {} is EXPIRED; run 'libra auth login --host {}'",
+                                scope.display(),
+                                scope.display()
+                            ));
+                        }
+                        crate::internal::auth::Lookup::Undecryptable => {
+                            emit_warning(format!(
+                                "stored token for {} cannot be decrypted (key changed?); \
+                                 run 'libra auth login --host {}'",
+                                scope.display(),
+                                scope.display()
+                            ));
+                        }
+                        crate::internal::auth::Lookup::Miss => {}
+                    }
+                }
+                res = client.execute(built).await?;
+            }
             if res.status() == StatusCode::FORBIDDEN {
                 // 403: no access, no need to retry. The caller receives the
                 // response and decides how to handle it — some callers (e.g.
@@ -80,13 +149,121 @@ impl BasicAuth {
                 eprintln!("fatal: failed to authenticate after {MAX_TRY} attempts");
                 break;
             }
+            // 401 auto-guidance (lore.md 2.7): a non-TTY caller must never
+            // hit the interactive prompt (it would consume piped protocol
+            // data) — fail fast with the auth-login hint instead.
+            if !std::io::IsTerminal::is_terminal(&std::io::stdin()) {
+                let scope = crate::internal::auth::HostScope::from_request_url(res.url());
+                let hint = scope
+                    .map(|scope| scope.display())
+                    .unwrap_or_else(|| "<host>".to_string());
+                eprintln!(
+                    "fatal: authentication required; run 'libra auth login --host {hint}' \
+                     (or 'libra auth status --host {hint}' to inspect the stored token)"
+                );
+                break;
+            }
+            if try_cnt == 0
+                && let Some(scope) = crate::internal::auth::HostScope::from_request_url(res.url())
+            {
+                eprintln!(
+                    "tip: 'libra auth login --host {}' stores a token so you are not \
+                     prompted again",
+                    scope.display()
+                );
+            }
             emit_warning("authentication required, retrying...");
             AUTH.lock()
-                .expect("AUTH mutex poisoned")
+                .unwrap_or_else(|poison| poison.into_inner())
                 .replace(ask_basic_auth());
+            prompted = true;
             try_cnt += 1;
         }
+        // Persist-on-success offer (lore.md 2.7): after a PROMPTED attempt
+        // genuinely succeeds (2xx — a 403 may be rate-limiting with WRONG
+        // credentials, never an identity proof), offer ONCE per scope per
+        // process to store the credential through the auth machinery.
+        // Consent-based: default No; `auth.saveOnPrompt` = ask|always|never.
+        if prompted && res.status().is_success() {
+            maybe_offer_persist(res.url()).await;
+        }
         Ok(res)
+    }
+}
+
+/// The consent flow for storing an interactively-entered credential. Never
+/// silent: `always` skips the question but still prints what it stored
+/// (scope only — no secret ever reaches output or logs).
+async fn maybe_offer_persist(url: &url::Url) {
+    use std::io::IsTerminal;
+    if !std::io::stdin().is_terminal() || !std::io::stderr().is_terminal() {
+        return;
+    }
+    let Some(scope) = crate::internal::auth::HostScope::from_request_url(url) else {
+        return; // non-https (non-loopback) would never attach anyway
+    };
+    // Once per scope per process.
+    static OFFERED: std::sync::Mutex<Option<std::collections::HashSet<String>>> =
+        std::sync::Mutex::new(None);
+    {
+        let mut offered = OFFERED.lock().unwrap_or_else(|poison| poison.into_inner());
+        let set = offered.get_or_insert_with(Default::default);
+        if !set.insert(scope.display()) {
+            return;
+        }
+    }
+    let policy = crate::internal::config::ConfigKv::get("auth.saveOnPrompt")
+        .await
+        .ok()
+        .flatten()
+        .map(|entry| entry.value.trim().to_ascii_lowercase())
+        .unwrap_or_else(|| "ask".to_string());
+    let store = match policy.as_str() {
+        "never" => return,
+        "always" => true,
+        _ => {
+            eprint!(
+                "Store this credential for {} (encrypted at rest)? [y/N] ",
+                scope.display()
+            );
+            let mut answer = String::new();
+            if std::io::stdin().read_line(&mut answer).is_err() {
+                return;
+            }
+            matches!(answer.trim(), "y" | "Y" | "yes")
+        }
+    };
+    if !store {
+        return;
+    }
+    let credentials = AUTH
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .clone();
+    let Some(credentials) = credentials else {
+        return;
+    };
+    // The same validation the auth-login path applies (token rules PLUS the
+    // username rules: non-empty, no ':', no control characters).
+    if credentials.password.is_empty()
+        || credentials.password.len() > 8192
+        || credentials.password.chars().any(|c| c.is_control())
+        || credentials.username.is_empty()
+        || credentials.username.contains(':')
+        || credentials.username.chars().any(|c| c.is_control())
+    {
+        return;
+    }
+    match crate::internal::auth::store_token(
+        &scope,
+        &credentials.username,
+        &credentials.password,
+        None,
+    )
+    .await
+    {
+        Ok(()) => eprintln!("Stored token for {}", scope.display()),
+        Err(error) => eprintln!("warning: could not store the credential: {error}"),
     }
 }
 
@@ -129,10 +306,59 @@ impl HttpsClient {
             .url
             .join(&format!("info/refs?service={service_name}"))
             .expect("info/refs?service=... is a valid relative URL");
-        let res = BasicAuth::send(|| async { self.client.get(url.clone()) })
-            .await
-            .map_err(|e| GitError::NetworkError(format!("Failed to send request: {}", e)))?;
-        tracing::debug!("{:?}", res);
+
+        // The info/refs discovery is a pure GET, so it is safe to retry with
+        // bounded backoff when the server rate-limits (`429`) or is temporarily
+        // unavailable (`503`), honouring `Retry-After`. Error messages are
+        // credential-redacted so a `user:token@host` URL never reaches logs.
+        let policy = RetryPolicy::default();
+        let client = &self.client;
+        let url_ref = &url;
+        let res = retry_idempotent(&policy, move |_attempt| async move {
+            let send_result = BasicAuth::send(|| async { client.get(url_ref.clone()) }).await;
+            let res = match send_result {
+                Ok(res) => res,
+                Err(err) => {
+                    let message = format!(
+                        "Failed to send request: {}",
+                        redact_url_credentials(&err.to_string())
+                    );
+                    // A connection-level failure never reached the server, so a
+                    // retry cannot duplicate any effect.
+                    if err.is_connect() {
+                        return RetryOutcome::Retry {
+                            retry_after: None,
+                            last_err: GitError::NetworkError(message),
+                        };
+                    }
+                    return RetryOutcome::Done(Err(GitError::NetworkError(message)));
+                }
+            };
+            if matches!(res.status().as_u16(), 429 | 503) {
+                let retry_after = res
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_retry_after);
+                return RetryOutcome::Retry {
+                    retry_after,
+                    last_err: GitError::NetworkError(format!(
+                        "server rate-limited or unavailable (HTTP {})",
+                        res.status().as_u16()
+                    )),
+                };
+            }
+            RetryOutcome::Done(Ok(res))
+        })
+        .await?;
+        // Do NOT log the `Response` via `Debug`: it embeds the request URL,
+        // which can carry `user:token@host` credentials. Log status + a
+        // credential-redacted URL instead.
+        tracing::debug!(
+            "discovery response: status={}, url={}",
+            res.status(),
+            redact_url_credentials(res.url().as_str())
+        );
 
         if res.status() == 401 {
             return Err(GitError::UnAuthorized(
@@ -166,11 +392,15 @@ impl HttpsClient {
             )));
         }
 
-        let response_content = res
-            .bytes()
-            .await
-            .map_err(|e| GitError::NetworkError(format!("Failed to read response body: {}", e)))?;
-        tracing::debug!("{:?}", response_content);
+        let response_content = res.bytes().await.map_err(|e| {
+            GitError::NetworkError(format!(
+                "Failed to read response body: {}",
+                redact_url_credentials(&e.to_string())
+            ))
+        })?;
+        // Log only the size, never the full body bytes (lore.md §0.2: do not
+        // echo complete response bodies).
+        tracing::debug!("discovery response body: {} bytes", response_content.len());
 
         parse_discovered_references(response_content, service)
     }
@@ -204,11 +434,26 @@ impl HttpsClient {
                 .body(body.clone())
         })
         .await
-        .map_err(|e| IoError::other(format!("Failed to send request: {}", e)))?;
-        tracing::debug!("request: {:?}", res);
+        .map_err(|e| {
+            IoError::other(format!(
+                "Failed to send request: {}",
+                redact_url_credentials(&e.to_string())
+            ))
+        })?;
+        // Never log the `Response` via `Debug` (embeds a possibly credentialed
+        // URL); log status + a redacted URL instead.
+        tracing::debug!(
+            "upload-pack response: status={}, url={}",
+            res.status(),
+            redact_url_credentials(res.url().as_str())
+        );
 
         if res.status() != 200 && res.status() != 304 {
-            tracing::error!("request failed: {:?}", res);
+            tracing::error!(
+                "upload-pack request failed: status={}, url={}",
+                res.status(),
+                redact_url_credentials(res.url().as_str())
+            );
             return Err(IoError::other(format!(
                 "Error Response format, status code: {}",
                 res.status()
@@ -248,12 +493,34 @@ fn normalize_url(url: &Url) -> Url {
     }
 }
 
+/// Redirect policy that refuses an https→http downgrade: reqwest strips
+/// Authorization only when the HOST or PORT changes — a same-host cleartext
+/// downgrade would re-send credentials over http (lore.md 1.6 review
+/// finding). Same-scheme redirects keep reqwest's default 10-hop limit.
+pub(crate) fn no_downgrade_redirect_policy() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let downgraded = attempt.url().scheme() == "http"
+            && attempt
+                .previous()
+                .last()
+                .is_some_and(|previous| previous.scheme() == "https");
+        if downgraded {
+            attempt.error("refusing an https->http downgrade redirect")
+        } else if attempt.previous().len() > 10 {
+            attempt.error("too many redirects")
+        } else {
+            attempt.follow()
+        }
+    })
+}
+
 fn build_client(
     connect_timeout: Duration,
     read_timeout: Duration,
 ) -> Result<reqwest::Client, String> {
     reqwest::Client::builder()
         .http1_only()
+        .redirect(no_downgrade_redirect_policy())
         .connect_timeout(connect_timeout)
         .read_timeout(read_timeout)
         .build()

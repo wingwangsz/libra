@@ -12,7 +12,7 @@
 use std::{env, io::Write, path::Path};
 
 use clap::{
-    Parser, Subcommand,
+    CommandFactory, Parser, Subcommand,
     error::{ContextKind, ContextValue, ErrorKind},
 };
 use git_internal::hash::{HashKind, set_hash_kind};
@@ -28,15 +28,36 @@ use crate::{
     },
 };
 
-const ROOT_AFTER_HELP: &str = "\
+// The `media` command (lore.md §6) is a cfg-gated `Commands` variant, so its
+// Command-Groups entry must appear ONLY under `--features fastcdc` — otherwise
+// the default-features compat matrix (which cross-checks every listed command
+// against the real CLI surface) would see a command that does not exist. A
+// cfg-selected macro fragment splices it into the Working Tree row.
+#[cfg(feature = "fastcdc")]
+macro_rules! media_group_entry {
+    () => {
+        ", media"
+    };
+}
+#[cfg(not(feature = "fastcdc"))]
+macro_rules! media_group_entry {
+    () => {
+        ""
+    };
+}
+
+const ROOT_AFTER_HELP: &str = concat!(
+    "\
 Command Groups:
-  Repository Setup        init, clone, config
-  Working Tree            status, add, rm, mv, restore, clean, stash, lfs, ls-files, worktree
-  History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive
-  Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert
-  Remote And Cloud        remote, fetch, pull, push, open, cloud, publish
-  AI And Automation       code, code-control, automation, usage, graph, sandbox, agent
-  Maintenance And Plumbing fsck, maintenance, cat-file, hash-object, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref
+  Repository Setup        init, clone, config, completions
+  Working Tree            status, add, rm, mv, restore, clean, stash, dirty, layer, sparse-view, hydrate",
+    media_group_entry!(),
+    ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
+  History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
+  Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
+  Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
+  AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, review, investigate, service
+  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
   error-codes  Print the stable CLI error code table (`libra help error-codes`)
@@ -49,9 +70,15 @@ Output Examples:
   libra --color=never log              Force-disable colors (also via NO_COLOR=1)
 
 For per-command flags, see `libra <cmd> --help`.
-";
+"
+);
 
 const ERROR_CODES_HELP: &str = include_str!("../docs/error-codes.md");
+const CLOUD_GLOBAL_CONFIG_KEYS: &[&str] = &[
+    "LIBRA_D1_ACCOUNT_ID",
+    "LIBRA_D1_API_TOKEN",
+    "LIBRA_D1_DATABASE_ID",
+];
 
 /// Read the repository's `core.objectformat` and pin the global hash algorithm.
 ///
@@ -264,6 +291,29 @@ struct Cli {
     )]
     progress: String,
 
+    /// fsync object writes (and their parent directories) for power-loss
+    /// durability, at the cost of write throughput. Recovery-critical sequencer
+    /// state is always fsynced regardless of this flag. Also settable via
+    /// `LIBRA_SYNC_DATA=1`.
+    #[arg(long, global = true)]
+    sync_data: bool,
+
+    /// Read objects from the local store only; never fetch from the configured
+    /// durable tier (a needed remote object becomes a clear error). This is
+    /// Libra's spelling of Lore's `--offline`/`--local` read policy as a single
+    /// collision-free global flag (a global `--local`/`--remote` would clash with
+    /// `config`/`clone`/`agent` options). For the `remote`-refresh policy use
+    /// `LIBRA_READ_POLICY=remote`. No-op for local-only repositories.
+    #[arg(long, global = true)]
+    offline: bool,
+
+    /// Maximum number of concurrent remote connections/requests (bounds fan-out
+    /// on large repos / CI so connections are not exhausted). A positive integer;
+    /// `0` is treated as `1`. Also settable via `LIBRA_MAX_CONNECTIONS`
+    /// (flag wins). Default 16. No-op for purely local operations.
+    #[arg(long, global = true, value_name = "N")]
+    max_connections: Option<usize>,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -324,6 +374,84 @@ enum Commands {
 
     #[command(about = "Show commit logs", alias = "hist", alias = "history")]
     Log(command::log::LogArgs),
+    #[command(
+        about = "Inspect the tracing log-file configuration",
+        after_help = command::logfile::LOGFILE_EXAMPLES
+    )]
+    Logfile(command::logfile::LogfileArgs),
+    #[command(
+        about = "Inspect the tiered-storage / LRU cache configuration",
+        after_help = command::cache::CACHE_EXAMPLES
+    )]
+    Cache(command::cache::CacheArgs),
+    #[command(
+        about = "Manage local, never-committed working-tree overlays (Libra extension)",
+        after_help = command::layer::LAYER_EXAMPLES
+    )]
+    Layer(command::layer::LayerArgs),
+    #[command(
+        about = "Object-level operations incl. payload obliteration (Libra extension)",
+        after_help = command::file::FILE_EXAMPLES
+    )]
+    File(command::file::FileArgs),
+    #[command(
+        about = "Manage object alternates — borrow objects from a shared store (Libra extension)",
+        after_help = command::alternates::ALTERNATES_EXAMPLES
+    )]
+    Alternates(command::alternates::AlternatesArgs),
+    #[command(
+        about = "Manage the file dependency graph (Libra extension)",
+        after_help = command::deps::DEPS_EXAMPLES
+    )]
+    Deps(command::deps::DepsArgs),
+    #[command(
+        about = "Hydrate working-tree content on demand (Libra extension)",
+        after_help = command::hydrate::HYDRATE_EXAMPLES
+    )]
+    Hydrate(command::hydrate::HydrateArgs),
+    #[cfg(feature = "fastcdc")]
+    #[command(
+        about = "FastCDC LFS media chunking client (Libra extension, lore.md §6)",
+        after_help = command::media::MEDIA_EXAMPLES
+    )]
+    Media(command::media::MediaArgs),
+    #[command(
+        name = "sparse-view",
+        about = "Manage the read-only sparse view filter over ls-files/diff (Libra extension)",
+        after_help = command::sparse_view::SPARSE_VIEW_EXAMPLES
+    )]
+    SparseView(command::sparse_view::SparseViewArgs),
+    #[command(
+        about = "Branch/repo metadata key-value store (Libra extension)",
+        after_help = command::metadata::METADATA_EXAMPLES
+    )]
+    Metadata(command::metadata::MetadataArgs),
+    #[command(
+        about = "Mark paths dirty in the dirty-set cache, or list it (Libra extension)",
+        after_help = command::dirty::DIRTY_EXAMPLES
+    )]
+    Dirty(command::dirty::DirtyArgs),
+    #[command(
+        about = "Manage host-scoped HTTP tokens: login, status, logout (Libra extension)",
+        after_help = command::auth::AUTH_EXAMPLES
+    )]
+    Auth(command::auth::AuthArgs),
+    #[command(about = "Log in to Libra website account via browser")]
+    Login(command::account::LoginArgs),
+    #[command(about = "Show the current Libra website account session")]
+    Whoami(command::account::WhoamiArgs),
+    #[command(about = "Log out of the Libra website account session")]
+    Logout(command::account::LogoutArgs),
+    #[command(
+        about = "Look up revisions by ordinal on a branch's first-parent chain (Libra extension)",
+        after_help = command::revision::REVISION_EXAMPLES
+    )]
+    Revision(command::revision::RevisionArgs),
+    #[command(
+        about = "Run a headless local service: notification bus + dirty-mark ingestion (Libra extension)",
+        after_help = command::service::SERVICE_EXAMPLES
+    )]
+    Service(command::service::ServiceArgs),
     #[command(about = "Summarize commit history by author", alias = "slog")]
     Shortlog(command::shortlog::ShortlogArgs),
     #[command(about = "Show various types of objects")]
@@ -372,12 +500,73 @@ enum Commands {
     #[command(about = "Provide content, type or size info for repository objects")]
     CatFile(command::cat_file::CatFileArgs),
     #[command(
+        about = "Report pathnames excluded by Git/Libra ignore rules",
+        after_help = command::check_ignore::CHECK_IGNORE_EXAMPLES
+    )]
+    CheckIgnore(command::check_ignore::CheckIgnoreArgs),
+    #[command(
+        about = "Report Git/Libra attributes for pathnames",
+        after_help = command::check_attr::CHECK_ATTR_EXAMPLES
+    )]
+    CheckAttr(command::check_attr::CheckAttrArgs),
+    #[command(
+        about = "Resolve Name <email> contacts through .mailmap",
+        after_help = command::check_mailmap::CHECK_MAILMAP_EXAMPLES
+    )]
+    CheckMailmap(command::check_mailmap::CheckMailmapArgs),
+    #[command(
+        about = "Emit history as a fast-import stream (git fast-export)",
+        after_help = command::fast_export::FAST_EXPORT_EXAMPLES
+    )]
+    FastExport(command::fast_export::FastExportArgs),
+    #[command(
+        about = "Create and inspect Git v2 bundle files",
+        after_help = command::bundle::BUNDLE_EXAMPLES
+    )]
+    Bundle(command::bundle::BundleArgs),
+    #[command(
+        about = "Import a git fast-import stream",
+        after_help = command::fast_import::FAST_IMPORT_EXAMPLES
+    )]
+    FastImport(command::fast_import::FastImportArgs),
+    #[command(
+        about = "Generate a shell completion script",
+        after_help = command::completions::COMPLETIONS_EXAMPLES
+    )]
+    Completions(command::completions::CompletionsArgs),
+    #[command(
         about = "Create an archive of files from a named tree",
         after_help = command::archive::ARCHIVE_EXAMPLES
     )]
     Archive(command::archive::ArchiveArgs),
     #[command(about = "Compute Git-compatible object IDs")]
     HashObject(command::hash_object::HashObjectArgs),
+    #[command(
+        about = "Write the current index out as a tree object",
+        after_help = command::write_tree::WRITE_TREE_EXAMPLES
+    )]
+    WriteTree(command::write_tree::WriteTreeArgs),
+    #[command(
+        about = "Create a commit object from an existing tree (plumbing; no ref updates)",
+        after_help = command::commit_tree::COMMIT_TREE_EXAMPLES,
+        name = "commit-tree"
+    )]
+    CommitTree(command::commit_tree::CommitTreeArgs),
+    #[command(
+        about = "Read a tree object into the index",
+        after_help = command::read_tree::READ_TREE_EXAMPLES
+    )]
+    ReadTree(command::read_tree::ReadTreeArgs),
+    #[command(
+        about = "Modify the index directly (add/remove/cacheinfo)",
+        after_help = command::update_index::UPDATE_INDEX_EXAMPLES
+    )]
+    UpdateIndex(command::update_index::UpdateIndexArgs),
+    #[command(
+        about = "Safely update, create, or delete a refs/heads/<branch> ref",
+        after_help = command::update_ref::UPDATE_REF_EXAMPLES
+    )]
+    UpdateRef(command::update_ref::UpdateRefArgs),
     #[command(about = "Validate pack index files against pack archives")]
     VerifyPack(command::verify_pack::VerifyPackArgs),
 
@@ -395,6 +584,46 @@ enum Commands {
     Tag(command::tag::TagArgs),
     #[command(about = "Merge changes")]
     Merge(command::merge::MergeArgs),
+    #[command(
+        about = "Three-way merge files (git merge-file)",
+        after_help = command::merge_file::MERGE_FILE_EXAMPLES
+    )]
+    MergeFile(command::merge_file::MergeFileArgs),
+    #[command(
+        about = "Find the best common ancestor(s) of two commits",
+        after_help = command::merge_base::MERGE_BASE_EXAMPLES
+    )]
+    MergeBase(command::merge_base::MergeBaseArgs),
+    #[command(
+        about = "Check whether a patch applies (git apply --check)",
+        after_help = command::apply::APPLY_EXAMPLES
+    )]
+    Apply(command::apply::ApplyArgs),
+    #[command(
+        about = "Diff between two trees (git diff-tree)",
+        after_help = command::diff_plumbing::DIFF_TREE_EXAMPLES
+    )]
+    DiffTree(command::diff_plumbing::DiffTreeArgs),
+    #[command(
+        about = "Diff a tree against the working tree (git diff-index)",
+        after_help = command::diff_plumbing::DIFF_INDEX_EXAMPLES
+    )]
+    DiffIndex(command::diff_plumbing::DiffIndexArgs),
+    #[command(
+        about = "Diff the index against the working tree (git diff-files)",
+        after_help = command::diff_plumbing::DIFF_FILES_EXAMPLES
+    )]
+    DiffFiles(command::diff_plumbing::DiffFilesArgs),
+    #[command(
+        about = "Vault-backed Git credential helper (fill/store/erase)",
+        after_help = command::credential::CREDENTIAL_EXAMPLES
+    )]
+    Credential(command::credential::CredentialArgs),
+    #[command(
+        about = "Reuse recorded conflict resolutions (git rerere)",
+        after_help = command::rerere::RERERE_EXAMPLES
+    )]
+    Rerere(command::rerere::RerereArgs),
     #[command(about = "Reapply commits on top of another base tip", alias = "rb")]
     Rebase(command::rebase::RebaseArgs),
     #[command(about = "Reset current HEAD to specified state")]
@@ -417,8 +646,18 @@ enum Commands {
         after_help = command::maintenance::MAINTENANCE_EXAMPLES
     )]
     Maintenance(command::maintenance::MaintenanceArgs),
+    #[command(
+        about = "Combine repository objects into a single pack",
+        after_help = command::repack::REPACK_EXAMPLES
+    )]
+    Repack(command::repack::RepackArgs),
     #[command(about = "Revert some existing commits")]
     Revert(command::revert::RevertArgs),
+    #[command(
+        about = "Create, list, or delete object replacements (refs/replace)",
+        after_help = command::replace::REPLACE_EXAMPLES
+    )]
+    Replace(command::replace::ReplaceArgs),
     #[command(about = "Manage the log of reference changes (e.g., HEAD, branches)")]
     Reflog(command::reflog::ReflogArgs),
     #[command(about = "View and restore command-level operation history")]
@@ -457,11 +696,21 @@ enum Commands {
     Sandbox(command::sandbox::SandboxArgs),
     #[command(about = "Manage external-agent capture (Claude Code, Gemini, …)")]
     Agent(command::agent::AgentArgs),
+    #[command(about = "Run read-only external-agent code reviews (AG-22)")]
+    Review(command::agent::review::ReviewArgs),
+    #[command(about = "Run read-only round-robin agent investigations (AG-23)")]
+    Investigate(command::agent::investigate::InvestigateArgs),
     #[command(
         about = "Build pack index file for an existing packed archive",
         hide = true
     )]
     IndexPack(command::index_pack::IndexPackArgs),
+    #[command(
+        about = "Create a pack from object ids read on stdin (internal plumbing)",
+        after_help = command::pack_objects::PACK_OBJECTS_EXAMPLES,
+        hide = true
+    )]
+    PackObjects(command::pack_objects::PackObjectsArgs),
     #[command(
         about = "Compatibility entry for hook configurations installed by `libra agent enable`",
         hide = true
@@ -478,9 +727,16 @@ pub enum Stash {
         #[arg(
             short = 'u',
             long = "include-untracked",
-            help = "Include untracked files in the stash"
+            help = "Include untracked files in the stash",
+            overrides_with = "no_include_untracked"
         )]
         include_untracked: bool,
+        #[arg(
+            long = "no-include-untracked",
+            help = "Do not include untracked files (the default); countermands an earlier -u/--include-untracked (last one wins)",
+            overrides_with = "include_untracked"
+        )]
+        no_include_untracked: bool,
         #[arg(
             short = 'a',
             long = "all",
@@ -493,6 +749,11 @@ pub enum Stash {
             help = "Keep staged changes in the index and working tree"
         )]
         keep_index: bool,
+        #[arg(
+            value_name = "pathspec",
+            help = "Stash only the changes to the given paths, leaving the rest of the working tree intact"
+        )]
+        pathspec: Vec<String>,
     },
     #[command(about = "Remove a single stashed state from the stash list")]
     Pop {
@@ -511,7 +772,9 @@ pub enum Stash {
         #[arg(help = "The stash to drop")]
         stash: Option<String>,
     },
-    #[command(about = "Show the changes recorded in the stash as a file-level summary")]
+    #[command(
+        about = "Show the changes recorded in the stash as a file-level summary or a unified diff (-p)"
+    )]
     Show {
         #[arg(help = "Stash reference (default: stash@{0})")]
         stash: Option<String>,
@@ -519,6 +782,12 @@ pub enum Stash {
         name_only: bool,
         #[arg(long, help = "Show only file names with their status code")]
         name_status: bool,
+        #[arg(
+            short = 'p',
+            long = "patch",
+            help = "Show the stashed changes as a unified diff (patch)"
+        )]
+        patch: bool,
     },
     #[command(about = "Create and check out a new branch from the stash, then drop it")]
     Branch {
@@ -583,7 +852,10 @@ pub enum Bisect {
         )]
         cmd: Vec<String>,
     },
-    #[command(about = "Show the current bisect state and remaining candidates")]
+    #[command(
+        about = "Show the current bisect state and remaining candidates",
+        visible_alias = "visualize"
+    )]
     View,
 }
 
@@ -606,7 +878,48 @@ pub fn parse(args: Option<&[&str]>) -> CliResult<()> {
         .build()
         .map_err(|e| CliError::fatal(format!("failed to create tokio runtime: {e}")))?;
 
-    runtime.block_on(Box::pin(parse_async(args)))
+    // The one vetted telemetry span (lore.md 1.7): canonical subcommand name,
+    // duration, and on failure the stable LBR-* code — NOTHING else. Plain
+    // `tracing`, so it is a no-op without a matching layer; the OTLP layer is
+    // feature+endpoint gated, and the fmt layer excludes this target so
+    // LIBRA_LOG output is byte-unchanged. Library embedders calling
+    // parse_async/exec_async directly bypass it (documented).
+    let command_name = canonical_command_name(args);
+    let span = tracing::info_span!(
+        target: "libra::telemetry",
+        "libra.command",
+        libra.command = command_name.as_deref().unwrap_or("<none>"),
+        otel.status_code = tracing::field::Empty,
+        libra.error_code = tracing::field::Empty,
+    );
+    let result = span.in_scope(|| runtime.block_on(Box::pin(parse_async(args))));
+    if let Err(error) = &result {
+        // tracing-opentelemetry maps `otel.status_code` to the OTel status.
+        span.record("otel.status_code", "ERROR");
+        span.record("libra.error_code", error.stable_code().as_str());
+    }
+    result
+}
+
+/// The CANONICAL subcommand name for telemetry: the raw argv token resolved
+/// through clap's own metadata (aliases like `br` canonicalize to `branch`).
+/// Never derived from user argv content beyond the subcommand token itself.
+fn canonical_command_name(args: Option<&[&str]>) -> Option<String> {
+    let argv: Vec<String> = match args {
+        Some(args) => args.iter().map(|s| s.to_string()).collect(),
+        None => env::args().collect(),
+    };
+    let (index, _) = find_subcommand_index(&argv)?;
+    let token = argv.get(index)?;
+    let cli = <Cli as clap::CommandFactory>::command();
+    cli.get_subcommands()
+        .find(|candidate| {
+            candidate.get_name() == token.as_str()
+                || candidate
+                    .get_all_aliases()
+                    .any(|alias| alias == token.as_str())
+        })
+        .map(|candidate| candidate.get_name().to_string())
 }
 
 /// Rewrite Git-style `-<n>` shortcuts into the long-form `-n <n>` flag, but only when
@@ -716,6 +1029,81 @@ fn rewrite_index_pack_progress_args(args: Vec<String>) -> Vec<String> {
     out
 }
 
+fn rewrite_reset_pathspec_separator_args(args: Vec<String>) -> Vec<String> {
+    let subcommand = find_subcommand_index(&args);
+    let Some((reset_index, from_double_dash)) = subcommand else {
+        return args;
+    };
+    if !matches!(args.get(reset_index), Some(name) if name == "reset") {
+        return args;
+    }
+
+    let separator_index = args
+        .iter()
+        .enumerate()
+        .skip(reset_index + 1)
+        .find_map(|(index, arg)| (arg == "--").then_some(index));
+    let Some(separator_index) = separator_index else {
+        return args;
+    };
+
+    let has_target_before_separator =
+        reset_has_positional_target_before_separator(&args, reset_index + 1, separator_index);
+    let mut out = Vec::with_capacity(args.len() + usize::from(!has_target_before_separator));
+    if from_double_dash {
+        for (idx, arg) in args.iter().enumerate().take(reset_index + 1) {
+            if idx + 1 == reset_index && arg == "--" {
+                continue;
+            }
+            out.push(arg.clone());
+        }
+    } else {
+        out.extend(args.iter().take(reset_index + 1).cloned());
+    }
+
+    for arg in args.iter().take(separator_index).skip(reset_index + 1) {
+        out.push(arg.clone());
+    }
+    out.push(format!(
+        "--{}",
+        command::reset::RESET_PATHSPEC_SEPARATOR_FLAG
+    ));
+    if !has_target_before_separator && args.get(separator_index + 1).is_some() {
+        out.push(command::reset::DEFAULT_RESET_TARGET.to_string());
+    }
+    out.push("--".to_string());
+    out.extend(args.iter().skip(separator_index + 1).cloned());
+    out
+}
+
+fn reset_has_positional_target_before_separator(
+    args: &[String],
+    start: usize,
+    separator_index: usize,
+) -> bool {
+    let mut index = start;
+    while index < separator_index {
+        let arg = &args[index];
+        if reset_flag_takes_separate_value(arg) {
+            index += 2;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn reset_flag_takes_separate_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "--pathspec-from-file" | "--color" | "--progress" | "--max-connections"
+    )
+}
+
 /// Locate the first non-flag token in `args` and return its index plus whether it was
 /// produced by an explicit `--` separator.
 ///
@@ -790,6 +1178,45 @@ fn parse_error_hints(err: &clap::Error) -> Vec<String> {
             }
         }
     }
+    hints
+}
+
+fn push_unique_hint(hints: &mut Vec<String>, hint: String) {
+    if !hint.is_empty() && !hints.iter().any(|existing| existing == &hint) {
+        hints.push(hint);
+    }
+}
+
+fn top_level_unknown_command_hints(err: &clap::Error) -> Vec<String> {
+    let mut hints = parse_error_hints(err);
+
+    if let Some(ContextValue::Strings(suggestions)) = err.get(ContextKind::SuggestedSubcommand) {
+        match suggestions.as_slice() {
+            [] => {}
+            [suggestion] => push_unique_hint(
+                &mut hints,
+                format!("a similar subcommand exists: '{suggestion}'"),
+            ),
+            suggestions => {
+                let suggestions = suggestions
+                    .iter()
+                    .map(|suggestion| format!("'{suggestion}'"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push_unique_hint(
+                    &mut hints,
+                    format!("similar subcommands exist: {suggestions}"),
+                );
+            }
+        }
+    }
+
+    if let Some(ContextValue::StyledStrs(suggestions)) = err.get(ContextKind::Suggested) {
+        for suggestion in suggestions {
+            push_unique_hint(&mut hints, suggestion.to_string().trim().to_string());
+        }
+    }
+
     hints
 }
 
@@ -970,7 +1397,33 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         | Commands::Open(_)
         | Commands::CodeControl(_)
         | Commands::LsRemote(_)
+        // `merge-file` is a standalone three-way text merge over files on disk;
+        // it touches no objects and works outside a repository, like Git.
+        | Commands::MergeFile(_)
+        // `credential` is a Git credential helper: `fill` must be a clean miss
+        // (exit 0, no output) even outside a repository, so it touches no objects
+        // and skips the hash-kind preflight. It resolves the repo vault lazily.
+        | Commands::Credential(_)
+        // `completions` renders a shell script from the clap command tree; it
+        // reads no objects and works outside a repository.
+        | Commands::Completions(_)
+        // `logfile` only inspects env-derived tracing configuration.
+        | Commands::Logfile(_)
+        // `auth` manages host-global tokens in the GLOBAL store; it works
+        // outside a repository and touches no objects.
+        | Commands::Auth(_)
+        | Commands::Login(_)
+        | Commands::Whoami(_)
+        | Commands::Logout(_)
         | Commands::Sandbox(_) => Ok(CommandPreflight::none()),
+        // `cache info` only inspects env/config-derived storage tunables and
+        // works outside a repository; `cache evict` deletes local objects, so
+        // it takes the standard repo + hash-kind preflight.
+        Commands::Cache(cache_args)
+            if matches!(cache_args.command, command::cache::CacheCommand::Info) =>
+        {
+            Ok(CommandPreflight::none())
+        }
         Commands::HashObject(args) if !args.write => {
             match utils::util::try_get_storage_path(None) {
                 Ok(storage) => Ok(CommandPreflight::repo_hash_kind_without_schema_guard(
@@ -985,6 +1438,9 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
             )),
             Err(_) => Ok(CommandPreflight::sha1_without_repo()),
         },
+        // `grep --no-index` searches the filesystem directly and works outside a
+        // repository, so it needs no storage/hash-kind preflight.
+        Commands::Grep(args) if args.no_index => Ok(CommandPreflight::none()),
         Commands::Archive(args) if args.list => Ok(CommandPreflight::none()),
         #[cfg(unix)]
         Commands::Worktree(command::worktree::WorktreeArgs {
@@ -1038,6 +1494,153 @@ fn print_error_codes_help() -> CliResult<()> {
     Ok(())
 }
 
+fn apply_global_runtime_flags(args: &Cli) -> CliResult<()> {
+    // `--sync-data` forces object-write fsync on for this run, layering over the
+    // `LIBRA_SYNC_DATA` env default. The flag can only turn it on; absence leaves
+    // whatever the env initialised.
+    if args.sync_data {
+        utils::atomic_write::set_sync_data(true);
+    }
+
+    // Object read policy (lore.md §0.8): the `LIBRA_READ_POLICY` env var is the
+    // baseline (auto/offline/local/remote); the `--offline` flag overrides it to
+    // local-only. ALWAYS set it (resolving to Auto when nothing is requested) so
+    // a reused process — TUI, tests — never inherits a stale policy. An
+    // unrecognized env value is a hard error rather than a silent Auto fallback,
+    // so a typo cannot quietly re-enable durable-tier reads.
+    let read_policy = if args.offline {
+        utils::read_policy::ReadPolicy::LocalOnly
+    } else {
+        utils::read_policy::read_policy_from_env().map_err(|message| {
+            CliError::command_usage(format!("invalid LIBRA_READ_POLICY: {message}"))
+                .with_stable_code(utils::error::StableErrorCode::CliInvalidArguments)
+                .with_exit_code(128)
+        })?
+    };
+    utils::read_policy::set_read_policy(read_policy);
+
+    // Resource limits (lore.md §0.9): `--max-connections` flag wins over the
+    // `LIBRA_MAX_CONNECTIONS` env baseline, else the default. Always set so a
+    // reused process never inherits a stale limit; an invalid env value errors.
+    let max_connections = match args.max_connections {
+        Some(limit) => limit,
+        None => utils::resource_limits::max_connections_from_env()
+            .map_err(|message| {
+                CliError::command_usage(format!("invalid LIBRA_MAX_CONNECTIONS: {message}"))
+                    .with_stable_code(utils::error::StableErrorCode::CliInvalidArguments)
+                    .with_exit_code(128)
+            })?
+            .unwrap_or(utils::resource_limits::DEFAULT_MAX_CONNECTIONS),
+    };
+    utils::resource_limits::set_max_connections(max_connections);
+
+    Ok(())
+}
+
+async fn enforce_global_config_schema_policy(command: &Commands) -> CliResult<()> {
+    let Some(future) = utils::client_storage::inspect_global_config_schema_future().await else {
+        return Ok(());
+    };
+
+    if utils::read_policy::read_policy() == utils::read_policy::ReadPolicy::LocalOnly {
+        utils::client_storage::emit_global_config_schema_future_warning(
+            &future,
+            "--offline or LIBRA_READ_POLICY=offline/local requested; ignoring global storage config and continuing with local storage",
+        );
+        return Ok(());
+    }
+
+    if command_requires_global_storage_config(command)
+        && command_may_read_global_config(command).await
+    {
+        return Err(global_config_schema_future_error(command, &future));
+    }
+
+    let action = if command_requires_global_storage_config(command) {
+        "process or repo-local configuration makes global storage config unnecessary; ignoring global config and continuing"
+    } else {
+        "command does not require global storage config; ignoring global config and continuing"
+    };
+    utils::client_storage::emit_global_config_schema_future_warning(&future, action);
+    Ok(())
+}
+
+async fn command_may_read_global_config(command: &Commands) -> bool {
+    let storage_may_read_global =
+        utils::client_storage::storage_config_resolution_may_read_global_config().await;
+    if matches!(command, Commands::Cloud(_)) {
+        storage_may_read_global
+            || utils::client_storage::env_resolution_may_read_global_config(
+                CLOUD_GLOBAL_CONFIG_KEYS,
+            )
+            .await
+    } else {
+        storage_may_read_global
+    }
+}
+
+fn command_requires_global_storage_config(command: &Commands) -> bool {
+    matches!(
+        command,
+        Commands::Pull(_)
+            | Commands::Push(_)
+            | Commands::Fetch(_)
+            | Commands::Clone(_)
+            | Commands::Cloud(_)
+    )
+}
+
+fn command_name(command: &Commands) -> &'static str {
+    match command {
+        Commands::Pull(_) => "pull",
+        Commands::Push(_) => "push",
+        Commands::Fetch(_) => "fetch",
+        Commands::Clone(_) => "clone",
+        Commands::Cloud(_) => "cloud",
+        _ => "command",
+    }
+}
+
+fn global_config_schema_future_error(
+    command: &Commands,
+    future: &utils::client_storage::GlobalConfigSchemaFuture,
+) -> CliError {
+    let command_name = command_name(command);
+    CliError::fatal(future.diagnostic_message(&format!(
+        "`libra {command_name}` requires global storage config to be trusted and was stopped before using local fallback"
+    )))
+    .with_stable_code(utils::error::StableErrorCode::ConfigSchemaFuture)
+    .with_hint(format!(
+        "install a newer Libra binary with: {}",
+        utils::client_storage::INSTALL_NEWER_LIBRA_COMMAND
+    ))
+    .with_hint("use --offline or LIBRA_READ_POLICY=offline/local only when local-only object access is intended")
+    .with_detail("command", command_name)
+    .with_detail(
+        "binary_path",
+        utils::client_storage::GlobalConfigSchemaFuture::binary_path_display(),
+    )
+    .with_detail("binary_version", env!("CARGO_PKG_VERSION"))
+    .with_detail("config_database", future.db_path.display().to_string())
+    .with_detail("config_schema_version", future.current_version)
+    .with_detail(
+        "latest_supported_schema_version",
+        future.latest_supported_display(),
+    )
+    .with_detail(
+        "install_command",
+        utils::client_storage::INSTALL_NEWER_LIBRA_COMMAND,
+    )
+}
+
+fn prepare_cli_invocation_state() {
+    utils::output::reset_warning_tracker();
+    utils::client_storage::reset_global_config_schema_future_warning_for_invocation();
+    // Pick up `LIBRA_SYNC_DATA` so atomic object writes fsync when requested
+    // (lore.md §7.7; the `--sync-data` flag of §0.5 layers on top).
+    utils::atomic_write::init_sync_data_from_env();
+}
+
 fn is_top_level_unknown_command(argv: &[String], err: &clap::Error) -> Option<String> {
     let invalid = match err.get(ContextKind::InvalidSubcommand) {
         Some(ContextValue::String(cmd)) => cmd,
@@ -1054,7 +1657,7 @@ fn is_top_level_unknown_command(argv: &[String], err: &clap::Error) -> Option<St
 
 fn classify_parse_error(argv: &[String], err: &clap::Error) -> CliError {
     if let Some(cmd) = is_top_level_unknown_command(argv, err) {
-        let (_, _, hints) = parse_error_components(err);
+        let hints = top_level_unknown_command_hints(err);
         let mut cli_error = CliError::unknown_command(format!(
             "libra: '{cmd}' is not a libra command. See 'libra --help'."
         ));
@@ -1121,7 +1724,8 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     };
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
-    utils::output::reset_warning_tracker();
+    let argv = rewrite_reset_pathspec_separator_args(argv);
+    prepare_cli_invocation_state();
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
     }
@@ -1139,6 +1743,8 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    apply_global_runtime_flags(&args)?;
+    enforce_global_config_schema_policy(&args.command).await?;
     if let Commands::Tag(tag_args) = &args.command {
         command::tag::validate_cli_args(tag_args)?;
     }
@@ -1219,6 +1825,28 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Lfs(cmd) => command::lfs::execute_safe(cmd, &output).await?,
         Commands::LsFiles(cmd_args) => command::ls_files::execute_safe(cmd_args, &output).await?,
         Commands::Log(cmd_args) => command::log::execute_safe(cmd_args, &output).await?,
+        Commands::Logfile(cmd_args) => command::logfile::execute_safe(cmd_args, &output).await?,
+        Commands::Cache(cmd_args) => command::cache::execute_safe(cmd_args, &output).await?,
+        Commands::Layer(cmd_args) => command::layer::execute_safe(cmd_args, &output).await?,
+        Commands::File(cmd_args) => command::file::execute_safe(cmd_args, &output).await?,
+        Commands::Alternates(cmd_args) => {
+            command::alternates::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Deps(cmd_args) => command::deps::execute_safe(cmd_args, &output).await?,
+        Commands::Hydrate(cmd_args) => command::hydrate::execute_safe(cmd_args, &output).await?,
+        #[cfg(feature = "fastcdc")]
+        Commands::Media(cmd_args) => command::media::execute_safe(cmd_args, &output).await?,
+        Commands::SparseView(cmd_args) => {
+            command::sparse_view::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Metadata(cmd_args) => command::metadata::execute_safe(cmd_args, &output).await?,
+        Commands::Dirty(cmd_args) => command::dirty::execute_safe(cmd_args, &output).await?,
+        Commands::Auth(cmd_args) => command::auth::execute_safe(cmd_args, &output).await?,
+        Commands::Login(cmd_args) => command::account::login(cmd_args, &output).await?,
+        Commands::Whoami(cmd_args) => command::account::whoami(cmd_args, &output).await?,
+        Commands::Logout(cmd_args) => command::account::logout(cmd_args, &output).await?,
+        Commands::Revision(cmd_args) => command::revision::execute_safe(cmd_args, &output).await?,
+        Commands::Service(cmd_args) => command::service::execute_safe(cmd_args, &output).await?,
         Commands::Shortlog(cmd_args) => command::shortlog::execute_safe(cmd_args, &output).await?,
         Commands::Show(cmd_args) => command::show::execute_safe(cmd_args, &output).await?,
         Commands::ShowRef(cmd_args) => command::show_ref::execute_safe(cmd_args, &output).await?,
@@ -1239,6 +1867,26 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Switch(cmd_args) => command::switch::execute_safe(cmd_args, &output).await?,
         Commands::Rebase(cmd_args) => command::rebase::execute_safe(cmd_args, &output).await?,
         Commands::Merge(cmd_args) => command::merge::execute_safe(cmd_args, &output).await?,
+        Commands::MergeFile(cmd_args) => {
+            command::merge_file::execute_safe(cmd_args, &output).await?
+        }
+        Commands::MergeBase(cmd_args) => {
+            command::merge_base::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Apply(cmd_args) => command::apply::execute_safe(cmd_args, &output).await?,
+        Commands::DiffTree(cmd_args) => {
+            command::diff_plumbing::execute_tree_safe(cmd_args, &output).await?
+        }
+        Commands::DiffIndex(cmd_args) => {
+            command::diff_plumbing::execute_index_safe(cmd_args, &output).await?
+        }
+        Commands::DiffFiles(cmd_args) => {
+            command::diff_plumbing::execute_files_safe(cmd_args, &output).await?
+        }
+        Commands::Credential(cmd_args) => {
+            command::credential::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Rerere(cmd_args) => command::rerere::execute_safe(cmd_args, &output).await?,
         Commands::Reset(cmd_args) => command::reset::execute_safe(cmd_args, &output).await?,
         Commands::RevParse(cmd_args) => command::rev_parse::execute_safe(cmd_args, &output).await?,
         Commands::RevList(cmd_args) => command::rev_list::execute_safe(cmd_args, &output).await?,
@@ -1250,6 +1898,38 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         }
         Commands::Push(cmd_args) => command::push::execute_safe(cmd_args, &output).await?,
         Commands::CatFile(cmd_args) => command::cat_file::execute_safe(cmd_args, &output).await?,
+        Commands::CheckIgnore(cmd_args) => {
+            command::check_ignore::execute_safe(cmd_args, &output).await?
+        }
+        Commands::CheckAttr(cmd_args) => {
+            command::check_attr::execute_safe(cmd_args, &output).await?
+        }
+        Commands::CheckMailmap(cmd_args) => {
+            command::check_mailmap::execute_safe(cmd_args, &output).await?
+        }
+        Commands::FastExport(cmd_args) => {
+            command::fast_export::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Bundle(cmd_args) => command::bundle::execute_safe(cmd_args, &output).await?,
+        Commands::FastImport(cmd_args) => {
+            command::fast_import::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Completions(cmd_args) => {
+            command::completions::execute_safe(cmd_args, Cli::command(), &output)?
+        }
+        Commands::WriteTree(cmd_args) => {
+            command::write_tree::execute_safe(cmd_args, &output).await?
+        }
+        Commands::CommitTree(cmd_args) => {
+            command::commit_tree::execute_safe(cmd_args, &output).await?
+        }
+        Commands::ReadTree(cmd_args) => command::read_tree::execute_safe(cmd_args, &output).await?,
+        Commands::UpdateIndex(cmd_args) => {
+            command::update_index::execute_safe(cmd_args, &output).await?
+        }
+        Commands::UpdateRef(cmd_args) => {
+            command::update_ref::execute_safe(cmd_args, &output).await?
+        }
         Commands::Archive(cmd_args) => command::archive::execute_safe(cmd_args, &output).await?,
         Commands::HashObject(cmd_args) => {
             command::hash_object::execute_safe(cmd_args, &output).await?
@@ -1258,15 +1938,20 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
             command::verify_pack::execute_safe(cmd_args, &output).await?
         }
         Commands::IndexPack(cmd_args) => command::index_pack::execute_safe(cmd_args, &output)?,
+        Commands::PackObjects(cmd_args) => {
+            command::pack_objects::execute_safe(cmd_args, &output).await?
+        }
         Commands::Fetch(cmd_args) => command::fetch::execute_safe(cmd_args, &output).await?,
         Commands::Fsck(cmd_args) => command::fsck::execute_safe(cmd_args, &output).await?,
         Commands::Maintenance(cmd_args) => {
             command::maintenance::execute_safe(cmd_args, &output).await?
         }
+        Commands::Repack(cmd_args) => command::repack::execute_safe(cmd_args, &output).await?,
         Commands::Diff(cmd_args) => command::diff::execute_safe(cmd_args, &output).await?,
         Commands::Grep(cmd_args) => command::grep::execute_safe(cmd_args, &output).await?,
         Commands::Blame(cmd_args) => command::blame::execute_safe(cmd_args, &output).await?,
         Commands::Revert(cmd_args) => command::revert::execute_safe(cmd_args, &output).await?,
+        Commands::Replace(cmd_args) => command::replace::execute_safe(cmd_args, &output).await?,
         Commands::Remote(cmd) => command::remote::execute_safe(cmd, &output).await?,
         Commands::Open(cmd_args) => command::open::execute_safe(cmd_args, &output).await?,
         Commands::Pull(cmd_args) => command::pull::execute_safe(cmd_args, &output).await?,
@@ -1278,6 +1963,12 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::Cloud(cmd_args) => command::cloud::execute_safe(cmd_args, &output).await?,
         Commands::Publish(cmd_args) => command::publish::execute_safe(cmd_args, &output).await?,
         Commands::Agent(cmd_args) => command::agent::execute_safe(cmd_args, &output).await?,
+        Commands::Review(cmd_args) => {
+            command::agent::review::execute_safe(cmd_args, &output).await?
+        }
+        Commands::Investigate(cmd_args) => {
+            command::agent::investigate::execute_safe(cmd_args, &output).await?
+        }
         Commands::Hooks(cmd_args) => command::hooks::execute_safe(cmd_args, &output).await?,
         Commands::Bisect(bisect_cmd) => command::bisect::execute_safe(bisect_cmd, &output).await?,
     }
@@ -1305,18 +1996,37 @@ mod tests {
     use serial_test::serial;
 
     use super::*;
+
+    #[test]
+    fn cherry_pick_short_gpg_sign_survives_root_cli_parsing() {
+        let cli = Cli::try_parse_from(["libra", "cherry-pick", "-S", "deadbeef"])
+            .expect("valid cherry-pick arguments should parse");
+        let Commands::CherryPick(args) = cli.command else {
+            panic!("expected cherry-pick command");
+        };
+        assert!(args.gpg_sign);
+        assert!(!args.no_gpg_sign);
+    }
     use crate::utils::{output, test};
+
+    fn apply_runtime_flags_for_test(argv: &[&str]) -> CliResult<()> {
+        prepare_cli_invocation_state();
+        let cli = Cli::try_parse_from(argv).unwrap();
+        apply_global_runtime_flags(&cli)
+    }
 
     /// Scenario: running `libra` with no arguments should show usage information without
     /// an `error:` prefix, matching the behaviour of `git` and other standard tools.
     /// The underlying `arg_required_else_help = true` flag triggers clap's
     /// `DisplayHelpOnMissingArgumentOrSubcommand` path, which we treat the same as
     /// `DisplayHelp` — i.e. print and return `Ok(())`.
-    #[tokio::test(flavor = "current_thread")]
-    #[serial]
-    async fn no_subcommand_shows_help_without_error_prefix() {
-        // `parse_async` must succeed (return Ok) so no `error:` label is emitted.
-        parse_async(Some(&["libra"])).await.unwrap();
+    #[test]
+    fn no_subcommand_shows_help_without_error_prefix() {
+        let err = Cli::try_parse_from(["libra"]).unwrap_err();
+        assert_eq!(
+            err.kind(),
+            ErrorKind::DisplayHelpOnMissingArgumentOrSubcommand
+        );
     }
 
     /// Scenario: clap's `debug_assert` walks the entire command tree and panics on any
@@ -1337,7 +2047,9 @@ mod tests {
     /// natural-but-wrong word are pointed at the real flag.
     #[tokio::test]
     async fn parse_error_shows_import_hint() {
-        let err = parse_async(Some(&["libra", "import"])).await.unwrap_err();
+        let argv = vec!["libra".to_string(), "import".to_string()];
+        let clap_err = Cli::try_parse_from(argv.clone()).unwrap_err();
+        let err = classify_parse_error(&argv, &clap_err);
         let msg = err.render();
         assert!(
             msg.contains("You probably want `libra config --import`."),
@@ -1446,7 +2158,7 @@ mod tests {
 
         // Curated allowlist of hidden commands (mirrors `hide = true`
         // attributes on `Commands::*` variants in this file).
-        const HIDDEN_COMMANDS: &[&str] = &["index-pack", "hooks"];
+        const HIDDEN_COMMANDS: &[&str] = &["index-pack", "hooks", "pack-objects"];
 
         let cli = Cli::command();
         for subcommand in cli.get_subcommands() {
@@ -1475,7 +2187,9 @@ mod tests {
     #[tokio::test]
     async fn clap_fuzzy_suggests_similar_command() {
         // "initt" is close enough to "init" for clap's built-in fuzzy match.
-        let err = parse_async(Some(&["libra", "initt"])).await.unwrap_err();
+        let argv = vec!["libra".to_string(), "initt".to_string()];
+        let clap_err = Cli::try_parse_from(argv.clone()).unwrap_err();
+        let err = classify_parse_error(&argv, &clap_err);
         let msg = err.render();
         // Clap should include its own "tip: a similar subcommand exists: 'init'".
         assert!(
@@ -1488,14 +2202,14 @@ mod tests {
     /// processes (TUI, tests) a previously-recorded warning would otherwise leak
     /// into the next invocation and silently flip the exit code under
     /// `--exit-code-on-warning`. This test seeds a stale warning, then verifies that
-    /// [`parse_async`] clears it before any handler runs.
-    #[tokio::test(flavor = "current_thread")]
+    /// [`prepare_cli_invocation_state`] clears it before dispatch.
+    #[test]
     #[serial]
-    async fn parse_async_resets_warning_tracker_before_dispatch() {
+    fn parse_async_resets_warning_tracker_before_dispatch() {
         output::record_warning();
         assert!(output::warning_was_emitted());
 
-        parse_async(Some(&["libra", "--help"])).await.unwrap();
+        prepare_cli_invocation_state();
 
         assert!(
             !output::warning_was_emitted(),
@@ -1503,11 +2217,160 @@ mod tests {
         );
     }
 
+    /// Scenario: the global `--sync-data` flag (lore.md §0.5) must actually flip
+    /// the process-global durability hook, from either flag placement, and a run
+    /// without it (env disabled) must leave the hook off. Uses `logfile info`
+    /// as a benign, repo-free command that still runs the post-parse flag
+    /// override before dispatch.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn sync_data_flag_enables_durability_hook() {
+        use crate::utils::atomic_write::{set_sync_data, sync_data_enabled};
+
+        // Pin the env baseline off so we measure the flag's effect, not ambient
+        // LIBRA_SYNC_DATA.
+        let _env = test::ScopedEnvVar::set("LIBRA_SYNC_DATA", "0");
+
+        // No flag: `parse_async` re-inits the hook from env (0), leaving it off
+        // even though we seed the opposite here.
+        set_sync_data(true);
+        apply_runtime_flags_for_test(&["libra", "logfile", "info"]).unwrap();
+        assert!(
+            !sync_data_enabled(),
+            "no --sync-data (env 0) should leave object fsync off"
+        );
+
+        // Both global placements enable it.
+        for argv in [
+            &["libra", "--sync-data", "logfile", "info"][..],
+            &["libra", "logfile", "info", "--sync-data"][..],
+        ] {
+            set_sync_data(false);
+            apply_runtime_flags_for_test(argv).unwrap();
+            assert!(
+                sync_data_enabled(),
+                "--sync-data ({argv:?}) should enable object fsync"
+            );
+        }
+
+        set_sync_data(false);
+    }
+
+    /// Scenario: the read policy (lore.md §0.8) resolves from `--offline` (→
+    /// LocalOnly, overriding env) and `LIBRA_READ_POLICY` (baseline), and a run
+    /// with neither resets to Auto.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn read_policy_resolves_from_flag_and_env() {
+        use crate::utils::read_policy::{ReadPolicy, read_policy, set_read_policy};
+
+        // No meaningful env (auto), no flag → Auto (also proves reset from a
+        // stale value).
+        {
+            let _env = test::ScopedEnvVar::set("LIBRA_READ_POLICY", "auto");
+            set_read_policy(ReadPolicy::LocalOnly);
+            apply_runtime_flags_for_test(&["libra", "logfile", "info"]).unwrap();
+            assert_eq!(
+                read_policy(),
+                ReadPolicy::Auto,
+                "no flag/env resets to Auto"
+            );
+
+            // `--offline` → LocalOnly.
+            set_read_policy(ReadPolicy::Auto);
+            apply_runtime_flags_for_test(&["libra", "--offline", "logfile", "info"]).unwrap();
+            assert_eq!(
+                read_policy(),
+                ReadPolicy::LocalOnly,
+                "--offline → LocalOnly"
+            );
+        }
+
+        // `LIBRA_READ_POLICY=remote` (no flag) → Remote.
+        {
+            let _env = test::ScopedEnvVar::set("LIBRA_READ_POLICY", "remote");
+            set_read_policy(ReadPolicy::Auto);
+            apply_runtime_flags_for_test(&["libra", "logfile", "info"]).unwrap();
+            assert_eq!(read_policy(), ReadPolicy::Remote, "env remote → Remote");
+
+            // `--offline` overrides the env baseline.
+            set_read_policy(ReadPolicy::Auto);
+            apply_runtime_flags_for_test(&["libra", "--offline", "logfile", "info"]).unwrap();
+            assert_eq!(
+                read_policy(),
+                ReadPolicy::LocalOnly,
+                "--offline overrides env remote"
+            );
+        }
+
+        // A typo'd LIBRA_READ_POLICY is a hard error (must not silently be Auto).
+        {
+            let _env = test::ScopedEnvVar::set("LIBRA_READ_POLICY", "offilne");
+            set_read_policy(ReadPolicy::Auto);
+            assert!(
+                apply_runtime_flags_for_test(&["libra", "logfile", "info"]).is_err(),
+                "an invalid LIBRA_READ_POLICY must be a usage error"
+            );
+        }
+
+        set_read_policy(ReadPolicy::Auto);
+    }
+
+    /// Scenario: `--max-connections` (lore.md §0.9) resolves flag > env >
+    /// default, always resets, and rejects an invalid env value.
+    #[tokio::test(flavor = "current_thread")]
+    #[serial]
+    async fn max_connections_resolves_from_flag_and_env() {
+        use crate::utils::resource_limits::{
+            DEFAULT_MAX_CONNECTIONS, max_connections, set_max_connections,
+        };
+
+        // No flag / no env → default (also proves reset from a stale value).
+        {
+            let _env = test::ScopedEnvVar::set("LIBRA_MAX_CONNECTIONS", "");
+            set_max_connections(3);
+            apply_runtime_flags_for_test(&["libra", "logfile", "info"]).unwrap();
+            assert_eq!(
+                max_connections(),
+                DEFAULT_MAX_CONNECTIONS,
+                "reset to default"
+            );
+
+            // Flag wins.
+            apply_runtime_flags_for_test(&["libra", "--max-connections", "5", "logfile", "info"])
+                .unwrap();
+            assert_eq!(max_connections(), 5, "--max-connections wins");
+        }
+
+        // Env baseline (no flag).
+        {
+            let _env = test::ScopedEnvVar::set("LIBRA_MAX_CONNECTIONS", "9");
+            apply_runtime_flags_for_test(&["libra", "logfile", "info"]).unwrap();
+            assert_eq!(max_connections(), 9, "env baseline");
+
+            // Flag overrides env.
+            apply_runtime_flags_for_test(&["libra", "--max-connections", "2", "logfile", "info"])
+                .unwrap();
+            assert_eq!(max_connections(), 2, "flag overrides env");
+        }
+
+        // Invalid env → usage error.
+        {
+            let _env = test::ScopedEnvVar::set("LIBRA_MAX_CONNECTIONS", "bogus");
+            assert!(
+                apply_runtime_flags_for_test(&["libra", "logfile", "info"]).is_err(),
+                "invalid LIBRA_MAX_CONNECTIONS must error"
+            );
+        }
+
+        set_max_connections(DEFAULT_MAX_CONNECTIONS);
+    }
+
     /// Scenario: `libra code --repo <path>` should perform repository preflight
     /// against `<path>`, *not* the process CWD. The test arranges for the CWD to be
     /// outside any repo, sets `--repo` to a freshly-initialised one, and confirms
-    /// that the error we hit is the *next* validation step (missing ollama model)
-    /// rather than "not a libra repository". This guards a regression where preflight
+    /// preflight resolves that repository instead of reporting "not a libra
+    /// repository" from the process CWD. This guards a regression where preflight
     /// was hitting CWD before honoring `--repo`.
     #[tokio::test(flavor = "current_thread")]
     #[serial]
@@ -1523,26 +2386,19 @@ mod tests {
         let repo_arg = repo
             .to_str()
             .expect("temporary repo path should be valid UTF-8");
-        let err = parse_async(Some(&[
-            "libra",
-            "code",
-            "--repo",
-            repo_arg,
-            "--provider",
-            "ollama",
-        ]))
-        .await
-        .expect_err("missing ollama model should stop after repository preflight");
-        let rendered = err.render();
+        let cli = Cli::try_parse_from(["libra", "code", "--repo", repo_arg]).unwrap();
+        let preflight = command_preflight(&cli.command).expect("--repo should drive preflight");
 
-        assert!(
-            rendered.contains("--model is required when using --provider ollama"),
-            "expected provider validation after --repo preflight, got: {rendered}"
+        let expected_storage = repo
+            .join(".libra")
+            .canonicalize()
+            .expect("test repository storage should exist");
+        assert_eq!(
+            preflight.storage.as_deref(),
+            Some(expected_storage.as_path())
         );
-        assert!(
-            !rendered.contains("not a libra repository"),
-            "--repo should be honored before checking the process cwd, got: {rendered}"
-        );
+        assert!(preflight.upgrade_schema);
+        assert!(preflight.set_hash_kind);
     }
 
     /// Scenario: `libra help error-codes` (and its `errors` alias) should bypass

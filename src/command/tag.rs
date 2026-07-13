@@ -20,13 +20,15 @@ use crate::{
 /// GitHub Issues URL shown on the `SerializeAnnotatedTag` internal-invariant
 /// error path so users can report the bug; mirrors `push.rs`'s
 /// `ObjectCollection` / `PackEncoding` hint pattern.
-const ISSUE_URL: &str = "https://github.com/web3infra-foundation/libra/issues";
+const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 
 const TAG_EXAMPLES: &str = "\
 EXAMPLES:
     libra tag v1.0                        Create a lightweight tag at HEAD
     libra tag -m \"Release v1.1\" v1.1    Create an annotated tag
     libra tag -F notes.txt v1.1           Annotated tag with message from a file (- for stdin)
+    libra tag -e v1.1                     Compose the annotated-tag message in an editor
+    libra tag -e -m \"draft\" v1.1          Open the editor pre-filled with a message to edit
     libra tag -l -n 2                     List tags with up to 2 annotation lines
     libra tag -d v1.0                     Delete a tag
     libra tag --points-at HEAD            List tags pointing at HEAD's commit
@@ -57,6 +59,14 @@ pub struct TagArgs {
     /// Like `-m`, providing it creates an annotated tag.
     #[clap(short = 'F', long = "file", conflicts_with = "message")]
     pub file: Option<String>,
+
+    /// Open an editor to compose or edit the annotated-tag message. With `-m`/
+    /// `-F` the editor is pre-filled with that message for further editing;
+    /// without them it composes a new message. Because Libra has no separate
+    /// `-a`, `-e` is the editor-driven way to create an annotated tag — an empty
+    /// message after stripping comments aborts the tag.
+    #[clap(short = 'e', long = "edit")]
+    pub edit: bool,
 
     /// Replace an existing tag with the same name instead of failing
     #[clap(short, long, group = "action")]
@@ -90,16 +100,38 @@ pub struct TagArgs {
     #[clap(long, value_name = "key")]
     pub sort: Option<String>,
 
-    /// Display the tag list in columns. Modes: `always`, `auto` (only when
-    /// stdout is a terminal), `never`. Bare `--column` means `always`. Cannot
-    /// be combined with `-n`.
-    #[clap(long, value_name = "mode", num_args = 0..=1, require_equals = true, default_missing_value = "always", conflicts_with = "n_lines")]
+    /// Display the tag list in columns. Accepts a comma/space-separated list of
+    /// options: enablement `always` / `auto` (only when stdout is a terminal) /
+    /// `never`; fill order `column` (top-to-bottom, default) / `row`
+    /// (left-to-right) / `plain` (single column); and column widths `dense`
+    /// (per-column) / `nodense` (uniform, default). Bare `--column` means
+    /// `always`. Cannot be combined with `-n`.
+    #[clap(long, value_name = "options", num_args = 0..=1, require_equals = true, default_missing_value = "always", conflicts_with = "n_lines", overrides_with = "no_column")]
     pub column: Option<String>,
 
-    /// Create a vault-PGP-signed annotated tag (requires a message via `-m`,
-    /// since Libra does not open an editor for the tag body).
-    #[clap(short = 's', long = "sign", requires = "message")]
+    /// Do not display the tag list in columns (equivalent to `--column=never`),
+    /// countermanding an earlier `--column` (last one on the command line wins),
+    /// matching `git tag --no-column`. Tags are listed one per line by default,
+    /// so on its own this is a no-op.
+    #[clap(long = "no-column", overrides_with = "column")]
+    pub no_column: bool,
+
+    /// Create a vault-PGP-signed annotated tag. Requires a message via `-m`
+    /// (`requires = "message"`); `-e`/`--edit` can further edit that `-m` body
+    /// before signing, but `-s` does not accept `-F` or an editor-only message.
+    #[clap(
+        short = 's',
+        long = "sign",
+        requires = "message",
+        overrides_with = "no_sign"
+    )]
     pub sign: bool,
+
+    /// Do not sign the tag, countermanding an earlier `-s`/`--sign` (last one on
+    /// the command line wins), matching `git tag --no-sign`. Tags are unsigned
+    /// by default, so on its own this is a no-op.
+    #[clap(long = "no-sign", overrides_with = "sign")]
+    pub no_sign: bool,
 
     /// Verify the PGP signature of the named annotated tag.
     #[clap(short = 'v', long = "verify", group = "action")]
@@ -165,7 +197,9 @@ pub(crate) fn validate_cli_args(args: &TagArgs) -> CliResult<()> {
 /// delete, verify, or any list filter so an invalid invocation is a usage
 /// error rather than silently ignoring the message (or performing a delete).
 fn validate_message_source_create_only(args: &TagArgs) -> Result<(), TagError> {
-    if args.message.is_none() && args.file.is_none() {
+    // `-e`/`--edit` is the editor-driven annotated-tag creation mode, so it is a
+    // create-only option just like `-m`/`-F`.
+    if args.message.is_none() && args.file.is_none() && !args.edit {
         return Ok(());
     }
     let non_create = args.list
@@ -181,7 +215,7 @@ fn validate_message_source_create_only(args: &TagArgs) -> Result<(), TagError> {
         || args.column.is_some();
     if non_create {
         return Err(TagError::MessageOptionRequiresCreate(
-            "-m/--message and -F/--file are only valid when creating a tag".to_string(),
+            "-m/--message, -F/--file, and -e/--edit are only valid when creating a tag".to_string(),
         ));
     }
     Ok(())
@@ -265,6 +299,14 @@ enum TagError {
     #[error("unsupported tag sort key '{0}'")]
     InvalidSortKey(String),
 
+    #[error(
+        "bad config value '{value}' for 'tag.sort' (expected refname or creatordate, reversible with '-')"
+    )]
+    InvalidSortConfig { value: String },
+
+    #[error("failed to read config 'tag.sort': {detail}")]
+    SortConfigRead { detail: String },
+
     #[error("failed to sign tag: {0}")]
     VaultSign(String),
 
@@ -273,6 +315,15 @@ enum TagError {
 
     #[error("tag '{0}' has a bad signature")]
     BadSignature(String),
+
+    #[error("no editor configured for `-e`/`--edit`")]
+    NoEditor,
+
+    #[error("failed to edit tag message: {0}")]
+    EditorFailed(String),
+
+    #[error("no tag message given, aborting")]
+    EmptyEditedMessage,
 }
 
 fn map_verify_tag_error(error: tag::VerifyTagError) -> TagError {
@@ -336,7 +387,7 @@ impl From<TagError> for CliError {
             }
             TagError::MessageOptionRequiresCreate(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint("-m/--message and -F/--file create a tag; drop the listing/delete/verify options."),
+                .with_hint("-m/--message, -F/--file, and -e/--edit create a tag; drop the listing/delete/verify options."),
             TagError::MessageFileRead { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::IoReadFailed)
                 .with_hint("check that the message file path exists and is readable."),
@@ -369,6 +420,12 @@ impl From<TagError> for CliError {
             TagError::InvalidSortKey(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("supported sort keys: refname, -refname, creatordate, -creatordate"),
+            TagError::InvalidSortConfig { .. } => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("fix the offending value with 'libra config tag.sort <key>' (refname, -refname, creatordate, -creatordate)"),
+            TagError::SortConfigRead { .. } => {
+                CliError::fatal(message).with_stable_code(StableErrorCode::IoReadFailed)
+            }
             TagError::VaultSign(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::RepoStateInvalid)
                 .with_hint("ensure the vault is initialized and signing is configured"),
@@ -378,6 +435,18 @@ impl From<TagError> for CliError {
             // A bad signature is a verification failure, not a usage error: exit 1.
             TagError::BadSignature(_) => CliError::failure(message)
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked),
+            TagError::NoEditor => CliError::fatal(message)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("set GIT_EDITOR, core.editor, VISUAL, or EDITOR")
+                .with_hint("or pass the message directly with -m/--message or -F/--file."),
+            TagError::EditorFailed(_) => {
+                CliError::fatal(message).with_stable_code(StableErrorCode::IoReadFailed)
+            }
+            // An empty edited message is a runtime abort (exit 128), matching
+            // Git and `commit`'s empty-message handling — not a usage error.
+            TagError::EmptyEditedMessage => CliError::failure(message)
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint("write a non-comment message in the editor, or pass -m/--message."),
         }
     }
 }
@@ -402,6 +471,72 @@ fn resolve_tag_message(args: &TagArgs) -> Result<Option<String>, TagError> {
     }
 }
 
+/// Open an editor (`-e`/`--edit`) to compose or edit the annotated-tag message.
+/// The buffer is seeded with the `-m`/`-F` message (if any) plus a commented
+/// instruction block; on save, comment lines are stripped (`git stripspace`
+/// semantics). An empty result aborts the tag, matching Git's "no tag message
+/// given" behavior.
+async fn compose_tag_message(name: &str, base: Option<&str>) -> Result<String, TagError> {
+    use std::io::IsTerminal;
+
+    let body = base.unwrap_or("");
+    let separator = if body.is_empty() || body.ends_with('\n') {
+        ""
+    } else {
+        "\n"
+    };
+    let template = format!(
+        "{body}{separator}\
+         # Write a message for tag:\n\
+         #   {name}\n\
+         # Lines starting with '#' will be ignored.\n"
+    );
+
+    // An explicitly configured editor runs even without a TTY (so scripted
+    // editors work in tests/automation); `vi` is only assumed on a terminal.
+    let editor_cmd = match crate::command::editor::resolve_editor().await {
+        Some(cmd) => cmd,
+        None if std::io::stdin().is_terminal() => "vi".to_string(),
+        None => return Err(TagError::NoEditor),
+    };
+
+    let path = crate::utils::util::storage_path().join("TAG_EDITMSG");
+    let raw = crate::command::editor::edit_message(&path, &template, &editor_cmd, true)
+        .await
+        .map_err(|e| TagError::EditorFailed(e.to_string()))?;
+
+    let message = clean_tag_message(&raw);
+    if message.is_empty() {
+        return Err(TagError::EmptyEditedMessage);
+    }
+    Ok(message)
+}
+
+/// Clean an edited tag-message buffer with `git stripspace` semantics (Git's
+/// default cleanup for tag messages): drop whole-line comments (first character
+/// `#`), trim trailing whitespace per line, and collapse blank-line runs while
+/// dropping leading/trailing blanks.
+fn clean_tag_message(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending_blank = false;
+    for line in raw.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            pending_blank = !out.is_empty();
+            continue;
+        }
+        if pending_blank {
+            out.push(String::new());
+            pending_blank = false;
+        }
+        out.push(trimmed.to_string());
+    }
+    out.join("\n")
+}
+
 fn validate_named_tag_action(args: &TagArgs) -> Result<(), TagError> {
     if args.name.is_some() {
         return Ok(());
@@ -411,6 +546,8 @@ fn validate_named_tag_action(args: &TagArgs) -> Result<(), TagError> {
         Some("tag name is required for --delete")
     } else if args.message.is_some() || args.file.is_some() {
         Some("tag name is required when using --message/--file")
+    } else if args.edit {
+        Some("tag name is required when using --edit")
     } else if args.force {
         Some("tag name is required for --force")
     } else {
@@ -531,7 +668,25 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
             no_merged.as_ref(),
         )
         .await?;
-        sort_tags(&mut tags, args.sort.as_deref())?;
+        // `--sort` wins; otherwise the Git-compatible `tag.sort` config
+        // default applies (strict local→global→system cascade). Resolved here,
+        // after list-mode detection, so a configured sort never flips a tag
+        // CREATION into list mode. When neither is set, Git's default order is
+        // refname-ascending (Libra's raw store order is insertion order).
+        let config_sort = if args.sort.is_none() {
+            configured_tag_sort().await?
+        } else {
+            None
+        };
+        match (args.sort.as_deref(), config_sort.as_deref()) {
+            (Some(key), _) => sort_tags(&mut tags, Some(key))?,
+            (None, Some(key)) => {
+                sort_tags(&mut tags, Some(key)).map_err(|_| TagError::InvalidSortConfig {
+                    value: key.to_string(),
+                })?
+            }
+            (None, None) => sort_tags(&mut tags, Some("refname"))?,
+        }
         return Ok(TagOutput::List { tags });
     }
 
@@ -540,7 +695,15 @@ async fn run_tag(args: &TagArgs) -> Result<TagOutput, TagError> {
         return run_delete_tag(name).await;
     }
 
-    let message = resolve_tag_message(args)?;
+    let base_message = resolve_tag_message(args)?;
+    // `-e`/`--edit` opens an editor on the (optional) base message; the edited,
+    // comment-stripped result becomes the annotated-tag message. Without `-e`
+    // the base message is used as-is (annotated iff `-m`/`-F` was given).
+    let message = if args.edit {
+        Some(compose_tag_message(name, base_message.as_deref()).await?)
+    } else {
+        base_message
+    };
     run_create_tag(name, message, args.force, args.sign).await
 }
 
@@ -560,8 +723,9 @@ fn render_tag_output(
     match result {
         TagOutput::List { tags } => {
             if let Some(mode) = column {
-                if resolve_column_enabled(mode)? {
-                    print!("{}", format_tag_columns(tags, column_layout_width()));
+                let spec = parse_column_spec(mode)?;
+                if spec.enabled {
+                    print!("{}", format_tag_columns(tags, column_layout_width(), spec));
                 } else {
                     print!("{}", format_tag_entries(tags));
                 }
@@ -726,6 +890,20 @@ async fn collect_tags(
 
 /// Sort tag entries by the given key. Supported keys: `refname`, `-refname`,
 /// `creatordate`, `-creatordate`. The `-` prefix reverses the order.
+/// Read the Git-compatible `tag.sort` default through the strict
+/// local → global → system cascade (P1-05d).
+async fn configured_tag_sort() -> Result<Option<String>, TagError> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        "tag.sort",
+    )
+    .await
+    .map(|value| value.map(|v| v.trim().to_string()))
+    .map_err(|error| TagError::SortConfigRead {
+        detail: format!("{error:#}"),
+    })
+}
+
 fn sort_tags(tags: &mut [TagListEntry], key: Option<&str>) -> Result<(), TagError> {
     let Some(key) = key else {
         return Ok(());
@@ -859,21 +1037,71 @@ fn trim_tag_message(message: &str, show_lines: usize) -> Option<String> {
     if value.is_empty() { None } else { Some(value) }
 }
 
-/// Resolve `--column=<mode>` to whether column layout is active. `always`
-/// forces it, `auto` enables it only when stdout is a terminal, `never`
-/// disables it. Any other value is a usage error.
-pub(crate) fn resolve_column_enabled(mode: &str) -> Result<bool, CliError> {
+/// Parsed `--column=<options>` spec (Git's comma/space-separated option list).
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ColumnSpec {
+    /// Whether column layout is active.
+    pub enabled: bool,
+    /// `dense` → each column is sized to its own widest entry; otherwise
+    /// (`nodense`, the Git default) all columns share the widest entry's width.
+    pub dense: bool,
+    /// `row` → fill row-major (left-to-right); otherwise (`column`, the Git
+    /// default) fill column-major (top-to-bottom).
+    pub row_major: bool,
+    /// `plain` → a single column (one entry per line), regardless of width.
+    pub plain: bool,
+}
+
+/// Parse `--column=<options>`: a comma/space-separated list mixing an enablement
+/// (`always` / `auto` / `never`), a fill order (`column` / `row` / `plain`), and
+/// a density (`dense` / `nodense`), in any order (Git semantics; later tokens of
+/// a kind win). `plain` forces a single column. `auto` enables columns only when
+/// stdout is a terminal. An unknown token is a usage error.
+pub(crate) fn parse_column_spec(mode: &str) -> Result<ColumnSpec, CliError> {
     use std::io::IsTerminal;
-    match mode {
-        "always" => Ok(true),
-        "auto" => Ok(std::io::stdout().is_terminal()),
-        "never" => Ok(false),
-        other => Err(
-            CliError::command_usage(format!("unsupported --column mode '{other}'"))
+    let mut enabled: Option<bool> = None;
+    let mut dense = false; // Git default: nodense
+    let mut row_major = false; // Git default: column-major
+    let mut plain = false;
+    for token in mode.split([',', ' ']).filter(|t| !t.is_empty()) {
+        match token {
+            "always" => enabled = Some(true),
+            "auto" => enabled = Some(std::io::stdout().is_terminal()),
+            "never" => enabled = Some(false),
+            "column" => {
+                row_major = false;
+                plain = false;
+            }
+            "row" => {
+                row_major = true;
+                plain = false;
+            }
+            "plain" => plain = true,
+            "dense" => dense = true,
+            "nodense" => dense = false,
+            other => {
+                return Err(CliError::command_usage(format!(
+                    "unsupported --column mode '{other}'"
+                ))
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint("supported modes: always, auto, never"),
-        ),
+                .with_hint(
+                    "supported options: always, auto, never, column, row, plain, dense, nodense",
+                ));
+            }
+        }
     }
+    // A bare `--column` (or one giving only order/density) enables columns.
+    Ok(ColumnSpec {
+        enabled: enabled.unwrap_or(true),
+        dense,
+        row_major,
+        plain,
+    })
+}
+
+/// Resolve `--column=<options>` to whether column layout is active.
+pub(crate) fn resolve_column_enabled(mode: &str) -> Result<bool, CliError> {
+    Ok(parse_column_spec(mode)?.enabled)
 }
 
 /// Width used for column layout: the `COLUMNS` environment variable if set and
@@ -886,28 +1114,100 @@ pub(crate) fn column_layout_width() -> usize {
         .unwrap_or(80)
 }
 
-/// Lay out tag names in dense, column-major order to fit `width` (matching
-/// Git's `tag --column`): column width is the longest name plus two padding
-/// spaces, the number of columns is `width / col_width` (at least one), and
-/// entries fill down each column before moving right. Trailing padding on each
-/// row is trimmed.
-fn format_tag_columns(tags: &[TagListEntry], width: usize) -> String {
+/// Lay out tag names in columns to fit `width`, byte-compatible with Git's
+/// `tag --column`. Mirrors Git's `display_table`: try the fewest rows (most
+/// columns) whose total padded width is strictly less than `width`, using the
+/// per-spec fill order and density.
+///
+/// * Column count: for `rows` = 1, 2, … (`cols = ceil(n / rows)`), compute each
+///   column's width — the widest entry in that column (for `dense`) or the
+///   overall widest entry (for `nodense`) — plus two padding spaces, and pick
+///   the first `rows` whose summed widths are `< width`; fall back to one column.
+/// * Fill order: column-major (top-to-bottom, default) or row-major
+///   (left-to-right, with `row`).
+/// * Trailing padding on each rendered row is trimmed.
+fn format_tag_columns(tags: &[TagListEntry], width: usize, spec: ColumnSpec) -> String {
     let names: Vec<&str> = tags.iter().map(|t| t.name.as_str()).collect();
     if names.is_empty() {
         return String::new();
     }
-    let max_len = names.iter().map(|n| n.chars().count()).max().unwrap_or(0);
-    let col_width = max_len + 2;
-    let cols = std::cmp::max(1, width / col_width);
-    let rows = names.len().div_ceil(cols);
+    // `plain` is a single column (one entry per line), matching Git.
+    if spec.plain {
+        let mut out = String::new();
+        for name in &names {
+            out.push_str(name);
+            out.push('\n');
+        }
+        return out;
+    }
+
+    let n = names.len();
+    // Git lays columns out by terminal DISPLAY width (wide CJK = 2, combining = 0),
+    // not character count, so the column count/padding match at width boundaries.
+    use unicode_width::UnicodeWidthStr;
+    let lens: Vec<usize> = names.iter().map(|s| UnicodeWidthStr::width(*s)).collect();
+    let max_len = *lens.iter().max().unwrap_or(&0);
+    const PAD: usize = 2;
+
+    let idx_at = |row_major: bool, r: usize, c: usize, cols: usize, rows: usize| -> usize {
+        if row_major {
+            r * cols + c
+        } else {
+            c * rows + r
+        }
+    };
+
+    let (rows, col_widths) = if spec.dense {
+        // DENSE: each column is sized to its own widest entry. Pick the fewest
+        // rows (most columns) whose summed padded widths are `< width`. The
+        // per-column widths depend on the fill order, so this is computed for the
+        // actual order. (Matches Git's `display_dense`.)
+        let try_rows = |rows: usize| -> Option<Vec<usize>> {
+            let cols = n.div_ceil(rows);
+            let mut col_widths = vec![0usize; cols];
+            for (c, w) in col_widths.iter_mut().enumerate() {
+                let mut m = 0;
+                for r in 0..rows {
+                    let idx = idx_at(spec.row_major, r, c, cols, rows);
+                    if idx < n {
+                        m = m.max(lens[idx]);
+                    }
+                }
+                *w = m + PAD;
+            }
+            (col_widths.iter().sum::<usize>() < width).then_some(col_widths)
+        };
+        (1..=n)
+            .find_map(|rows| try_rows(rows).map(|w| (rows, w)))
+            .unwrap_or_else(|| (n, vec![max_len + PAD]))
+    } else {
+        // NODENSE: every column shares the widest entry's width. The column count
+        // is the most such columns whose total is strictly `< width` (Git's fit
+        // test), i.e. `(width - 1) / colw`. Column-major then recomputes
+        // `cols = ceil(n / rows)` to drop empty trailing columns (Git's `layout`);
+        // row-major keeps the fitted count (Git does not recompute it).
+        let colw = max_len + PAD;
+        let cols0 = (width.saturating_sub(1) / colw).clamp(1, n);
+        let rows = n.div_ceil(cols0);
+        let cols = if spec.row_major {
+            cols0
+        } else {
+            n.div_ceil(rows).max(1)
+        };
+        (rows, vec![colw; cols])
+    };
+    let cols = col_widths.len();
 
     let mut out = String::new();
     for r in 0..rows {
         let mut line = String::new();
-        for c in 0..cols {
-            let idx = c * rows + r;
-            if idx < names.len() {
-                line.push_str(&format!("{:<col_width$}", names[idx]));
+        for (c, w) in col_widths.iter().enumerate() {
+            let idx = idx_at(spec.row_major, r, c, cols, rows);
+            if idx < n {
+                // Pad by DISPLAY width (Rust's `{:<w}` pads by char count, which
+                // is wrong for wide/zero-width characters).
+                line.push_str(names[idx]);
+                line.extend(std::iter::repeat_n(' ', w.saturating_sub(lens[idx])));
             }
         }
         out.push_str(line.trim_end());
@@ -957,9 +1257,11 @@ mod tests {
 
     use super::*;
     use crate::{
-        cli::parse_async,
-        command::init::{self, InitArgs},
-        internal::tag,
+        command::{
+            add, commit,
+            init::{self, InitArgs},
+        },
+        internal::{config::ConfigKv, tag},
         utils::test::ChangeDirGuard,
     };
 
@@ -980,28 +1282,24 @@ mod tests {
         })
         .await
         .unwrap();
-        parse_async(Some(&["libra", "config", "user.name", "Tag Test User"]))
+        ConfigKv::set("user.name", "Tag Test User", false)
             .await
             .unwrap();
-        parse_async(Some(&[
-            "libra",
-            "config",
-            "user.email",
-            "tag-test@example.com",
-        ]))
-        .await
-        .unwrap();
+        ConfigKv::set("user.email", "tag-test@example.com", false)
+            .await
+            .unwrap();
         fs::write("test.txt", "hello").unwrap();
-        parse_async(Some(&["libra", "add", "test.txt"]))
+        let quiet_output = OutputConfig {
+            quiet: true,
+            ..OutputConfig::default()
+        };
+        add::execute_safe(add::AddArgs::parse_from(["add", "test.txt"]), &quiet_output)
             .await
             .unwrap();
-        parse_async(Some(&[
-            "libra",
-            "commit",
-            "--no-verify",
-            "-m",
-            "Initial commit",
-        ]))
+        commit::execute_safe(
+            commit::CommitArgs::parse_from(["commit", "--no-verify", "-m", "Initial commit"]),
+            &quiet_output,
+        )
         .await
         .unwrap();
         (temp_dir, guard)

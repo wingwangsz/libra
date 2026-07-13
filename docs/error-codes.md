@@ -68,7 +68,7 @@ exit codes (128/129), improving compatibility with Git-aware tooling and CI syst
 | Fine-grained behavior | Fine-grained exit | Git-standard contract |
 | --- | --- | --- |
 | Usage / invalid target | `2` | `129` + same `LBR-CLI-*` code |
-| Fatal runtime errors (repo, conflict, network, auth, I/O, internal) | `3`-`8` | `128` + same `LBR-*` code |
+| Fatal runtime errors (repo, config, conflict, network, auth, I/O, internal) | `3`-`8` | `128` + same `LBR-*` code |
 | Warnings emitted | `9` | Unchanged `9` |
 | `cat-file -e` missing object probe | `1` | Still `1` with no stderr output |
 
@@ -88,8 +88,15 @@ structured report is always present.
 | `128` | `LBR-REPO-001` | `repo` | Not inside a Libra repository | running repo commands outside `.libra` |
 | `128` | `LBR-REPO-002` | `repo` | Repository metadata is corrupt or incompatible | missing DB, corrupted metadata |
 | `128` | `LBR-REPO-003` | `repo` | Repository state blocks the operation | no commits yet, detached state mismatch, missing configured remote |
+| `128` | `LBR-CONFIG-001` | `config` | Global config DB schema is newer than this Libra binary supports | `pull`, `push`, `fetch`, `clone`, or `cloud` would otherwise silently ignore global storage config |
 | `128` | `LBR-CONFLICT-001` | `conflict` | Unresolved conflict is present | merge/rebase conflict still unresolved |
 | `128` | `LBR-CONFLICT-002` | `conflict` | Operation blocked to avoid overwriting state | non-fast-forward, destination exists, dirty worktree |
+| `128` | `LBR-POLICY-001` | `conflict` | Branch policy (protect/archive metadata) blocked the ref update | `branch reset` / `update-ref` on a protected or archived branch |
+| `128` | `LBR-CASE-001` | `conflict` | Paths that differ only by case collide on a case-insensitive filesystem | `add`/`checkout`/`switch`/`mv` under `core.casehandling=error` |
+| `128` | `LBR-LAYER-001` | `conflict` | A layer overlay path collided with tracked content, or a layer path was staged | `layer apply` collision / `add` of a layer overlay path (lore.md 2.4) |
+| `128` | `LBR-OBLITERATE-001` | `repo` | No payload found for the object to obliterate | `file obliterate` on an absent/unknown OID (lore.md 2.5) |
+| `128` | `LBR-OBLITERATE-002` | `repo` | Object exists only inside a packfile; v1 cannot rewrite packs | `file obliterate` on a packed-only object (lore.md 2.5) |
+| `128` | `LBR-OBLITERATE-003` | `conflict` | Obliteration not confirmed; it is irreversible and requires --yes | `file obliterate` without `--yes` (lore.md 2.5) |
 | `128` | `LBR-NET-001` | `network` | Remote unreachable or transport unavailable | DNS, timeout, TLS, connection refused |
 | `128` | `LBR-NET-002` | `network` | Protocol, negotiation, or pack failure | packet-line, sideband, unpack/ref update protocol errors |
 | `128` | `LBR-AUTH-001` | `auth` | Missing identity, token, or credentials | missing commit identity, missing API key, missing SSH material |
@@ -103,6 +110,19 @@ structured report is always present.
 | `129` | `LBR-ADD-001` | `cli` | `libra add` invoked with no matched paths and nothing already staged | `libra add nonexistent.txt` on an empty index |
 | `128` | `LBR-UNSUPPORTED-001` | `repo` | Operation declined because the requested mode is intentionally unsupported in this batch | requesting a Git feature explicitly declined in `docs/development/commands/_compatibility.md` |
 | `128` | `LBR-AGENT-001` | `internal` | AI agent run exceeded a configured budget dimension (tokens, tool calls, wall-clock, source calls, or cost) | a sub-agent ran 500 tool calls when `max_tool_calls = 200` |
+| `128` | `LBR-AGENT-002` | `internal` | External `libra-agent-*` agents are disabled (`agent.external_agents.enabled` defaults to `false`) | `libra agent rpc invoke` before opting in to external discovery |
+| `128` | `LBR-AGENT-003` | `internal` | External agent binary negotiated an incompatible protocol version | a `libra-agent-*` binary answers `info` with an unsupported `protocol_version` |
+| `128` | `LBR-AGENT-004` | `internal` | Method not declared in the external agent's negotiated capabilities | invoking `read_transcript` when the binary's `capabilities` omit it |
+| `128` | `LBR-AGENT-005` | `internal` | External agent binary failed provenance revalidation (untrusted, or sha256/device/inode/mtime changed since trust) | the trusted binary at `~/.libra/agents/libra-agent-foo` was replaced after `libra agent rpc trust` |
+| `128` | `LBR-AGENT-006` | `internal` | External `libra-agent-*` binary tried to impersonate a built-in agent slug | a PATH binary named `libra-agent-claude-code` |
+| `128` | `LBR-AGENT-007` | `internal` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed | a binary floods stderr past the 64 KiB cap |
+| `128` | `LBR-AGENT-008` | `internal` | Hook envelope failed validation before checkpoint persistence | a provider hook posts malformed JSON to `libra agent hooks` |
+| `128` | `LBR-AGENT-009` | `internal` | Agent checkpoint store inconsistent across ref/DB/object-index | `agent_checkpoint` row points at a missing traces object; run `libra agent doctor` |
+| `128` | `LBR-AGENT-010` | `internal` | `review --fix` / `investigate fix` requires the internal AgentRuntime fix bridge, which is not available | `libra review --fix` before the fix bridge lands |
+| `128` | `LBR-AGENT-011` | `internal` | Untrusted seed content cannot enter a mutating workflow without explicit approval | an issue-link seed attempting to drive a mutating fix |
+| `128` | `LBR-AGENT-012` | `internal` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed | a trusted `libra-agent-*` binary exits before answering the invoked method |
+| `128` | `LBR-AGENT-013` | `internal` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` | `libra agent checkpoint export --raw` (or equivalent) without `--allow-raw` |
+| `128` | `LBR-AGENT-014` | `internal` | A `review`/`investigate` run was refused because the shared run queue is full — more than `agent.max_concurrent_runs` runs are active and the wait queue is at its cap (10) | starting an 11th queued `libra review`/`libra investigate` run while the concurrency budget is saturated |
 | `9` | `LBR-WARN-001` | `warning` | Command completed with warnings | `--exit-code-on-warning` |
 
 ## Stable Codes By Category
@@ -124,12 +144,24 @@ structured report is always present.
 | `LBR-REPO-002` | Repository metadata is corrupt or incompatible |
 | `LBR-REPO-003` | Repository state blocks the operation |
 
+### Config
+
+| Stable code | Meaning |
+| --- | --- |
+| `LBR-CONFIG-001` | Global config database schema is newer than this Libra binary supports; update Libra or explicitly use `--offline` / `LIBRA_READ_POLICY=offline|local` when local-only object access is intended. |
+
 ### Conflict
 
 | Stable code | Meaning |
 | --- | --- |
 | `LBR-CONFLICT-001` | Unresolved conflict is present |
 | `LBR-CONFLICT-002` | Operation blocked to avoid overwriting state |
+| `LBR-POLICY-001` | Branch policy (protect/archive metadata) blocked the ref update. |
+| `LBR-CASE-001` | Paths that differ only by case collide on a case-insensitive filesystem. |
+| `LBR-LAYER-001` | A layer overlay path collided with tracked content; a layer may only add untracked paths. |
+| `LBR-OBLITERATE-001` | No payload was found for the object to obliterate. |
+| `LBR-OBLITERATE-002` | The object exists only inside a packfile; v1 obliteration cannot rewrite packs. |
+| `LBR-OBLITERATE-003` | Obliteration was not confirmed; it is irreversible and requires --yes. |
 
 ### Network
 
@@ -158,6 +190,19 @@ structured report is always present.
 | --- | --- |
 | `LBR-INTERNAL-001` | Unexpected internal invariant failure |
 | `LBR-AGENT-001` | AI agent run exceeded a configured budget dimension (tokens, tool calls, wall-clock, source calls, or cost) |
+| `LBR-AGENT-002` | External `libra-agent-*` agents are disabled (`agent.external_agents.enabled` defaults to `false`) |
+| `LBR-AGENT-003` | External agent binary negotiated an incompatible protocol version |
+| `LBR-AGENT-004` | Method not declared in the external agent's negotiated capabilities |
+| `LBR-AGENT-005` | External agent binary failed provenance revalidation (untrusted, or sha256/device/inode/mtime changed since trust) |
+| `LBR-AGENT-006` | External `libra-agent-*` binary tried to impersonate a built-in agent slug |
+| `LBR-AGENT-007` | External agent IO exceeded hard caps or failed redaction; output withheld fail-closed |
+| `LBR-AGENT-008` | Hook envelope failed validation before checkpoint persistence |
+| `LBR-AGENT-009` | Agent checkpoint store inconsistent across ref/DB/object-index |
+| `LBR-AGENT-010` | `review --fix` / `investigate fix` requires the internal AgentRuntime fix bridge, which is not available |
+| `LBR-AGENT-011` | Untrusted seed content cannot enter a mutating workflow without explicit approval |
+| `LBR-AGENT-012` | External agent RPC transport failed (invoke timeout, broken pipe/unexpected exit, or malformed JSON-RPC frame); invocation withheld fail-closed |
+| `LBR-AGENT-013` | Raw (un-redacted) checkpoint access/export denied without `--allow-raw`; redacted `--detail`/`--transcript` output stays available; the refusal is audited in `agent_audit_log` |
+| `LBR-AGENT-014` | A `review`/`investigate` run was refused because the shared run queue is full (over `agent.max_concurrent_runs` active and the wait queue at its cap) |
 
 ### Unsupported
 

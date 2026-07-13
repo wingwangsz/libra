@@ -91,6 +91,17 @@ struct MvOutput {
     dry_run: bool,
     forced: bool,
     verbose: bool,
+    /// Sources skipped under `-k`/`--skip-errors`, with the reason each was
+    /// dropped. Empty (and omitted from JSON) when nothing was skipped.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    skipped: Vec<MvSkipped>,
+}
+
+/// A source dropped by `-k`/`--skip-errors`, paired with why it was skipped.
+#[derive(Debug, Serialize)]
+struct MvSkipped {
+    source: String,
+    reason: String,
 }
 
 pub async fn execute(args: MvArgs) {
@@ -153,6 +164,7 @@ async fn execute_inner(args: MvArgs, output: &OutputConfig) -> Result<MvOutput, 
             return Err(format!("fatal: failed to load index: {err}"));
         }
     };
+    let mut skipped: Vec<MvSkipped> = Vec::new();
     for src in &sources {
         match validate_source_and_collect_moves(
             src,
@@ -164,11 +176,19 @@ async fn execute_inner(args: MvArgs, output: &OutputConfig) -> Result<MvOutput, 
             Ok(plan) => {
                 if args.skip_errors && plan_targets_existing_planned_destination(&move_plan, &plan)
                 {
+                    skipped.push(MvSkipped {
+                        source: util::path_to_string(&util::to_workdir_path(src)),
+                        reason: "destination is already targeted by an earlier source".to_string(),
+                    });
                     continue;
                 }
                 move_plan.extend(plan);
             }
-            Err(_) if args.skip_errors => {
+            Err(err) if args.skip_errors => {
+                skipped.push(MvSkipped {
+                    source: util::path_to_string(&util::to_workdir_path(src)),
+                    reason: strip_fatal_prefix(&err),
+                });
                 continue;
             }
             Err(err) => {
@@ -189,9 +209,19 @@ async fn execute_inner(args: MvArgs, output: &OutputConfig) -> Result<MvOutput, 
         args.verbose,
         args.dry_run,
         args.force,
+        skipped,
         &mut index,
         output,
     )
+}
+
+/// Strip a leading `fatal: ` from a validation error so the reason reads cleanly
+/// when it is reported as a skipped-source diagnostic rather than a fatal error.
+fn strip_fatal_prefix(message: &str) -> String {
+    message
+        .strip_prefix("fatal: ")
+        .unwrap_or(message)
+        .to_string()
 }
 /// Validates a source path and builds the move plan.
 ///
@@ -225,6 +255,18 @@ fn validate_source_and_collect_moves(
     }
 
     if src.is_dir() {
+        // Case-only DIRECTORY rename on a case-insensitive FS: `mv Dir dir`
+        // makes the destination stat resolve to the source itself — without
+        // this check it would route into move-INTO-directory (`dir/Dir`).
+        if destination_is_dir
+            && crate::utils::path_case::is_case_only_pair(
+                &util::path_to_string(&util::to_workdir_path(src)),
+                &util::path_to_string(&util::to_workdir_path(destination)),
+            )
+            && crate::utils::path_case::same_file_entry(src, destination)
+        {
+            return plan_case_only_directory_rename(src, destination, index);
+        }
         return validate_source_directory(src, destination, destination_is_dir, index);
     }
 
@@ -317,20 +359,31 @@ fn validate_source_file(
     };
 
     if let Ok(meta) = std::fs::symlink_metadata(&target) {
-        if !force {
-            return Err(format!(
-                "fatal: destination already exists, source={}, destination={}",
-                util::to_workdir_path(src).display(),
-                util::to_workdir_path(&target).display()
-            ));
-        }
-        let file_type = meta.file_type();
-        if !(file_type.is_file() || file_type.is_symlink()) {
-            return Err(format!(
-                "fatal: cannot overwrite, source={}, destination={}",
-                util::to_workdir_path(src).display(),
-                util::to_workdir_path(&target).display()
-            ));
+        // Case-only rename on a case-insensitive FS: the destination stat
+        // resolves to the SOURCE itself (same inode, fold-equal path). This
+        // is the DELIBERATE case-rename mechanism (lore.md 1.14) — allowed
+        // without --force, and perform_moves must never remove_file it (the
+        // old --force path deleted the source's own inode: data loss).
+        let case_only = crate::utils::path_case::is_case_only_pair(
+            &util::path_to_string(&util::to_workdir_path(src)),
+            &util::path_to_string(&util::to_workdir_path(&target)),
+        ) && crate::utils::path_case::same_file_entry(src, &target);
+        if !case_only {
+            if !force {
+                return Err(format!(
+                    "fatal: destination already exists, source={}, destination={}",
+                    util::to_workdir_path(src).display(),
+                    util::to_workdir_path(&target).display()
+                ));
+            }
+            let file_type = meta.file_type();
+            if !(file_type.is_file() || file_type.is_symlink()) {
+                return Err(format!(
+                    "fatal: cannot overwrite, source={}, destination={}",
+                    util::to_workdir_path(src).display(),
+                    util::to_workdir_path(&target).display()
+                ));
+            }
         }
     }
 
@@ -408,6 +461,37 @@ fn is_conflicted_in_index(index: &Index, src: &Path) -> bool {
     (1..=3).any(|stage| index.tracked(&src_str, stage))
 }
 /// Checks whether multiple move operations target the same destination path.
+/// Case-only directory rename plan: one fs rename `Dir` → `dir`, with every
+/// tracked entry under the old prefix rekeyed to the new prefix.
+fn plan_case_only_directory_rename(
+    src: &Path,
+    destination: &Path,
+    index: &Index,
+) -> Result<MovePlan, String> {
+    let src_rel = util::to_workdir_path(src);
+    let dst_rel = util::to_workdir_path(destination);
+    let mut index_updates = Vec::new();
+    for tracked in index.tracked_files() {
+        if let Ok(suffix) = tracked.strip_prefix(&src_rel) {
+            index_updates.push((
+                util::workdir_to_absolute(&tracked),
+                util::workdir_to_absolute(dst_rel.join(suffix)),
+            ));
+        }
+    }
+    if index_updates.is_empty() {
+        return Err(format!(
+            "fatal: not under version control, source={}, destination={}",
+            src_rel.display(),
+            dst_rel.display()
+        ));
+    }
+    Ok(MovePlan {
+        fs_moves: vec![(src.to_path_buf(), destination.to_path_buf())],
+        index_updates,
+    })
+}
+
 fn has_duplicate_target(moves: &[(PathBuf, PathBuf)]) -> bool {
     let mut target_paths = HashSet::new();
     for (_, target) in moves {
@@ -438,16 +522,22 @@ fn perform_moves(
     verbose: bool,
     dry_run: bool,
     force: bool,
+    skipped: Vec<MvSkipped>,
     index: &mut Index,
     output: &OutputConfig,
 ) -> Result<MvOutput, String> {
     let mut moved_count = 0usize;
+
+    // `-k`/`--skip-errors` stays silent on stderr in human mode (matching Git's
+    // `mv -k`); the dropped sources are surfaced only via `MvOutput.skipped` in
+    // the structured `--json`/`--machine` output.
     let output_result = MvOutput {
         moves: move_pairs_for_output(&plan.fs_moves),
         index_updates: move_pairs_for_output(&plan.index_updates),
         dry_run,
         forced: force,
         verbose,
+        skipped,
     };
 
     for (src, dst) in &plan.fs_moves {
@@ -482,7 +572,16 @@ fn perform_moves(
             ));
         }
 
-        if force && let Ok(meta) = std::fs::symlink_metadata(dst) {
+        // Case-only pair (fold-equal path, same inode): the destination IS
+        // the source — force-removing it would delete the only copy.
+        let case_only = crate::utils::path_case::is_case_only_pair(
+            &util::path_to_string(&src_workdir),
+            &util::path_to_string(&dst_workdir),
+        ) && crate::utils::path_case::same_file_entry(src, dst);
+        if force
+            && !case_only
+            && let Ok(meta) = std::fs::symlink_metadata(dst)
+        {
             let file_type = meta.file_type();
             if (file_type.is_file() || file_type.is_symlink())
                 && let Err(err) = std::fs::remove_file(dst)
@@ -496,14 +595,59 @@ fn perform_moves(
             }
         }
 
-        // Perform the move operation in the filesystem.
+        // Perform the move operation in the filesystem. A direct rename is
+        // an atomic in-place case change on APFS/NTFS (Git relies on this);
+        // fall back to a two-step rename through a temp name only when the
+        // direct rename fails for a case-only pair.
         if let Err(e) = std::fs::rename(src, dst) {
-            return Err(format!(
-                "fatal: failed to move, source={}, destination={}, error={}",
-                src_workdir.display(),
-                dst_workdir.display(),
-                e
-            ));
+            let mut renamed = false;
+            if case_only {
+                // Collision-free temp name in the same directory: rename(2)
+                // REPLACES an existing destination, so a predictable temp
+                // path could destroy an unrelated file. Probe candidates
+                // until one is genuinely absent; give up (source untouched)
+                // rather than ever overwriting.
+                let mut tmp = None;
+                for attempt in 0..64u32 {
+                    let candidate = dst
+                        .with_file_name(format!(".libra-mv-{}-{attempt}-tmp", std::process::id()));
+                    if std::fs::symlink_metadata(&candidate).is_err() {
+                        tmp = Some(candidate);
+                        break;
+                    }
+                }
+                if let Some(tmp) = tmp
+                    && std::fs::rename(src, &tmp).is_ok()
+                {
+                    match std::fs::rename(&tmp, dst) {
+                        Ok(()) => renamed = true,
+                        Err(step2) => {
+                            // Restore rather than leaving the temp name; if
+                            // even the restore fails, say EXACTLY where the
+                            // file is — never fail silently with a strand.
+                            if let Err(restore) = std::fs::rename(&tmp, src) {
+                                return Err(format!(
+                                    "fatal: case rename failed mid-way and the file could not \
+                                     be restored: it is at '{}' (intended '{}'); step error={}, \
+                                     restore error={}",
+                                    tmp.display(),
+                                    dst_workdir.display(),
+                                    step2,
+                                    restore
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            if !renamed {
+                return Err(format!(
+                    "fatal: failed to move, source={}, destination={}, error={}",
+                    src_workdir.display(),
+                    dst_workdir.display(),
+                    e
+                ));
+            }
         }
 
         moved_count += 1;

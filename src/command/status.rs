@@ -4,7 +4,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     io,
     io::{IsTerminal, Write},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use clap::{Parser, ValueEnum};
@@ -22,7 +22,10 @@ use git_internal::{
 };
 use serde::Serialize;
 
-use super::{merge, stash};
+use super::{
+    merge, stash, status_untracked,
+    unmerged::{self, UnmergedEntry},
+};
 use crate::{
     command::calc_file_blob_hash,
     internal::{
@@ -35,7 +38,9 @@ use crate::{
         ignore::IgnorePolicy,
         object_ext::{CommitExt, TreeExt},
         output::{ColorChoice, OutputConfig, emit_json_data},
-        path, util,
+        path,
+        pathspec::{PathspecError, PathspecSet},
+        util,
     },
 };
 
@@ -52,7 +57,7 @@ EXAMPLES:
     libra status -sb                   Include branch info in short output (-b = --branch)
     libra status --show-stash          Show stash count
     libra status --ignored             Include ignored files
-    libra status --untracked-files=no  Hide untracked files
+    libra status -uno                  Hide untracked files (-u = --untracked-files; bare -u = all)
     libra status --renames             Detect renames (--no-renames disables)
     libra status --json                Structured JSON output for agents
     libra status --exit-code           Exit 1 if working tree is dirty
@@ -90,6 +95,11 @@ pub struct StatusArgs {
     #[clap(short = 'b', long = "branch")]
     pub branch: bool,
 
+    /// Do not show branch info in the short format, overriding
+    /// `status.branch=true` (and an earlier `--branch`; the last one wins).
+    #[clap(long = "no-branch", overrides_with = "branch")]
+    pub no_branch: bool,
+
     /// Show ahead/behind counts in branch info (default: true).
     /// Use --no-ahead-behind to suppress the counts.
     #[clap(long = "ahead-behind")]
@@ -103,21 +113,58 @@ pub struct StatusArgs {
     #[clap(long = "show-stash")]
     pub show_stash: bool,
 
+    /// Do not show the stash hint, overriding `status.showStash=true` (and an
+    /// earlier `--show-stash`; the last one wins).
+    #[clap(long = "no-show-stash", overrides_with = "show_stash")]
+    pub no_show_stash: bool,
+
     /// Show ignored files
     #[clap(long = "ignored")]
     pub ignored: bool,
 
-    /// Control untracked files display (normal|all|no)
+    /// Control untracked files display: `no`, `normal` (the default when both
+    /// the flag and `status.showUntrackedFiles` are absent), or `all`. As in
+    /// Git, the short `-u`/long `--untracked-files` with no value means `all`
+    /// (e.g. `-u`, `-uno`, `--untracked-files=all`); when the flag is absent
+    /// the `status.showUntrackedFiles` config default applies.
     #[clap(
+        short = 'u',
         long = "untracked-files",
         value_name = "MODE",
-        default_value = "normal"
+        num_args = 0..=1,
+        default_missing_value = "all"
     )]
-    pub untracked_files: UntrackedFiles,
+    pub untracked_files: Option<UntrackedFiles>,
+
+    /// Libra extension (lore.md 1.1): consume the dirty-set cache instead of
+    /// walking the working tree. Requires a fresh cache (`status --scan`);
+    /// a missing/stale cache degrades to the full reconcile with a hint.
+    /// NOTE: unrelated to Git's `--cached` (= the index) — this reads Libra's
+    /// `working_dirty` SQLite cache.
+    #[clap(long = "cached", conflicts_with_all = ["check_dirty", "scan", "porcelain", "short", "ignored"])]
+    pub cached: bool,
+
+    /// Libra extension (lore.md 1.1): re-verify ONLY the cached dirty set
+    /// (O(dirty paths)) — rows re-verified clean are pruned; nothing new is
+    /// discovered. Degrades to the full reconcile when the cache is stale.
+    #[clap(long = "check-dirty", conflicts_with_all = ["cached", "scan", "porcelain", "short", "ignored"])]
+    pub check_dirty: bool,
+
+    /// Libra extension (lore.md 1.1): run the normal full status AND rebuild
+    /// the dirty-set cache atomically from it (the only authoritative writer).
+    #[clap(long = "scan", conflicts_with_all = ["cached", "check_dirty", "porcelain", "short", "ignored"])]
+    pub scan: bool,
 
     /// Print status entries with columns aligned (human output only).
-    #[clap(long = "column")]
+    #[clap(long = "column", overrides_with = "no_column")]
     pub column: bool,
+
+    /// Do not print status entries in columns (equivalent to `--column=never`),
+    /// countermanding an earlier `--column` (last one on the command line wins),
+    /// matching `git status --no-column`. Status is not columnar by default, so
+    /// on its own this is a no-op.
+    #[clap(long = "no-column", overrides_with = "column")]
+    pub no_column: bool,
 
     /// Terminate each status entry with a NUL byte instead of a newline.
     /// This is intended for machine-readable short/porcelain output.
@@ -148,6 +195,17 @@ pub struct StatusArgs {
     /// Can be combined with --quiet for silent dirty checking.
     #[clap(long = "exit-code")]
     pub exit_code: bool,
+
+    /// Limit status output to files matching the given pathspec(s).
+    #[clap(value_name = "pathspec")]
+    pub pathspec: Vec<String>,
+
+    /// Resolved `status.relativePaths` (config-only, like Git): `true` (the
+    /// default) renders human long/short paths relative to the current
+    /// directory; `false` keeps repository-root-relative paths. Populated by
+    /// [`apply_status_config_defaults`], never by the CLI.
+    #[clap(skip = true)]
+    pub relative_paths: bool,
 }
 
 impl StatusArgs {
@@ -155,6 +213,96 @@ impl StatusArgs {
     fn show_ahead_behind(&self) -> bool {
         !self.no_ahead_behind
     }
+}
+
+/// Resolve the Git-compatible `status.*` config defaults (plan-20260708
+/// P1-05d): `status.showUntrackedFiles`, `status.short`, `status.branch`,
+/// `status.showStash`, and `status.relativePaths`, each read through the
+/// strict local → global → system cascade. All five keys are validated
+/// UP FRONT — an invalid value is a usage error and an unreadable
+/// local/global scope an IO error, both before any status output — and then
+/// applied only where Git applies them: CLI flags always win;
+/// `status.short` yields to an explicit `--long`/`--porcelain`;
+/// `status.branch` affects only the short format (porcelain stays
+/// config-immune, matching Git's stable-script contract).
+async fn apply_status_config_defaults(args: &mut StatusArgs) -> CliResult<()> {
+    use crate::internal::config::{
+        LocalIdentityTarget, parse_git_config_bool, read_cascaded_config_value_strict,
+    };
+
+    async fn read_value(key: &str) -> CliResult<Option<String>> {
+        read_cascaded_config_value_strict(LocalIdentityTarget::CurrentRepo, key)
+            .await
+            .map_err(|error| {
+                CliError::fatal(format!("failed to read config '{key}': {error:#}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })
+    }
+    fn invalid(key: &str, value: &str, expected: &str) -> CliError {
+        CliError::command_usage(format!(
+            "bad config value '{value}' for '{key}' (expected {expected})"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(format!(
+            "fix the offending value with 'libra config {key} <value>'"
+        ))
+    }
+    async fn read_bool(key: &str) -> CliResult<Option<bool>> {
+        match read_value(key).await? {
+            Some(value) => match parse_git_config_bool(&value) {
+                Some(enabled) => Ok(Some(enabled)),
+                None => Err(invalid(key, &value, "a Git boolean")),
+            },
+            None => Ok(None),
+        }
+    }
+
+    // Validate every key up front so a bad value fails closed even when the
+    // requested format would not consult it.
+    let untracked = match read_value("status.showUntrackedFiles").await? {
+        Some(value) => Some(match value.trim().to_ascii_lowercase().as_str() {
+            "no" => UntrackedFiles::No,
+            "normal" => UntrackedFiles::Normal,
+            "all" => UntrackedFiles::All,
+            _ => {
+                return Err(invalid(
+                    "status.showUntrackedFiles",
+                    &value,
+                    "no, normal, or all",
+                ));
+            }
+        }),
+        None => None,
+    };
+    let short = read_bool("status.short").await?;
+    let branch = read_bool("status.branch").await?;
+    let show_stash = read_bool("status.showStash").await?;
+    let relative_paths = read_bool("status.relativePaths").await?;
+
+    if args.untracked_files.is_none() {
+        args.untracked_files = untracked;
+    }
+    if !args.short && !args.long_format && args.porcelain.is_none() && short == Some(true) {
+        args.short = true;
+    }
+    // Git scopes the status.branch default to the short format; porcelain
+    // headers still require an explicit `-b`/`--branch`.
+    if args.short && !args.branch && !args.no_branch && branch == Some(true) {
+        args.branch = true;
+    }
+    if !args.show_stash && !args.no_show_stash && show_stash == Some(true) {
+        args.show_stash = true;
+    }
+    args.relative_paths = relative_paths.unwrap_or(true);
+    Ok(())
+}
+
+/// Resolve and validate all `status.*` defaults without collecting repository
+/// state or producing output. Embedded consumers use this before side effects,
+/// then pass the returned arguments to [`execute_to_resolved`].
+pub(crate) async fn resolve_config_defaults(mut args: StatusArgs) -> CliResult<StatusArgs> {
+    apply_status_config_defaults(&mut args).await?;
+    Ok(args)
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -250,6 +398,8 @@ pub enum StatusError {
     ListWorkdirFiles { path: PathBuf, source: io::Error },
     #[error("failed to determine working directory: {source}")]
     Workdir { source: io::Error },
+    #[error("{source}")]
+    ConfigRead { source: anyhow::Error },
 }
 
 impl From<StatusError> for CliError {
@@ -270,6 +420,9 @@ impl From<StatusError> for CliError {
             }
             StatusError::Workdir { .. } => {
                 CliError::fatal(msg).with_stable_code(StableErrorCode::RepoNotFound)
+            }
+            StatusError::ConfigRead { .. } => {
+                CliError::fatal(msg).with_stable_code(StableErrorCode::IoReadFailed)
             }
         }
     }
@@ -297,6 +450,7 @@ pub struct UpstreamInfo {
 pub struct MergeStatusInfo {
     pub target_ref: String,
     pub conflicted_paths: Vec<String>,
+    pub unresolved_count: usize,
 }
 
 // ---------------------------------------------------------------------------
@@ -304,33 +458,70 @@ pub struct MergeStatusInfo {
 // ---------------------------------------------------------------------------
 
 /// Pre-computed status data shared across all renderers (human/JSON/short/porcelain).
+#[derive(Clone)]
 struct StatusData {
     head: Head,
     head_oid: Option<ObjectHash>,
     has_commits: bool,
     staged: Changes,
     unstaged: Changes,
+    unmerged: Vec<UnmergedEntry>,
     ignored_files: Vec<PathBuf>,
     stash_count: Option<usize>,
     upstream: Option<UpstreamInfo>,
     merge_state: Option<MergeStatusInfo>,
-    porcelain_v2: Option<PorcelainV2Data>,
+    /// A non-merge sequence in progress (cherry-pick/revert/rebase), surfaced
+    /// as a one-line human advisory (lore.md 2.6). Merge has its own richer
+    /// rendering; porcelain/JSON are unchanged.
+    sequence_notice: Option<String>,
+    /// lore.md 2.2: a read-only sparse view is ACTIVELY filtering (enabled AND
+    /// non-empty AND compiled — matches SparseView::is_active). status itself
+    /// is NEVER filtered (it must stay honest about what commit will record);
+    /// this is only an advisory that ls-files/diff are scoped. An
+    /// enabled-but-empty view is a no-op, so no advisory.
+    sparse_view_active: bool,
+    porcelain_v2: Option<std::sync::Arc<PorcelainV2Data>>,
+}
+
+/// Human advisory for a non-merge sequence in progress (read-only detection).
+async fn sequence_notice() -> Option<String> {
+    use crate::internal::sequencer::{self, SequenceKind};
+    match sequencer::detect_active().await.ok().flatten() {
+        Some(SequenceKind::CherryPick) => Some(
+            "cherry-pick in progress; run 'libra cherry-pick --continue' or '--abort'".to_string(),
+        ),
+        Some(SequenceKind::Revert) => {
+            Some("revert in progress; run 'libra revert --continue' or '--abort'".to_string())
+        }
+        Some(SequenceKind::Rebase) => {
+            Some("rebase in progress; run 'libra rebase --continue' or '--abort'".to_string())
+        }
+        // Merge has its own dedicated rendering below.
+        Some(SequenceKind::Merge) | None => None,
+    }
 }
 
 impl StatusData {
     fn is_dirty(&self) -> bool {
-        !self.staged.is_empty() || !self.unstaged.is_empty() || self.merge_state.is_some()
+        !self.staged.is_empty()
+            || !self.unstaged.is_empty()
+            || self.merge_state.is_some()
+            || !self.unmerged.is_empty()
     }
 }
 
 /// Collect all status data in one pass, eliminating duplicate computation
 /// between human/JSON/short/porcelain renderers.
 async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
+    // lore.md 2.4: layer-overlay paths are excluded from status like ignored
+    // files (a no-op with no layers).
+    crate::internal::layer::refresh_exclusion_snapshot().await;
     if is_bare_repository().await {
         return Err(CliError::fatal("this operation must be run in a work tree")
             .with_stable_code(StableErrorCode::RepoStateInvalid)
             .with_hint("this command requires a working tree; bare repositories do not have one"));
     }
+    let ignore_case = effective_ignore_case_for_status().await?;
 
     let head = Head::current_result()
         .await
@@ -344,39 +535,31 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         .await
         .map(|c| c.to_relative())
         .map_err(CliError::from)?;
-    let mut unstaged = changes_to_be_staged()
-        .map(|c| c.to_relative())
-        .map_err(CliError::from)?;
-    let mut ignored_files = if args.ignored && !matches!(args.untracked_files, UntrackedFiles::No) {
-        list_ignored_files()
-            .map(|c| c.to_relative().new)
-            .map_err(CliError::from)?
-    } else {
-        vec![]
-    };
-    let needs_index = matches!(args.untracked_files, UntrackedFiles::Normal)
-        || matches!(args.porcelain, Some(PorcelainVersion::V2));
-    let mut maybe_index = if needs_index {
-        Some(load_status_index()?)
-    } else {
-        None
-    };
-
-    // Apply untracked-files filter
-    match args.untracked_files {
-        UntrackedFiles::No => {
-            unstaged.new.clear();
-            ignored_files.clear();
-        }
-        UntrackedFiles::Normal => {
-            let index = maybe_index
-                .as_ref()
-                .ok_or_else(|| CliError::internal("status index should be loaded"))?;
-            unstaged.new = collapse_untracked_directories(unstaged.new, index);
-            ignored_files = collapse_untracked_directories(ignored_files, index);
-        }
-        UntrackedFiles::All => {}
-    }
+    let worktree = status_untracked::collect_status_worktree_changes(
+        args.untracked_files.unwrap_or(UntrackedFiles::Normal),
+        args.ignored,
+        ignore_case,
+    )
+    .map_err(CliError::from)?;
+    let mut unstaged = status_untracked::changes_to_current_directory(worktree.unstaged);
+    let unmerged = unmerged::collect(&worktree.index)
+        .into_iter()
+        .map(|entry| {
+            let current_path = util::workdir_to_current(&entry.path);
+            entry.with_path(current_path)
+        })
+        .collect::<Vec<_>>();
+    let unmerged_paths = unmerged
+        .iter()
+        .map(|entry| entry.path.clone())
+        .collect::<HashSet<_>>();
+    unstaged.new.retain(|path| !unmerged_paths.contains(path));
+    let ignored_files = worktree
+        .ignored_files
+        .into_iter()
+        .map(util::workdir_to_current)
+        .collect();
+    let mut maybe_index = Some(worktree.index);
 
     // Resolve rename detection: `--no-renames` wins (off); otherwise `--renames`
     // (or `--find-renames`) enables it at the given threshold (default 50).
@@ -397,7 +580,11 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
     }
 
     let stash_count = if args.show_stash {
-        Some(stash::get_stash_num().unwrap_or(0))
+        Some(stash::get_stash_num().map_err(|detail| {
+            CliError::fatal(format!("failed to read stash state for status: {detail}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("repair or remove the corrupt stash log, then retry")
+        })?)
     } else {
         None
     };
@@ -415,12 +602,12 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
             let index = maybe_index
                 .as_ref()
                 .ok_or_else(|| CliError::internal("status index should be loaded"))?;
+            let conflicted_paths =
+                merge::unresolved_conflicted_paths(index, &state.conflicted_paths);
             Some(MergeStatusInfo {
                 target_ref: state.target_ref,
-                conflicted_paths: merge::unresolved_conflicted_paths(
-                    index,
-                    &state.conflicted_paths,
-                ),
+                unresolved_count: conflicted_paths.len(),
+                conflicted_paths,
             })
         }
         None => None,
@@ -429,23 +616,88 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         let index = maybe_index
             .take()
             .ok_or_else(|| CliError::internal("porcelain v2 metadata should be loaded"))?;
-        Some(build_porcelain_v2_data(index, head_oid.as_ref()))
+        Some(std::sync::Arc::new(build_porcelain_v2_data(
+            index,
+            head_oid.as_ref(),
+        )))
     } else {
         None
     };
 
-    Ok(StatusData {
+    let mut data = StatusData {
         head,
         head_oid,
         has_commits,
         staged,
         unstaged,
+        unmerged,
         ignored_files,
         stash_count,
         upstream,
         merge_state,
+        sequence_notice: sequence_notice().await,
+        sparse_view_active: crate::internal::sparse::SparseView::load()
+            .await
+            .is_active(),
         porcelain_v2,
-    })
+    };
+    filter_status_data_by_pathspec(&mut data, args)?;
+    Ok(data)
+}
+
+fn filter_status_data_by_pathspec(data: &mut StatusData, args: &StatusArgs) -> CliResult<()> {
+    if args.pathspec.is_empty() {
+        return Ok(());
+    }
+    let pathspecs =
+        PathspecSet::from_workdir(&args.pathspec, &util::cur_dir(), &util::working_dir())
+            .map_err(pathspec_error_to_cli)?;
+
+    filter_changes_by_pathspec(&mut data.staged, &pathspecs);
+    filter_changes_by_pathspec(&mut data.unstaged, &pathspecs);
+    data.unmerged
+        .retain(|entry| current_relative_matches(&entry.path, &pathspecs));
+    data.ignored_files
+        .retain(|path| current_relative_matches(path, &pathspecs));
+    if let Some(merge_state) = data.merge_state.as_mut() {
+        merge_state
+            .conflicted_paths
+            .retain(|path| pathspecs.matches_path(Path::new(path)));
+    }
+
+    Ok(())
+}
+
+fn filter_changes_by_pathspec(changes: &mut Changes, pathspecs: &PathspecSet) {
+    changes
+        .new
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes
+        .modified
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes
+        .deleted
+        .retain(|path| current_relative_matches(path, pathspecs));
+    changes.renamed.retain(|(old, new)| {
+        current_relative_matches(old, pathspecs) || current_relative_matches(new, pathspecs)
+    });
+}
+
+fn current_relative_matches(path: &Path, pathspecs: &PathspecSet) -> bool {
+    pathspecs.matches_path(util::to_workdir_path(path))
+}
+
+fn pathspec_error_to_cli(error: PathspecError) -> CliError {
+    match error {
+        PathspecError::OutsideRepository { .. } => CliError::fatal(error.to_string())
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("all pathspecs must stay within the repository working tree"),
+        PathspecError::UnsupportedMagic { .. } | PathspecError::InvalidPattern { .. } => {
+            CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use supported magic: top, exclude, icase, literal, glob")
+        }
+    }
 }
 
 /// Detect renames between deleted and new files in `changes`.
@@ -599,7 +851,7 @@ pub async fn collect_status_json_envelope_for_api(
 ) -> CliResult<serde_json::Value> {
     use std::path::PathBuf;
 
-    let args = StatusArgs::default();
+    let mut args = StatusArgs::default();
     let canon_working =
         std::fs::canonicalize(working_dir).unwrap_or_else(|_| PathBuf::from(working_dir));
     let canon_cwd = std::env::current_dir()
@@ -616,6 +868,11 @@ pub async fn collect_status_json_envelope_for_api(
         )));
     }
 
+    // Byte-parity with `libra status --json`: the API honors the same
+    // resolved `status.*` defaults (and the same fail-closed validation) as
+    // the CLI entry points.
+    apply_status_config_defaults(&mut args).await?;
+    let args = args;
     let data = collect_status_data(&args).await?;
     let inner = build_status_json(&data, &args);
     Ok(serde_json::json!({
@@ -634,8 +891,23 @@ pub async fn execute(args: StatusArgs) {
 /// Safe entry point that returns structured [`CliResult`] instead of printing
 /// errors and exiting. JSON mode propagates status-computation failures as
 /// structured CLI errors; text mode uses the same structured error contract.
-pub async fn execute_safe(args: StatusArgs, output: &OutputConfig) -> CliResult<()> {
+pub async fn execute_safe(mut args: StatusArgs, output: &OutputConfig) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
+
+    // Fail closed on invalid `status.*` config before any mode runs or any
+    // output is produced; CLI flags keep precedence inside the resolver.
+    apply_status_config_defaults(&mut args).await?;
+    let args = args;
+
+    // Dirty-set cache modes (lore.md 1.1). NOTE: only this CLI entry routes
+    // them — the legacy `execute_to` writer entry ignores the flags (its
+    // callers never set them).
+    if args.scan {
+        return run_status_scan(&args, output).await;
+    }
+    if args.cached || args.check_dirty {
+        return run_status_cache_mode(&args, output).await;
+    }
 
     let data = collect_status_data(&args).await?;
 
@@ -655,11 +927,498 @@ pub async fn execute_safe(args: StatusArgs, output: &OutputConfig) -> CliResult<
     Ok(())
 }
 
+// ─── Dirty-set cache modes (lore.md §1.1) ───────────────────────────────────
+
+/// The raw (repo-relative) staged + unstaged sets for dirty-cache snapshots.
+/// This remains a full reconcile so `status --scan` can discover every dirty
+/// path before replacing the cache.
+async fn compute_raw_sets() -> CliResult<(Changes, Changes)> {
+    let staged = changes_to_be_committed_safe()
+        .await
+        .map_err(CliError::from)?;
+    let ignore_case = effective_ignore_case_for_status().await?;
+    let unstaged = changes_to_be_staged_with_ignore_case(ignore_case).map_err(CliError::from)?;
+    Ok((staged, unstaged))
+}
+
+async fn effective_ignore_case_for_status() -> CliResult<bool> {
+    crate::utils::path_case::effective_ignore_case()
+        .await
+        .map_err(|error| {
+            CliError::fatal(error.to_string()).with_stable_code(StableErrorCode::IoReadFailed)
+        })
+}
+
+fn dirty_cache_error(action: &str, error: anyhow::Error) -> CliError {
+    CliError::fatal(format!("failed to {action} the dirty cache: {error}"))
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+}
+
+/// Snapshot rows from the raw sets ('/'-normalized repo-relative paths).
+fn snapshot_rows(
+    staged: &Changes,
+    unstaged: &Changes,
+) -> Result<Vec<(String, &'static str)>, CliError> {
+    use crate::internal::dirty;
+    let mut rows: Vec<(String, &'static str)> = Vec::new();
+    let mut push = |paths: &[PathBuf], kind: &'static str| -> Result<(), CliError> {
+        for path in paths {
+            // Strict: the reconcile already refuses undecodable paths, so this
+            // only fires defensively — the scan aborts rather than caching a
+            // lossy-mangled path that would later verify as a different file.
+            let stored = dirty::native_path_to_stored(path)
+                .map_err(|e| dirty_cache_error("encode a path for", e))?;
+            rows.push((stored, kind));
+        }
+        Ok(())
+    };
+    push(&unstaged.new, dirty::KIND_NEW)?;
+    push(&unstaged.modified, dirty::KIND_MODIFIED)?;
+    push(&unstaged.deleted, dirty::KIND_DELETED)?;
+    push(&staged.new, dirty::KIND_STAGED_NEW)?;
+    push(&staged.modified, dirty::KIND_STAGED_MODIFIED)?;
+    push(&staged.deleted, dirty::KIND_STAGED_DELETED)?;
+    Ok(rows)
+}
+
+/// `status --scan`: run the full safe reconcile and atomically replace the
+/// cache snapshot from it. TOCTOU-safe: the index fingerprint and HEAD are
+/// captured BEFORE the reconcile and re-verified AFTER — a concurrent index
+/// writer aborts the cache commit (the old snapshot stays intact) instead of
+/// stamping rows computed against an older index as fresh.
+async fn run_status_scan(args: &StatusArgs, output: &OutputConfig) -> CliResult<()> {
+    use crate::internal::{
+        db::get_db_conn_instance,
+        dirty::{DirtyCache, ScanLockOutcome},
+    };
+
+    let index_path =
+        path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
+    let db = get_db_conn_instance().await;
+    let pid = std::process::id() as i64;
+    match DirtyCache::try_acquire_scan_lock_with_conn(&db, pid)
+        .await
+        .map_err(|e| dirty_cache_error("lock", e))?
+    {
+        ScanLockOutcome::Acquired { stole } => {
+            if stole {
+                crate::utils::error::emit_warning(
+                    "stole a stale dirty-cache scan lock (previous scanner crashed?)",
+                );
+            }
+        }
+        ScanLockOutcome::Held { pid, since } => {
+            return Err(CliError::failure(format!(
+                "another `status --scan` holds the dirty-cache lock (pid {pid}, since {since})"
+            ))
+            .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+            .with_hint("wait for it to finish, or re-run later (stale locks are stolen)"));
+        }
+    }
+    // Everything below must release the lock — including error paths.
+    let result = run_status_scan_locked(args, output, &index_path).await;
+    let _ = DirtyCache::release_scan_lock_with_conn(&db, pid).await;
+    result?;
+    // Re-open a plain connection for the final read in JSON mode is not
+    // needed; run_status_scan_locked rendered already.
+    Ok(())
+}
+
+async fn run_status_scan_locked(
+    args: &StatusArgs,
+    output: &OutputConfig,
+    index_path: &std::path::Path,
+) -> CliResult<()> {
+    use sea_orm::TransactionTrait;
+
+    use crate::internal::{
+        db::get_db_conn_instance,
+        dirty::{DirtyCache, current_index_fingerprint},
+    };
+
+    let fingerprint_before =
+        current_index_fingerprint(index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let head_before = Head::current_commit().await.map(|oid| oid.to_string());
+    let scan_started_at = crate::internal::dirty::now_timestamp();
+
+    // The same full safe reconcile as the default status, raw + display.
+    let (staged_raw, unstaged_raw) = compute_raw_sets().await?;
+    let data = collect_status_data(args).await?;
+
+    let fingerprint_after =
+        current_index_fingerprint(index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let head_after = Head::current_commit().await.map(|oid| oid.to_string());
+    if fingerprint_before != fingerprint_after || head_before != head_after {
+        return Err(CliError::failure(
+            "the index or HEAD changed while scanning; the dirty cache was left untouched",
+        )
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+        .with_hint("re-run 'libra status --scan' once the concurrent operation finishes"));
+    }
+
+    let rows = snapshot_rows(&staged_raw, &unstaged_raw)?;
+    let row_count = rows.len();
+    let db = get_db_conn_instance().await;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|e| dirty_cache_error("open a transaction for", anyhow::anyhow!(e)))?;
+    DirtyCache::replace_all_with_conn(
+        &txn,
+        &rows,
+        &fingerprint_before,
+        head_before.as_deref(),
+        &scan_started_at,
+    )
+    .await
+    .map_err(|e| dirty_cache_error("write", e))?;
+    txn.commit()
+        .await
+        .map_err(|e| dirty_cache_error("commit", anyhow::anyhow!(e)))?;
+
+    if output.is_json() {
+        let mut json_data = build_status_json(&data, args);
+        json_data["mode"] = serde_json::json!("scan");
+        json_data["cached_paths"] = serde_json::json!(row_count);
+        emit_json_data("status", &json_data, output)?;
+    } else if !output.quiet {
+        let mut stdout = std::io::stdout();
+        render_status_to_writer(&data, args, output, &mut stdout).await?;
+        println!("dirty cache rebuilt ({row_count} paths)");
+    }
+    if args.exit_code && data.is_dirty() {
+        return Err(CliError::silent_exit(1));
+    }
+    Ok(())
+}
+
+/// Classify a manual (`kind='unknown'`) mark against the index, bounded and
+/// panic-free (deliberately no `Index::is_modified`, which panics on missing
+/// entries/files): returns the effective kind, or `None` when clean.
+fn classify_manual_mark(
+    index: &Index,
+    workdir: &std::path::Path,
+    stored: &str,
+) -> Option<&'static str> {
+    use crate::internal::dirty;
+    let native = dirty::stored_path_to_native(stored);
+    let Some(path_str) = native.to_str() else {
+        return Some(dirty::KIND_NEW); // undecodable: over-report
+    };
+    let tracked = index.tracked(path_str, 0);
+    let abs = workdir.join(&native);
+    let exists = abs.symlink_metadata().is_ok();
+    match (tracked, exists) {
+        (false, true) => Some(dirty::KIND_NEW),
+        (false, false) => None, // neither tracked nor present: not dirty
+        (true, false) => Some(dirty::KIND_DELETED),
+        (true, true) => {
+            // Content confirm (no stat shortcut: manual marks are few, and a
+            // wrong stat shortcut here would silently drop a real edit).
+            match calc_file_blob_hash(&abs) {
+                Ok(hash) if index.verify_hash(path_str, 0, &hash) => None,
+                Ok(_) => Some(dirty::KIND_MODIFIED),
+                Err(_) => Some(dirty::KIND_MODIFIED), // unreadable: over-report
+            }
+        }
+    }
+}
+
+/// `status --cached` and `status --check-dirty`: consume / re-verify the
+/// cache. Any freshness doubt degrades to the full reconcile (the cache may
+/// over-report or degrade, never silently under-report).
+async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliResult<()> {
+    use sea_orm::TransactionTrait;
+
+    use crate::internal::{
+        db::get_db_conn_instance,
+        dirty::{self, CacheState, DirtyCache, current_index_fingerprint},
+    };
+
+    let index_path =
+        path::try_index().map_err(|source| CliError::from(StatusError::Workdir { source }))?;
+    let fingerprint =
+        current_index_fingerprint(&index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let head_oid = Head::current_commit().await.map(|oid| oid.to_string());
+    let db = get_db_conn_instance().await;
+    let meta = DirtyCache::meta_with_conn(&db)
+        .await
+        .map_err(|e| dirty_cache_error("read", e))?;
+    let state = DirtyCache::classify(meta.as_ref(), &fingerprint, head_oid.as_deref());
+
+    if state != CacheState::Fresh {
+        // Degrade to the full reconcile — never trust a doubtful cache.
+        crate::utils::error::emit_warning(format!(
+            "dirty cache is {}; falling back to the full status (run 'libra status --scan' to rebuild)",
+            state.as_str()
+        ));
+        let data = collect_status_data(args).await?;
+        if output.is_json() {
+            let mut json_data = build_status_json(&data, args);
+            json_data["mode"] =
+                serde_json::json!(if args.cached { "cached" } else { "check_dirty" });
+            json_data["freshness"] = serde_json::json!("full");
+            json_data["cache_state"] = serde_json::json!(state.as_str());
+            emit_json_data("status", &json_data, output)?;
+        } else if !output.quiet {
+            let mut stdout = std::io::stdout();
+            render_status_to_writer(&data, args, output, &mut stdout).await?;
+        }
+        if args.exit_code && data.is_dirty() {
+            return Err(CliError::silent_exit(1));
+        }
+        return Ok(());
+    }
+
+    let rows = DirtyCache::list_with_conn(&db)
+        .await
+        .map_err(|e| dirty_cache_error("read", e))?;
+    let workdir = util::try_working_dir()
+        .map_err(|source| CliError::from(StatusError::Workdir { source }))?;
+    let index = load_status_index()?;
+
+    // Build the raw sets from the cache (staged snapshot + unstaged rows +
+    // classified manual marks), optionally re-verifying (--check-dirty).
+    let mut staged = Changes::default();
+    let mut unstaged = Changes::default();
+    let mut pruned: Vec<(String, String)> = Vec::new();
+    let mut confirmed: Vec<(String, String)> = Vec::new();
+    for row in &rows {
+        let native = dirty::stored_path_to_native(&row.path);
+        let verify = args.check_dirty;
+        match row.kind.as_str() {
+            dirty::KIND_STAGED_NEW => staged.new.push(native),
+            dirty::KIND_STAGED_MODIFIED => staged.modified.push(native),
+            dirty::KIND_STAGED_DELETED => staged.deleted.push(native),
+            dirty::KIND_NEW => {
+                // An undecodable stored path cannot be re-verified — keep it
+                // (the cache must never under-report a recorded fact).
+                let Some(path_str) = native.to_str() else {
+                    unstaged.new.push(native);
+                    continue;
+                };
+                let still = !verify
+                    || (workdir.join(&native).symlink_metadata().is_ok()
+                        && !index.tracked(path_str, 0));
+                if still {
+                    unstaged.new.push(native);
+                    if verify {
+                        confirmed.push((row.path.clone(), row.kind.clone()));
+                    }
+                } else {
+                    pruned.push((row.path.clone(), row.kind.clone()));
+                }
+            }
+            dirty::KIND_MODIFIED => {
+                let Some(path_str) = native.to_str() else {
+                    unstaged.modified.push(native);
+                    continue;
+                };
+                let abs = workdir.join(&native);
+                let still = !verify || {
+                    index.tracked(path_str, 0)
+                        && abs.symlink_metadata().is_ok()
+                        && match calc_file_blob_hash(&abs) {
+                            Ok(hash) => !index.verify_hash(path_str, 0, &hash),
+                            Err(_) => true, // unreadable: keep (over-report)
+                        }
+                };
+                if still {
+                    unstaged.modified.push(native);
+                    if verify {
+                        confirmed.push((row.path.clone(), row.kind.clone()));
+                    }
+                } else {
+                    pruned.push((row.path.clone(), row.kind.clone()));
+                }
+            }
+            dirty::KIND_DELETED => {
+                let Some(path_str) = native.to_str() else {
+                    unstaged.deleted.push(native);
+                    continue;
+                };
+                let still = !verify
+                    || (index.tracked(path_str, 0)
+                        && workdir.join(&native).symlink_metadata().is_err());
+                if still {
+                    unstaged.deleted.push(native);
+                    if verify {
+                        confirmed.push((row.path.clone(), row.kind.clone()));
+                    }
+                } else {
+                    pruned.push((row.path.clone(), row.kind.clone()));
+                }
+            }
+            _ => {
+                // Manual 'unknown' marks: classified in memory, always content
+                // confirmed (both modes — cheap, marks are few).
+                match classify_manual_mark(&index, &workdir, &row.path) {
+                    Some(dirty::KIND_NEW) => unstaged.new.push(native),
+                    Some(dirty::KIND_DELETED) => unstaged.deleted.push(native),
+                    Some(_) => unstaged.modified.push(native),
+                    None => {
+                        if verify {
+                            pruned.push((row.path.clone(), row.kind.clone()));
+                        }
+                        // --cached: clean manual marks are dropped from the
+                        // VIEW but kept in the cache (read-only fast path).
+                    }
+                }
+            }
+        }
+    }
+    let checked = rows.len();
+    // Re-verify the epoch AFTER processing: a concurrent index/HEAD change
+    // since the initial classify would make this view (and any prune) stale —
+    // degrade instead of committing or rendering it as fresh.
+    let fingerprint_now =
+        current_index_fingerprint(&index_path).map_err(|e| dirty_cache_error("fingerprint", e))?;
+    let head_now = Head::current_commit().await.map(|oid| oid.to_string());
+    if fingerprint_now != fingerprint || head_now != head_oid {
+        crate::utils::error::emit_warning(
+            "the index or HEAD changed while reading the dirty cache; falling back to the full status",
+        );
+        let data = collect_status_data(args).await?;
+        if output.is_json() {
+            let mut json_data = build_status_json(&data, args);
+            json_data["mode"] =
+                serde_json::json!(if args.cached { "cached" } else { "check_dirty" });
+            json_data["freshness"] = serde_json::json!("full");
+            json_data["cache_state"] = serde_json::json!("stale");
+            emit_json_data("status", &json_data, output)?;
+        } else if !output.quiet {
+            let mut stdout = std::io::stdout();
+            render_status_to_writer(&data, args, output, &mut stdout).await?;
+        }
+        if args.exit_code && data.is_dirty() {
+            return Err(CliError::silent_exit(1));
+        }
+        return Ok(());
+    }
+    if args.check_dirty && (!pruned.is_empty() || !confirmed.is_empty()) {
+        let txn = db
+            .begin()
+            .await
+            .map_err(|e| dirty_cache_error("open a transaction for", anyhow::anyhow!(e)))?;
+        DirtyCache::prune_and_confirm_with_conn(&txn, &pruned, &confirmed)
+            .await
+            .map_err(|e| dirty_cache_error("update", e))?;
+        txn.commit()
+            .await
+            .map_err(|e| dirty_cache_error("commit", anyhow::anyhow!(e)))?;
+    }
+
+    // Assemble display data: cheap fresh pieces (head/upstream/merge state),
+    // cache-derived changes (cwd-relative for display), NO rename detection
+    // (would need object loads; documented) and no worktree walk.
+    let head = Head::current().await;
+    let head_oid_hash = Head::current_commit().await;
+    let staged = staged.to_relative();
+    let mut unstaged = unstaged.to_relative();
+    // Honor the resolved display defaults exactly like the full status
+    // (P1-05d): `status.showUntrackedFiles=no`/`-uno` hides untracked
+    // entries (the cache stores explicit paths, so `normal` and `all`
+    // render identically here), and `--show-stash`/`status.showStash`
+    // surfaces the stash count. `status.relativePaths=false` is applied by
+    // the shared renderer.
+    if args.untracked_files == Some(UntrackedFiles::No) {
+        unstaged.new.clear();
+    }
+    let stash_count = if args.show_stash {
+        Some(stash::get_stash_num().map_err(|detail| {
+            CliError::fatal(format!("failed to read stash state for status: {detail}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("repair or remove the corrupt stash log, then retry")
+        })?)
+    } else {
+        None
+    };
+    let upstream = resolve_upstream_info(&head, head_oid_hash.as_ref()).await?;
+    let merge_state = match merge::MergeState::load_optional_sync().map_err(|detail| {
+        CliError::fatal(format!("failed to inspect merge state: {detail}"))
+            .with_stable_code(StableErrorCode::IoReadFailed)
+    })? {
+        Some(state) => {
+            let conflicted_paths =
+                merge::unresolved_conflicted_paths(&index, &state.conflicted_paths);
+            Some(MergeStatusInfo {
+                target_ref: state.target_ref.clone(),
+                unresolved_count: conflicted_paths.len(),
+                conflicted_paths,
+            })
+        }
+        None => None,
+    };
+    let mut data = StatusData {
+        head,
+        has_commits: head_oid_hash.is_some(),
+        head_oid: head_oid_hash,
+        staged,
+        unstaged,
+        unmerged: vec![],
+        ignored_files: vec![],
+        stash_count,
+        upstream,
+        merge_state,
+        sequence_notice: sequence_notice().await,
+        sparse_view_active: crate::internal::sparse::SparseView::load()
+            .await
+            .is_active(),
+        porcelain_v2: None,
+    };
+    filter_status_data_by_pathspec(&mut data, args)?;
+
+    if output.is_json() {
+        let mut json_data = build_status_json(&data, args);
+        json_data["mode"] = serde_json::json!(if args.cached { "cached" } else { "check_dirty" });
+        json_data["freshness"] = serde_json::json!("cached");
+        json_data["cache_state"] = serde_json::json!("fresh");
+        json_data["cached_paths"] = serde_json::json!(checked);
+        if args.check_dirty {
+            json_data["checked_paths"] = serde_json::json!(checked);
+            json_data["stale_paths"] = serde_json::json!(
+                pruned
+                    .iter()
+                    .map(|(path, _)| path.clone())
+                    .collect::<Vec<_>>()
+            );
+        }
+        emit_json_data("status", &json_data, output)?;
+    } else if !output.quiet {
+        let mut stdout = std::io::stdout();
+        render_status_to_writer(&data, args, output, &mut stdout).await?;
+        if args.check_dirty {
+            println!(
+                "dirty cache re-verified ({} checked, {} pruned)",
+                checked,
+                pruned.len()
+            );
+        }
+    }
+    if args.exit_code && data.is_dirty() {
+        return Err(CliError::silent_exit(1));
+    }
+    Ok(())
+}
+
 /// Legacy entry point that writes status to the given writer.
 /// Used by the old `execute()` path and tests.
-pub async fn execute_to(args: StatusArgs, writer: &mut impl Write) -> CliResult<()> {
+pub async fn execute_to(mut args: StatusArgs, writer: &mut impl Write) -> CliResult<()> {
     util::require_repo().map_err(|_| CliError::repo_not_found())?;
 
+    apply_status_config_defaults(&mut args).await?;
+    execute_to_resolved(args, writer).await
+}
+
+/// Collect and render status from arguments whose config defaults were already
+/// resolved by [`resolve_config_defaults`]. This avoids a second, potentially
+/// inconsistent config read after an embedded caller has crossed a side-effect
+/// boundary.
+pub(crate) async fn execute_to_resolved(
+    args: StatusArgs,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    util::require_repo().map_err(|_| CliError::repo_not_found())?;
     let data = collect_status_data(&args).await?;
     let output = OutputConfig::default();
     render_status_to_writer(&data, &args, &output, writer).await
@@ -695,8 +1454,9 @@ async fn render_status_to_writer(
             output_porcelain_v2(
                 &data.staged,
                 &data.unstaged,
+                &data.unmerged,
                 &data.ignored_files,
-                data.porcelain_v2.as_ref(),
+                data.porcelain_v2.as_deref(),
                 args.null_terminated,
                 &mut buffer,
             )?;
@@ -713,9 +1473,10 @@ async fn render_status_to_writer(
                     &mut buffer,
                 )?;
             }
-            output_porcelain(
+            output_porcelain_with_unmerged(
                 &data.staged,
                 &data.unstaged,
+                &data.unmerged,
                 args.null_terminated,
                 &mut buffer,
             )?;
@@ -735,6 +1496,19 @@ async fn render_status_to_writer(
         None => {}
     };
 
+    // `status.relativePaths=false`: Git renders the HUMAN formats (short and
+    // long) with repository-root-relative paths. Collection stays cwd-relative
+    // throughout (pathspec filtering and porcelain metadata lookups depend on
+    // it); only the rendered copy is converted here. Porcelain/JSON output is
+    // reached before this point and keeps its existing path shape.
+    let rooted_data;
+    let data = if args.relative_paths {
+        data
+    } else {
+        rooted_data = data_with_repo_root_paths(data);
+        &rooted_data
+    };
+
     // Short format
     if args.short {
         if args.branch {
@@ -749,6 +1523,7 @@ async fn render_status_to_writer(
         output_short_format_with_config(
             &data.staged,
             &data.unstaged,
+            &data.unmerged,
             output,
             args.null_terminated,
             &mut buffer,
@@ -772,6 +1547,46 @@ async fn render_status_to_writer(
     render_human_status(data, args, &mut buffer)?;
     writer.write_all(&buffer).map_err(write_error)?;
     Ok(())
+}
+
+/// Convert every display path in `data` from cwd-relative to
+/// repository-root-relative (`status.relativePaths=false`). Rename pairs,
+/// unmerged entries, and ignored paths are converted alongside the staged and
+/// unstaged change sets.
+fn data_with_repo_root_paths(data: &StatusData) -> StatusData {
+    // Collapsed untracked/ignored directories carry a deliberate trailing
+    // `/` marker (see `status_untracked`); path conversion must not eat it,
+    // or directories become indistinguishable from files in the output.
+    fn convert(path: &Path) -> PathBuf {
+        let rooted = util::to_workdir_path(path);
+        if path.to_string_lossy().ends_with('/') {
+            PathBuf::from(format!("{}/", rooted.display()))
+        } else {
+            rooted
+        }
+    }
+    fn changes(changes: &Changes) -> Changes {
+        Changes {
+            new: changes.new.iter().map(|p| convert(p)).collect(),
+            modified: changes.modified.iter().map(|p| convert(p)).collect(),
+            deleted: changes.deleted.iter().map(|p| convert(p)).collect(),
+            renamed: changes
+                .renamed
+                .iter()
+                .map(|(from, to)| (convert(from), convert(to)))
+                .collect(),
+        }
+    }
+    let mut rooted = data.clone();
+    rooted.staged = changes(&data.staged);
+    rooted.unstaged = changes(&data.unstaged);
+    rooted.unmerged = data
+        .unmerged
+        .iter()
+        .map(|entry| entry.clone().with_path(convert(&entry.path)))
+        .collect();
+    rooted.ignored_files = data.ignored_files.iter().map(|p| convert(p)).collect();
+    rooted
 }
 
 // ---------------------------------------------------------------------------
@@ -802,6 +1617,16 @@ fn render_human_status(
         render_upstream_human(upstream, buffer)?;
     }
 
+    if let Some(notice) = &data.sequence_notice {
+        writeln!(buffer, "{notice}").map_err(write_error)?;
+    }
+    if data.sparse_view_active {
+        writeln!(
+            buffer,
+            "note: a sparse view is active (scopes 'ls-files'/'diff' output; status is not filtered)"
+        )
+        .map_err(write_error)?;
+    }
     if let Some(merge_state) = &data.merge_state {
         render_merge_state_human(merge_state, buffer)?;
     }
@@ -823,7 +1648,11 @@ fn render_human_status(
     }
 
     // Clean tree
-    if data.staged.is_empty() && data.unstaged.is_empty() {
+    if data.merge_state.is_none()
+        && data.staged.is_empty()
+        && data.unstaged.is_empty()
+        && data.unmerged.is_empty()
+    {
         writeln!(buffer, "nothing to commit, working tree clean").map_err(write_error)?;
         return Ok(());
     }
@@ -889,6 +1718,35 @@ fn render_human_status(
         }
     }
 
+    if !data.unmerged.is_empty() {
+        writeln!(buffer, "Unmerged paths:").map_err(write_error)?;
+        writeln!(buffer, "  use \"libra add <file>...\" to mark resolution")
+            .map_err(write_error)?;
+        writeln!(
+            buffer,
+            "  use \"libra merge --abort\" or the active sequencer abort command to abort"
+        )
+        .map_err(write_error)?;
+        let entries = data
+            .unmerged
+            .iter()
+            .map(|entry| {
+                (
+                    unmerged_human_label(entry),
+                    entry.path.display().to_string(),
+                )
+            })
+            .collect::<Vec<_>>();
+        if args.column {
+            render_columnated_labeled_entries(buffer, &entries, colored::Color::BrightRed)?;
+        } else {
+            for (label, path) in entries {
+                let line = format!("\t{label} {path}");
+                writeln!(buffer, "{}", line.bright_red()).map_err(write_error)?;
+            }
+        }
+    }
+
     // Untracked
     if !data.unstaged.new.is_empty() {
         writeln!(buffer, "Untracked files:").map_err(write_error)?;
@@ -926,6 +1784,18 @@ fn render_human_status(
     }
 
     Ok(())
+}
+
+fn unmerged_human_label(entry: &UnmergedEntry) -> &'static str {
+    match entry.xy() {
+        ('D', 'D') => "both deleted:",
+        ('A', 'U') => "added by us:",
+        ('U', 'D') => "deleted by them:",
+        ('U', 'A') => "added by them:",
+        ('D', 'U') => "deleted by us:",
+        ('A', 'A') => "both added:",
+        _ => "both modified:",
+    }
 }
 
 /// Build a flat list of (label, path) for human output.
@@ -1045,10 +1915,16 @@ fn render_merge_state_human(merge_state: &MergeStatusInfo, buffer: &mut Vec<u8>)
         merge_state.target_ref
     )
     .map_err(write_error)?;
-    if merge_state.conflicted_paths.is_empty() {
+    if merge_state.unresolved_count == 0 {
         writeln!(
             buffer,
             "  (all conflicts fixed: run \"libra merge --continue\")"
+        )
+        .map_err(write_error)?;
+    } else if merge_state.conflicted_paths.is_empty() {
+        writeln!(
+            buffer,
+            "  (conflicts remain outside the selected pathspec; run \"libra status\" to see them)"
         )
         .map_err(write_error)?;
     } else {
@@ -1195,6 +2071,13 @@ fn build_status_json(data: &StatusData, _args: &StatusArgs) -> serde_json::Value
             "deleted": paths_to_json(&data.unstaged.deleted),
             "renamed": renamed_to_json(&data.unstaged.renamed),
         },
+        "unmerged": paths_to_json(
+            &data
+                .unmerged
+                .iter()
+                .map(|entry| entry.path.clone())
+                .collect::<Vec<_>>()
+        ),
         "untracked": paths_to_json(&data.unstaged.new),
         "ignored": paths_to_json(&data.ignored_files),
         "is_clean": !data.is_dirty(),
@@ -1231,7 +2114,17 @@ pub fn output_porcelain(
     null_terminated: bool,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    let status_list = generate_short_format_status(staged, unstaged);
+    output_porcelain_with_unmerged(staged, unstaged, &[], null_terminated, writer)
+}
+
+fn output_porcelain_with_unmerged(
+    staged: &Changes,
+    unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
+    null_terminated: bool,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
     for (file, staged_status, unstaged_status) in status_list {
         write!(
@@ -1273,6 +2166,19 @@ fn tree_item_mode_to_u32(mode: TreeItemMode) -> u32 {
         TreeItemMode::Link => 0o120000,
         TreeItemMode::Tree => 0o040000,
         TreeItemMode::Commit => 0o160000,
+    }
+}
+
+/// Classify a raw index entry mode into the tree-item mode it would commit as,
+/// mirroring `tree::create_tree_from_index`. Lets staged-change detection notice
+/// a mode-only change (e.g. the executable bit set by `add --chmod=+x`).
+fn index_mode_to_tree_item_mode(mode: u32) -> TreeItemMode {
+    match mode & 0o170000 {
+        0o120000 => TreeItemMode::Link,
+        0o040000 => TreeItemMode::Tree,
+        0o160000 => TreeItemMode::Commit,
+        _ if mode & 0o111 != 0 => TreeItemMode::BlobExecutable,
+        _ => TreeItemMode::Blob,
     }
 }
 
@@ -1346,6 +2252,7 @@ fn build_porcelain_v2_data(index: Index, head_oid: Option<&ObjectHash>) -> Porce
 fn output_porcelain_v2(
     staged: &Changes,
     unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
     ignored: &[PathBuf],
     metadata: Option<&PorcelainV2Data>,
     null_terminated: bool,
@@ -1355,6 +2262,10 @@ fn output_porcelain_v2(
         metadata.ok_or_else(|| CliError::internal("missing porcelain v2 metadata for status"))?;
     let zero_hash = zero_hash_str();
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+
+    for entry in unmerged {
+        write_unmerged_porcelain_v2(entry, &zero_hash, null_terminated, writer)?;
+    }
 
     let status_list = generate_short_format_status(staged, unstaged);
     for (file, staged_status, unstaged_status) in status_list {
@@ -1433,6 +2344,59 @@ fn zero_hash_str() -> String {
     ObjectHash::zero_str(get_hash_kind())
 }
 
+fn write_unmerged_porcelain_v2(
+    entry: &UnmergedEntry,
+    zero_hash: &str,
+    null_terminated: bool,
+    writer: &mut impl Write,
+) -> CliResult<()> {
+    let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
+    let (staged_status, unstaged_status) = entry.xy();
+    let mode = |stage| {
+        entry
+            .stage(stage)
+            .map(|stage| format_mode(stage.mode))
+            .unwrap_or_else(|| "000000".to_string())
+    };
+    let hash = |stage| {
+        entry
+            .stage(stage)
+            .map(|stage| stage.hash.to_string())
+            .unwrap_or_else(|| zero_hash.to_string())
+    };
+    write!(
+        writer,
+        "u {}{} N... {} {} {} {} {} {} {} {}",
+        staged_status,
+        unstaged_status,
+        mode(1),
+        mode(2),
+        mode(3),
+        format_mode(get_unmerged_worktree_mode(&entry.path)),
+        hash(1),
+        hash(2),
+        hash(3),
+        entry.path.display()
+    )
+    .map_err(write_err)?;
+    if null_terminated {
+        writer.write_all(b"\0").map_err(write_err)?;
+    } else {
+        writer.write_all(b"\n").map_err(write_err)?;
+    }
+    Ok(())
+}
+
+fn get_unmerged_worktree_mode(file_path: &std::path::Path) -> u32 {
+    let workdir_path = current_to_workdir(file_path);
+    let abs_path = util::workdir_to_absolute(&workdir_path);
+    if std::fs::symlink_metadata(&abs_path).is_ok() {
+        get_worktree_mode(file_path)
+    } else {
+        0
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Short format
 // ---------------------------------------------------------------------------
@@ -1441,6 +2405,14 @@ fn zero_hash_str() -> String {
 pub fn generate_short_format_status(
     staged: &Changes,
     unstaged: &Changes,
+) -> Vec<(std::path::PathBuf, char, char)> {
+    generate_short_format_status_with_unmerged(staged, unstaged, &[])
+}
+
+fn generate_short_format_status_with_unmerged(
+    staged: &Changes,
+    unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
 ) -> Vec<(std::path::PathBuf, char, char)> {
     let mut file_status: HashMap<PathBuf, (char, char)> = HashMap::new();
 
@@ -1483,6 +2455,9 @@ pub fn generate_short_format_status(
     for file in &unstaged.new {
         file_status.insert(file.clone(), ('?', '?'));
     }
+    for entry in unmerged {
+        file_status.insert(entry.path.clone(), entry.xy());
+    }
 
     let mut sorted_files: Vec<_> = file_status.iter().collect();
     sorted_files.sort_by(|a, b| a.0.cmp(b.0));
@@ -1501,13 +2476,22 @@ pub async fn output_short_format(
     unstaged: &Changes,
     writer: &mut impl Write,
 ) -> CliResult<()> {
-    output_short_format_with_config(staged, unstaged, &OutputConfig::default(), false, writer).await
+    output_short_format_with_config(
+        staged,
+        unstaged,
+        &[],
+        &OutputConfig::default(),
+        false,
+        writer,
+    )
+    .await
 }
 
 /// Short format output with color controlled by OutputConfig.
 async fn output_short_format_with_config(
     staged: &Changes,
     unstaged: &Changes,
+    unmerged: &[UnmergedEntry],
     output: &OutputConfig,
     null_terminated: bool,
     writer: &mut impl Write,
@@ -1515,7 +2499,7 @@ async fn output_short_format_with_config(
     let use_colors = should_use_colors(output).await;
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
 
-    let status_list = generate_short_format_status(staged, unstaged);
+    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
 
     for (file, staged_status, unstaged_status) in status_list {
         if use_colors {
@@ -2004,23 +2988,31 @@ pub async fn changes_to_be_committed_safe() -> Result<Changes, StatusError> {
     };
     let commit = Commit::load(&head_commit);
     let tree = Tree::load(&commit.tree_id);
-    let tree_files = tree.get_plain_items();
+    let tree_files = tree.get_plain_items_with_mode();
 
-    for (item_path, item_hash) in tree_files.iter() {
+    for (item_path, item_hash, item_mode) in tree_files.iter() {
         let item_str = item_path
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding {
                 path: item_path.clone(),
             })?;
         if index.tracked(item_str, 0) {
-            if !index.verify_hash(item_str, 0, item_hash) {
+            // A staged change is either a content change (blob hash differs) OR a
+            // mode change (e.g. `add --chmod=+x`): the index records 100755 while
+            // the HEAD tree still has 100644, with the same blob.
+            let content_changed = !index.verify_hash(item_str, 0, item_hash);
+            let mode_changed = index
+                .get(item_str, 0)
+                .is_some_and(|entry| index_mode_to_tree_item_mode(entry.mode) != *item_mode);
+            if content_changed || mode_changed {
                 changes.modified.push(item_path.clone());
             }
         } else {
             changes.deleted.push(item_path.clone());
         }
     }
-    let tree_files_set: HashSet<PathBuf> = tree_files.into_iter().map(|(path, _)| path).collect();
+    let tree_files_set: HashSet<PathBuf> =
+        tree_files.into_iter().map(|(path, _, _)| path).collect();
     changes.new = tracked_files
         .into_iter()
         .filter(|path| !tree_files_set.contains(path))
@@ -2038,12 +3030,28 @@ pub fn changes_to_be_staged() -> Result<Changes, StatusError> {
 /// Commands such as `add --force` or `status --ignored` can switch policies as needed.
 pub fn changes_to_be_staged_with_policy(policy: IgnorePolicy) -> Result<Changes, StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    changes_to_be_staged_with_policy_and_ignore_case(policy, ignore_case)
+}
+
+pub(crate) fn changes_to_be_staged_with_ignore_case(
+    ignore_case: bool,
+) -> Result<Changes, StatusError> {
+    changes_to_be_staged_with_policy_and_ignore_case(IgnorePolicy::Respect, ignore_case)
+}
+
+fn changes_to_be_staged_with_policy_and_ignore_case(
+    policy: IgnorePolicy,
+    ignore_case: bool,
+) -> Result<Changes, StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    let (mut visible, ignored) = changes_to_be_staged_split_with_index(&workdir, &index)?;
+    let (mut visible, ignored) =
+        changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)?;
     match policy {
         IgnorePolicy::Respect => Ok(visible),
         IgnorePolicy::OnlyIgnored => Ok(ignored),
@@ -2056,38 +3064,61 @@ pub fn changes_to_be_staged_with_policy(policy: IgnorePolicy) -> Result<Changes,
 
 pub fn changes_to_be_staged_split_safe() -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
-    let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
-    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
-        path: index_path.clone(),
-        source,
-    })?;
-    changes_to_be_staged_split_with_index(&workdir, &index)
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    changes_to_be_staged_split_safe_with_ignore_case(ignore_case)
 }
 
-/// List changes to be staged with --force semantics (recurse into ignored directories)
-pub fn changes_to_be_staged_split_force() -> Result<(Changes, Changes), StatusError> {
+pub(crate) fn changes_to_be_staged_split_safe_with_ignore_case(
+    ignore_case: bool,
+) -> Result<(Changes, Changes), StatusError> {
     let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
     let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
     let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
         path: index_path.clone(),
         source,
     })?;
-    changes_to_be_staged_split_force_with_index(&workdir, &index)
+    changes_to_be_staged_split_with_index(&workdir, &index, ignore_case)
+}
+
+/// List changes to be staged with --force semantics (recurse into ignored directories)
+pub fn changes_to_be_staged_split_force() -> Result<(Changes, Changes), StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let ignore_case = effective_ignore_case_for_workdir(&workdir)?;
+    changes_to_be_staged_split_force_with_ignore_case(ignore_case)
+}
+
+fn effective_ignore_case_for_workdir(workdir: &Path) -> Result<bool, StatusError> {
+    crate::utils::path_case::effective_ignore_case_for_dir_sync(workdir)
+        .map_err(|source| StatusError::ConfigRead { source })
+}
+
+pub(crate) fn changes_to_be_staged_split_force_with_ignore_case(
+    ignore_case: bool,
+) -> Result<(Changes, Changes), StatusError> {
+    let workdir = util::try_working_dir().map_err(|source| StatusError::Workdir { source })?;
+    let index_path = path::try_index().map_err(|source| StatusError::Workdir { source })?;
+    let index = Index::load(&index_path).map_err(|source| StatusError::IndexLoad {
+        path: index_path.clone(),
+        source,
+    })?;
+    changes_to_be_staged_split_force_with_index(&workdir, &index, ignore_case)
 }
 
 fn changes_to_be_staged_split_force_with_index(
     workdir: &PathBuf,
     index: &Index,
+    ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
+    let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
     for file in tracked_files.iter() {
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
         let file_abs = workdir.join(file);
-        if !file_abs.exists() {
+        if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());
         } else if index.is_modified(file_str, 0, workdir) {
             let file_hash =
@@ -2110,7 +3141,8 @@ fn changes_to_be_staged_split_force_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             visible.new.push(file);
         }
     }
@@ -2118,7 +3150,8 @@ fn changes_to_be_staged_split_force_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             ignored.new.push(file);
         }
     }
@@ -2128,16 +3161,18 @@ fn changes_to_be_staged_split_force_with_index(
 fn changes_to_be_staged_split_with_index(
     workdir: &PathBuf,
     index: &Index,
+    ignore_case: bool,
 ) -> Result<(Changes, Changes), StatusError> {
     let mut visible = Changes::default();
     let mut ignored = Changes::default();
     let tracked_files = index.tracked_files();
+    let tracked_fold = tracked_files_by_fold(&tracked_files, ignore_case);
     for file in tracked_files.iter() {
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
         let file_abs = workdir.join(file);
-        if !file_abs.exists() {
+        if file_abs.symlink_metadata().is_err() {
             visible.deleted.push(file.clone());
         } else if index.is_modified(file_str, 0, workdir) {
             let file_hash =
@@ -2159,7 +3194,8 @@ fn changes_to_be_staged_split_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             visible.new.push(file);
         }
     }
@@ -2167,11 +3203,38 @@ fn changes_to_be_staged_split_with_index(
         let file_str = file
             .to_str()
             .ok_or_else(|| StatusError::InvalidPathEncoding { path: file.clone() })?;
-        if !index.tracked(file_str, 0) {
+        if !index.tracked(file_str, 0) && !is_same_file_tracked_alias(workdir, &file, &tracked_fold)
+        {
             ignored.new.push(file);
         }
     }
     Ok((visible, ignored))
+}
+
+fn tracked_files_by_fold(tracked_files: &[PathBuf], ignore_case: bool) -> HashMap<String, PathBuf> {
+    if !ignore_case {
+        return HashMap::new();
+    }
+    tracked_files
+        .iter()
+        .map(|path| {
+            (
+                crate::utils::path_case::fold_path_key(path.to_string_lossy().as_ref()),
+                path.clone(),
+            )
+        })
+        .collect()
+}
+
+fn is_same_file_tracked_alias(
+    workdir: &Path,
+    file: &Path,
+    tracked_fold: &HashMap<String, PathBuf>,
+) -> bool {
+    let key = crate::utils::path_case::fold_path_key(file.to_string_lossy().as_ref());
+    tracked_fold.get(&key).is_some_and(|tracked| {
+        crate::utils::path_case::is_same_file_case_alias(workdir, file, tracked)
+    })
 }
 
 fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>, Vec<PathBuf>)> {
@@ -2202,7 +3265,7 @@ fn list_workdir_files_split_safe(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>,
                 } else {
                     pending_dirs.push(path);
                 }
-            } else if file_type.is_file() {
+            } else if file_type.is_file() || file_type.is_symlink() {
                 if util::check_gitignore(workdir, &path) {
                     ignored.push(relative);
                 } else {
@@ -2245,7 +3308,7 @@ fn list_workdir_files_split_force(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>
                 // — so `add --force` sees concrete blobs, not a path that
                 // would panic when `Blob::from_file` tries to read it.
                 pending_dirs.push(path.clone());
-            } else if file_type.is_file() {
+            } else if file_type.is_file() || file_type.is_symlink() {
                 if util::check_gitignore(workdir, &path) {
                     ignored.push(relative);
                 } else {
@@ -2258,7 +3321,7 @@ fn list_workdir_files_split_force(workdir: &PathBuf) -> io::Result<(Vec<PathBuf>
     Ok((files, ignored))
 }
 
-/// List ignored files (not tracked by index, but ignored by .libraignore) under workdir
+/// List ignored files (not tracked by index, but ignored by configured rules) under workdir
 pub fn list_ignored_files() -> Result<Changes, StatusError> {
     changes_to_be_staged_with_policy(IgnorePolicy::OnlyIgnored)
 }

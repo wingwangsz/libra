@@ -15,9 +15,10 @@ use git_internal::{
     errors::GitError,
     hash::ObjectHash,
     internal::{
-        index::{Index, Time},
+        index::{Index, IndexEntry, Time},
         object::{
             ObjectTrait,
+            blob::Blob,
             commit::Commit,
             signature::Signature,
             tree::{Tree, TreeItem, TreeItemMode},
@@ -30,7 +31,8 @@ use serde::Serialize;
 use crate::{
     cli::Stash,
     command::{
-        load_object,
+        load_object, log,
+        merge::{MergeTreeEntry, create_tree_from_items_map},
         reset::{
             rebuild_index_from_tree, remove_empty_directories, reset_index_to_commit,
             restore_working_directory_from_tree,
@@ -53,12 +55,12 @@ use crate::{
 /// GitHub Issues URL surfaced on `StashError::Other` so users can report
 /// catch-all bucket failures that map to `InternalInvariant`. Mirrors
 /// push.rs / tag.rs's hint pattern per Cross-Cutting G.
-const ISSUE_URL: &str = "https://github.com/web3infra-foundation/libra/issues";
+const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 
 // ── Typed error ──────────────────────────────────────────────────────
 
 #[derive(Debug, thiserror::Error)]
-enum StashError {
+pub(crate) enum StashError {
     #[error("not a libra repository")]
     NotInRepo,
 
@@ -92,11 +94,20 @@ enum StashError {
     #[error("failed to write object: {0}")]
     WriteObject(String),
 
+    #[error("failed to load index: {0}")]
+    IndexLoad(String),
+
     #[error("failed to save index: {0}")]
     IndexSave(String),
 
     #[error("failed to reset working directory: {0}")]
     ResetFailed(String),
+
+    #[error("pathspec '{0}' did not match any tracked files")]
+    PathspecNoMatch(String),
+
+    #[error("'{0}' cannot be combined with a pathspec")]
+    PathspecWithOption(String),
 
     #[error("{0}")]
     Other(String),
@@ -116,8 +127,11 @@ impl StashError {
             Self::ClearRequiresForce => StableErrorCode::CliInvalidArguments,
             Self::ReadObject(_) => StableErrorCode::IoReadFailed,
             Self::WriteObject(_) => StableErrorCode::IoWriteFailed,
+            Self::IndexLoad(_) => StableErrorCode::IoReadFailed,
             Self::IndexSave(_) => StableErrorCode::IoWriteFailed,
             Self::ResetFailed(_) => StableErrorCode::IoWriteFailed,
+            Self::PathspecNoMatch(_) => StableErrorCode::CliInvalidTarget,
+            Self::PathspecWithOption(_) => StableErrorCode::CliInvalidArguments,
             Self::Other(_) => StableErrorCode::InternalInvariant,
         }
     }
@@ -153,6 +167,15 @@ impl From<StashError> for CliError {
             StashError::ClearRequiresForce => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint("re-run with --force, or use --json / --machine for scripted use"),
+            StashError::PathspecNoMatch(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("check the path exists and is tracked, or omit it to stash everything"),
+            StashError::PathspecWithOption(_) => CliError::command_usage(message)
+                .with_stable_code(stable_code)
+                .with_hint("run the option without a pathspec, or the pathspec without the option"),
+            StashError::IndexLoad(_) => CliError::fatal(message)
+                .with_stable_code(stable_code)
+                .with_hint("repair or refresh the index, then retry the stash operation."),
             StashError::Other(_) => CliError::fatal(message)
                 .with_stable_code(stable_code)
                 .with_hint(format!("this is a bug; please report it at {ISSUE_URL}")),
@@ -199,6 +222,11 @@ pub enum StashOutput {
         stash_id: String,
         files: Vec<StashFileChange>,
         files_changed: StashFilesChangedStats,
+        /// Unified diff of the stashed changes, present only with `-p`/`--patch`
+        /// (additive; omitted from JSON otherwise so existing consumers are
+        /// unaffected).
+        #[serde(skip_serializing_if = "Option::is_none")]
+        patch: Option<String>,
         // Human-render hints. Skipped in JSON because the structured output
         // always carries the full file list with status.
         #[serde(skip)]
@@ -256,6 +284,7 @@ EXAMPLES:
     libra stash push --keep-index     Keep staged changes in place
     libra stash list                  Show all stash entries
     libra stash show                  File-level summary of stash@{0}
+    libra stash show -p               Show the stashed changes as a unified diff
     libra stash show stash@{1}        Inspect a specific stash entry
     libra stash branch hotfix         Branch off the latest stash and drop it
     libra stash apply                 Re-apply stash@{0} without dropping
@@ -287,14 +316,17 @@ async fn run_stash(stash_cmd: Stash, output: &OutputConfig) -> Result<StashOutpu
         Stash::Push {
             message,
             include_untracked,
+            no_include_untracked: _,
             all,
             keep_index,
+            pathspec,
         } => {
             run_push(StashPushOptions {
                 message,
                 include_untracked: include_untracked || all,
                 include_ignored: all,
                 keep_index,
+                pathspec,
             })
             .await
         }
@@ -306,7 +338,8 @@ async fn run_stash(stash_cmd: Stash, output: &OutputConfig) -> Result<StashOutpu
             stash,
             name_only,
             name_status,
-        } => run_show(stash, name_only, name_status).await,
+            patch,
+        } => run_show(stash, name_only, name_status, patch).await,
         Stash::Branch { branch, stash } => run_branch(branch, stash).await,
         Stash::Clear { force } => run_clear(force, output).await,
     }
@@ -318,13 +351,25 @@ struct StashPushOptions {
     include_untracked: bool,
     include_ignored: bool,
     keep_index: bool,
+    /// When non-empty, stash only the changes to these paths (Git's
+    /// `stash push -- <pathspec>...`); the rest of the working tree is left
+    /// untouched.
+    pathspec: Vec<String>,
 }
 
 async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> {
+    // `stash push -- <pathspec>` stashes only the changes to the named paths and
+    // leaves the rest of the working tree intact — a distinct, self-contained
+    // flow so the common full-stash path stays unchanged.
+    if !options.pathspec.is_empty() {
+        return run_push_pathspec(options).await;
+    }
+
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
     let index_path = git_dir.join("index");
-    let index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
+    let index = Index::load(&index_path)
+        .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
     let included_untracked_paths = collect_included_untracked_paths(&options)?;
 
     if !has_changes().await && included_untracked_paths.is_empty() {
@@ -340,7 +385,11 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
 
     let index_tree =
         tree::create_tree_from_index(&index).map_err(|e| StashError::WriteObject(e.to_string()))?;
-    let index_tree_hash = index_tree.id;
+    let index_tree_data = index_tree
+        .to_data()
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
+    let index_tree_hash = object::write_git_object(&git_dir, "tree", &index_tree_data)
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
 
     let (author, committer) = util::create_signatures().await;
     let (current_branch_name, head_commit_summary) = match Head::current().await {
@@ -455,6 +504,418 @@ async fn run_push(options: StashPushOptions) -> Result<StashOutput, StashError> 
     })
 }
 
+/// Create a HELD stash COMMIT for merge autostash (lore.md §1.8):
+/// tracked-only (index + worktree vs HEAD; untracked/ignored stay in place —
+/// Git parity), message-tagged, written to the object store but deliberately
+/// NOT entered into refs/stash (the MERGE_AUTOSTASH model). This does NOT
+/// touch the worktree: the caller must persist a durable reference (the
+/// sidecar) FIRST and only then call [`reset_to_head_for_held_stash`] — the
+/// reverse order would open a crash window where the changes are gone from
+/// the tree and the stash commit is referenced by nothing. Returns `None`
+/// when the tree is clean (strict no-op).
+pub(crate) async fn create_held_stash_commit(
+    message: &str,
+) -> Result<Option<ObjectHash>, StashError> {
+    let git_dir =
+        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let index_path = git_dir.join("index");
+    let index = Index::load(&index_path)
+        .map_err(|error| StashError::IndexLoad(format!("{}: {error}", index_path.display())))?;
+
+    if !has_changes().await {
+        return Ok(None);
+    }
+
+    let head_commit_hash = Head::current_commit()
+        .await
+        .ok_or(StashError::NoInitialCommit)?;
+    let index_tree =
+        tree::create_tree_from_index(&index).map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let index_tree_data = index_tree
+        .to_data()
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
+    let index_tree_hash = object::write_git_object(&git_dir, "tree", &index_tree_data)
+        .map_err(|error| StashError::WriteObject(error.to_string()))?;
+    let (author, committer) = util::create_signatures().await;
+
+    let index_commit = Commit::new(
+        author.clone(),
+        committer.clone(),
+        index_tree_hash,
+        vec![head_commit_hash],
+        message,
+    );
+    let data = index_commit
+        .to_data()
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let index_commit_hash = object::write_git_object(&git_dir, "commit", &data)
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+
+    let workdir = git_dir
+        .parent()
+        .ok_or_else(|| StashError::Other("cannot find workdir".into()))?;
+    let worktree_tree =
+        create_tree_from_workdir(workdir, &git_dir, &index).map_err(StashError::WriteObject)?;
+    let worktree_tree_data = worktree_tree
+        .to_data()
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let worktree_tree_hash = object::write_git_object(&git_dir, "tree", &worktree_tree_data)
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+
+    let stash_commit = Commit::new(
+        author,
+        committer,
+        worktree_tree_hash,
+        vec![head_commit_hash, index_commit_hash],
+        message,
+    );
+    let stash_commit_data = stash_commit
+        .to_data()
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let stash_commit_hash = object::write_git_object(&git_dir, "commit", &stash_commit_data)
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+
+    Ok(Some(stash_commit_hash))
+}
+
+/// Second half of the held-stash push: hard-reset index + worktree to HEAD.
+/// Call ONLY after the held stash commit is durably referenced (sidecar
+/// written) — see [`create_held_stash_commit`].
+pub(crate) async fn reset_to_head_for_held_stash() -> Result<(), StashError> {
+    let head_commit_hash = Head::current_commit()
+        .await
+        .ok_or(StashError::NoInitialCommit)?;
+    perform_hard_reset(&head_commit_hash)
+        .await
+        .map_err(StashError::ResetFailed)
+}
+
+/// Enter an existing stash COMMIT into refs/stash (promote a held autostash
+/// into the visible stash list, e.g. after its re-apply conflicted).
+pub(crate) async fn store_stash_commit(hash: &ObjectHash, message: &str) -> Result<(), StashError> {
+    let git_dir =
+        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let (_, committer) = util::create_signatures().await;
+    update_stash_ref(&git_dir, hash, &committer, message)
+        .map_err(|e| StashError::WriteObject(e.to_string()))
+}
+
+/// Map an index entry's raw mode to the tree-item mode used for stash trees.
+fn index_mode_to_tree_mode(mode: u32) -> TreeItemMode {
+    match mode & 0o170000 {
+        0o120000 => TreeItemMode::Link,
+        0o160000 => TreeItemMode::Commit,
+        _ if mode & 0o111 != 0 => TreeItemMode::BlobExecutable,
+        _ => TreeItemMode::Blob,
+    }
+}
+
+/// The Unix permission bits a restored worktree file should carry for a tree mode.
+#[cfg(unix)]
+fn tree_mode_to_unix_perm(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::BlobExecutable => 0o755,
+        _ => 0o644,
+    }
+}
+
+/// Resolve user pathspecs to the set of candidate paths they select. A pathspec
+/// matches a path when they are equal or the path lies under the pathspec
+/// directory (`<spec>/...`); separators are normalised to `/`. An empty/`.`
+/// pathspec (the repository root) matches every candidate. Returns a sorted,
+/// de-duplicated list for deterministic processing.
+fn paths_matching_pathspec(pathspec: &[String], candidates: &HashSet<String>) -> Vec<String> {
+    let norm = |s: &str| {
+        s.trim_start_matches("./")
+            .trim_end_matches('/')
+            .replace('\\', "/")
+    };
+    // The root pathspec — `.`, `./`, or the empty string after normalising a
+    // worktree-relative path at the repo root — selects the whole tree.
+    let match_all = pathspec.iter().any(|s| {
+        let n = norm(s);
+        n.is_empty() || n == "."
+    });
+    if match_all {
+        let mut all: Vec<String> = candidates.iter().cloned().collect();
+        all.sort();
+        all.dedup();
+        return all;
+    }
+    let specs: Vec<String> = pathspec
+        .iter()
+        .map(|s| norm(s))
+        .filter(|s| !s.is_empty())
+        .collect();
+    let mut matched: Vec<String> = candidates
+        .iter()
+        .filter(|path| {
+            let p = norm(path);
+            specs
+                .iter()
+                .any(|spec| p == *spec || p.starts_with(&format!("{spec}/")))
+        })
+        .cloned()
+        .collect();
+    matched.sort();
+    matched.dedup();
+    matched
+}
+
+/// `stash push -- <pathspec>`: stash only the changes to the matched paths.
+///
+/// The stash trees are HEAD overlaid with the matched paths' index / working-tree
+/// content, so unmatched paths read as unchanged from HEAD — a later edit to one
+/// of them can never produce a spurious conflict on `stash pop` (which now merges
+/// onto the live working tree). After recording the stash, ONLY the matched paths
+/// are reset to HEAD; the rest of the working tree is left exactly as it was.
+///
+/// `-u`/`-a`/`-k` are not yet modelled together with a pathspec and are rejected
+/// (LBR-CLI-002) rather than silently ignored.
+async fn run_push_pathspec(options: StashPushOptions) -> Result<StashOutput, StashError> {
+    // `-u`/`-a`/`-k` with a pathspec are not yet modelled; reject the combination
+    // explicitly rather than silently ignoring the option.
+    if options.include_untracked {
+        return Err(StashError::PathspecWithOption("--include-untracked".into()));
+    }
+    if options.include_ignored {
+        return Err(StashError::PathspecWithOption("--all".into()));
+    }
+    if options.keep_index {
+        return Err(StashError::PathspecWithOption("--keep-index".into()));
+    }
+
+    let git_dir =
+        util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let index_path = git_dir.join("index");
+    let index = Index::load(&index_path).unwrap_or_else(|_| Index::new());
+    let workdir = git_dir
+        .parent()
+        .ok_or_else(|| StashError::Other("cannot find workdir".into()))?;
+
+    let head_commit_hash = Head::current_commit()
+        .await
+        .ok_or(StashError::NoInitialCommit)?;
+    let head_commit: Commit =
+        load_object(&head_commit_hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    let head_tree: Tree =
+        load_object(&head_commit.tree_id).map_err(|e| StashError::ReadObject(e.to_string()))?;
+
+    // HEAD file map — the baseline every stash tree starts from.
+    let head_map: HashMap<PathBuf, MergeTreeEntry> = head_tree
+        .get_plain_items_with_mode()
+        .into_iter()
+        .map(|(path, hash, mode)| (path, MergeTreeEntry::new(hash, mode)))
+        .collect();
+
+    // Candidate paths the pathspec can match: HEAD ∪ index-tracked.
+    let mut candidates: HashSet<String> = head_map
+        .keys()
+        .map(|p| p.to_string_lossy().replace('\\', "/"))
+        .collect();
+    for p in index.tracked_files() {
+        candidates.insert(p.to_string_lossy().replace('\\', "/"));
+    }
+    // Normalise each pathspec to a worktree-relative path so a pathspec given
+    // relative to the caller's current directory (a subdirectory of the repo)
+    // matches the repo-root-relative candidates — like Git's other pathspec
+    // commands. `to_workdir_path` resolves against the repo root.
+    let normalised: Vec<String> = options
+        .pathspec
+        .iter()
+        .map(|spec| {
+            util::to_workdir_path(spec)
+                .to_string_lossy()
+                .replace('\\', "/")
+        })
+        .collect();
+    let matched = paths_matching_pathspec(&normalised, &candidates);
+    if matched.is_empty() {
+        return Err(StashError::PathspecNoMatch(options.pathspec.join(" ")));
+    }
+
+    // Stash worktree tree = HEAD overlaid with each matched path's EFFECTIVE
+    // change. An unstaged working-tree change wins; otherwise a staged-only
+    // change is folded in (Libra has no `stash apply --index`, so the worktree
+    // restore must carry staged selections too, else `pop` would silently drop
+    // them); otherwise the path stays at HEAD. This is what `pop` replays.
+    let mut worktree_map = head_map.clone();
+    for path in &matched {
+        let rel = PathBuf::from(path);
+        let full = workdir.join(&rel);
+        let head_entry = head_map.get(&rel).copied();
+
+        let worktree_entry = if full.is_file() {
+            let content = fs::read(&full).map_err(|e| StashError::ReadObject(e.to_string()))?;
+            let blob_hash = object::write_git_object(&git_dir, "blob", &content)
+                .map_err(|e| StashError::WriteObject(e.to_string()))?;
+            let meta = fs::metadata(&full).map_err(|e| StashError::ReadObject(e.to_string()))?;
+            Some(MergeTreeEntry::new(
+                blob_hash,
+                tree_item_mode_from_metadata(&meta),
+            ))
+        } else {
+            None
+        };
+        let index_entry = index
+            .get(path, 0)
+            .map(|e| MergeTreeEntry::new(e.hash, index_mode_to_tree_mode(e.mode)));
+
+        let effective = if worktree_entry != head_entry {
+            worktree_entry
+        } else if index_entry != head_entry {
+            index_entry
+        } else {
+            head_entry
+        };
+        match effective {
+            Some(entry) => {
+                worktree_map.insert(rel, entry);
+            }
+            None => {
+                worktree_map.remove(&rel);
+            }
+        }
+    }
+    // Stash index tree (parent 2) = HEAD overlaid with the matched paths' staged content.
+    let mut index_map = head_map.clone();
+    for path in &matched {
+        let rel = PathBuf::from(path);
+        if let Some(entry) = index.get(path, 0) {
+            index_map.insert(
+                rel,
+                MergeTreeEntry::new(entry.hash, index_mode_to_tree_mode(entry.mode)),
+            );
+        } else {
+            index_map.remove(&rel);
+        }
+    }
+
+    // Nothing to stash only when BOTH the working-tree and index overlays leave
+    // every matched path at HEAD — a staged-only change (e.g. a staged deletion)
+    // must still be stashed even when the working tree matches HEAD.
+    if worktree_map == head_map && index_map == head_map {
+        return Ok(StashOutput::Noop {
+            message: "No local changes to save".to_string(),
+        });
+    }
+    let worktree_tree_hash =
+        create_tree_from_items_map(&worktree_map).map_err(StashError::WriteObject)?;
+    let index_tree_hash =
+        create_tree_from_items_map(&index_map).map_err(StashError::WriteObject)?;
+
+    // Stash metadata + commits.
+    let (author, committer) = util::create_signatures().await;
+    let head_commit_hash_str = head_commit_hash.to_string();
+    let head_commit_short = head_commit_hash_str
+        .get(..7)
+        .unwrap_or(head_commit_hash_str.as_str());
+    let head_summary = head_commit.message.lines().next().unwrap_or("").to_string();
+    let branch_name = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "(no branch)".to_string(),
+    };
+    let final_message = options
+        .message
+        .clone()
+        .unwrap_or_else(|| format!("WIP on {branch_name}: {head_commit_short} {head_summary}"));
+
+    let index_commit = Commit::new(
+        author.clone(),
+        committer.clone(),
+        index_tree_hash,
+        vec![head_commit_hash],
+        &final_message,
+    );
+    let index_commit_data = index_commit
+        .to_data()
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let index_commit_hash = object::write_git_object(&git_dir, "commit", &index_commit_data)
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+
+    let stash_commit = Commit::new(
+        author,
+        committer.clone(),
+        worktree_tree_hash,
+        vec![head_commit_hash, index_commit_hash],
+        &final_message,
+    );
+    let stash_commit_data = stash_commit
+        .to_data()
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+    let stash_commit_hash = object::write_git_object(&git_dir, "commit", &stash_commit_data)
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+
+    update_stash_ref(&git_dir, &stash_commit_hash, &committer, &final_message)
+        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+
+    // Reset ONLY the matched paths to HEAD (worktree + index); leave the rest.
+    reset_pathspec_to_head(&matched, &head_map, workdir, &index_path)?;
+
+    Ok(StashOutput::Push {
+        message: final_message,
+        stash_id: stash_commit_hash.to_string(),
+        included_untracked: 0,
+        kept_index: false,
+    })
+}
+
+/// Reset only the given paths to their HEAD state, in both the working tree and
+/// the on-disk index, leaving every other path untouched. A path absent from
+/// HEAD (a matched add) is removed from the working tree and the index.
+fn reset_pathspec_to_head(
+    matched: &[String],
+    head_map: &HashMap<PathBuf, MergeTreeEntry>,
+    workdir: &Path,
+    index_path: &Path,
+) -> Result<(), StashError> {
+    let mut index = Index::load(index_path).unwrap_or_else(|_| Index::new());
+    for path in matched {
+        let rel = PathBuf::from(path);
+        let full = workdir.join(&rel);
+        index.remove(path, 0);
+        match head_map.get(&rel) {
+            Some(entry) => {
+                let blob: Blob =
+                    load_object(&entry.hash).map_err(|e| StashError::ReadObject(e.to_string()))?;
+                if let Some(parent) = full.parent() {
+                    fs::create_dir_all(parent)
+                        .map_err(|e| StashError::WriteObject(e.to_string()))?;
+                }
+                fs::write(&full, &blob.data).map_err(|e| StashError::WriteObject(e.to_string()))?;
+                #[cfg(unix)]
+                {
+                    let perm = std::fs::Permissions::from_mode(tree_mode_to_unix_perm(entry.mode));
+                    let _ = fs::set_permissions(&full, perm);
+                }
+                // Pass the repo-relative path: `new_from_file` records its first
+                // argument verbatim as the index entry name (and joins it onto
+                // `workdir` for the stat), so an absolute path would corrupt the
+                // index. It reads metadata from `workdir.join(rel)`.
+                let mut new_entry = IndexEntry::new_from_file(&rel, entry.hash, workdir)
+                    .map_err(|e| StashError::IndexSave(e.to_string()))?;
+                // Preserve HEAD's recorded file mode (e.g. the executable bit),
+                // which a plain `new_from_file` would re-derive from disk.
+                new_entry.mode = match entry.mode {
+                    TreeItemMode::BlobExecutable => 0o100755,
+                    TreeItemMode::Link => 0o120000,
+                    _ => 0o100644,
+                };
+                index.add(new_entry);
+            }
+            None => {
+                if full.exists() {
+                    fs::remove_file(&full).map_err(|e| StashError::WriteObject(e.to_string()))?;
+                }
+            }
+        }
+    }
+    index
+        .save(index_path)
+        .map_err(|e| StashError::IndexSave(e.to_string()))?;
+    Ok(())
+}
+
 async fn run_pop(stash: Option<String>) -> Result<StashOutput, StashError> {
     let apply_result = do_apply(stash.clone()).await?;
     let (index, stash_id, branch) = match apply_result {
@@ -489,6 +950,7 @@ pub(crate) async fn autostash_push() -> Result<bool, String> {
         include_untracked: false,
         include_ignored: false,
         keep_index: false,
+        pathspec: Vec::new(),
     };
     match run_push(options).await.map_err(|e| e.to_string())? {
         StashOutput::Noop { .. } => Ok(false),
@@ -503,7 +965,7 @@ pub(crate) async fn autostash_pop() -> Result<(), String> {
 }
 
 async fn run_list() -> Result<StashOutput, StashError> {
-    if !has_stash() {
+    if !has_stash()? {
         return Ok(StashOutput::List {
             entries: Vec::new(),
         });
@@ -542,6 +1004,7 @@ async fn run_show(
     stash: Option<String>,
     name_only: bool,
     name_status: bool,
+    patch: bool,
 ) -> Result<StashOutput, StashError> {
     let (index, stash_id_str) = resolve_stash_to_commit_hash(stash)?;
     let git_dir =
@@ -614,11 +1077,28 @@ async fn run_show(
     files.sort_by(|a, b| a.path.cmp(&b.path));
     stats.total = files.len();
 
+    // `-p`/`--patch`: the stashed changes as a unified diff. A stash commit's
+    // first parent IS the base it was created against, so `log::generate_diff`
+    // (which diffs a commit against its first parent — the same git-faithful
+    // engine `log`/`show`/`format-patch` use) yields exactly the stash diff.
+    let patch_text = if patch {
+        Some(
+            log::generate_diff(&stash_commit, Vec::new())
+                .await
+                .map_err(|e| {
+                    StashError::ReadObject(format!("failed to generate stash diff: {e}"))
+                })?,
+        )
+    } else {
+        None
+    };
+
     Ok(StashOutput::Show {
         stash: format!("stash@{{{index}}}"),
         stash_id: stash_id_str,
         files,
         files_changed: stats,
+        patch: patch_text,
         name_only,
         name_status,
     })
@@ -683,7 +1163,7 @@ async fn run_clear(force: bool, output: &OutputConfig) -> Result<StashOutput, St
         return Err(StashError::ClearRequiresForce);
     }
 
-    if !has_stash() {
+    if !has_stash()? {
         return Ok(StashOutput::Clear { cleared_count: 0 });
     }
 
@@ -761,11 +1241,16 @@ fn render_stash_output(result: &StashOutput, output: &OutputConfig) -> CliResult
             stash,
             files,
             files_changed,
+            patch,
             name_only,
             name_status,
             ..
         } => {
-            if *name_only {
+            if let Some(patch) = patch {
+                // `-p`/`--patch`: emit the unified diff only (no file summary),
+                // matching `git stash show -p`.
+                print!("{patch}");
+            } else if *name_only {
                 for change in files {
                     println!("{}", change.path);
                 }
@@ -823,6 +1308,43 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
     let (index, hash_str) = resolve_stash_to_commit_hash(stash)?;
     let stash_commit_hash =
         ObjectHash::from_str(&hash_str).map_err(|e| StashError::ReadObject(e.to_string()))?;
+    apply_stash_commit(&stash_commit_hash).await?;
+
+    let branch = match Head::current().await {
+        Head::Branch(name) => name,
+        Head::Detached(_) => "(no branch)".to_string(),
+    };
+
+    Ok(StashOutput::Apply {
+        index,
+        stash_id: hash_str,
+        branch,
+    })
+}
+
+/// Apply a stash COMMIT by OID — the three-way apply shared by
+/// `stash apply/pop` and the merge autostash finalizer (which holds a stash
+/// commit reachable only from its sidecar, never from refs/stash). All-or-
+/// nothing for the working tree: any conflict or collision fails BEFORE files
+/// are rewritten, leaving the current state intact. The current index is
+/// intentionally preserved by default.
+pub(crate) async fn apply_stash_commit(hash: &ObjectHash) -> Result<(), StashError> {
+    apply_stash_commit_inner(hash, false).await
+}
+
+/// Apply a held autostash and restore its staged index layer as well as its
+/// working-tree layer. Unlike ordinary `stash apply`, autostash temporarily
+/// resets both layers, so leaving the index untouched would lose staged-only
+/// changes once the held object becomes unreachable.
+pub(crate) async fn apply_held_stash_commit(hash: &ObjectHash) -> Result<(), StashError> {
+    apply_stash_commit_inner(hash, true).await
+}
+
+async fn apply_stash_commit_inner(
+    hash: &ObjectHash,
+    restore_index: bool,
+) -> Result<(), StashError> {
+    let stash_commit_hash = *hash;
     let git_dir =
         util::try_get_storage_path(None).map_err(|e| StashError::ReadObject(e.to_string()))?;
 
@@ -835,10 +1357,6 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
         .parent_commit_ids
         .first()
         .ok_or_else(|| StashError::ReadObject("stash commit is malformed".into()))?;
-    let head_commit_hash = Head::current_commit()
-        .await
-        .ok_or_else(|| StashError::ReadObject("could not get HEAD commit hash".into()))?;
-
     let base_commit_data = object::read_git_object(&git_dir, &base_commit_hash)
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let base_commit = Commit::from_bytes(&base_commit_data, base_commit_hash)
@@ -848,23 +1366,16 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
     let base_tree = Tree::from_bytes(&base_tree_data, base_commit.tree_id)
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
 
-    let head_commit_data = object::read_git_object(&git_dir, &head_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let head_commit = Commit::from_bytes(&head_commit_data, head_commit_hash)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let head_tree_data = object::read_git_object(&git_dir, &head_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-    let head_tree = Tree::from_bytes(&head_tree_data, head_commit.tree_id)
-        .map_err(|e| StashError::ReadObject(e.to_string()))?;
-
     let stash_tree_data = object::read_git_object(&git_dir, &stash_commit.tree_id)
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let stash_tree = Tree::from_bytes(&stash_tree_data, stash_commit.tree_id)
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let untracked_tree = load_untracked_parent_tree(&stash_commit, &git_dir)?;
-
-    let merged_tree = merge_trees(&base_tree, &head_tree, &stash_tree, &git_dir)
-        .map_err(StashError::MergeConflict)?;
+    let stash_index_tree = if restore_index {
+        Some(load_stash_index_parent_tree(&stash_commit, &git_dir)?)
+    } else {
+        None
+    };
 
     let workdir = git_dir.parent().ok_or_else(|| {
         StashError::Other(format!(
@@ -873,9 +1384,36 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
         ))
     })?;
     let index_path = git_dir.join("index");
-    let mut new_index = Index::new();
 
-    let head_files = tree::get_tree_files_recursive(&head_tree, &git_dir, &PathBuf::new())
+    // "ours" for the three-way apply is the CURRENT working tree, NOT HEAD. This
+    // preserves uncommitted changes that are not part of the stash — the paths a
+    // pathspec `stash push` deliberately left behind, or unrelated edits made
+    // after stashing. (Applying against HEAD would silently overwrite them.)
+    // base = the commit the stash was created on; theirs = the stashed tree.
+    // `create_tree_from_workdir` writes every blob/subtree it visits, so the
+    // resulting tree is fully materialised for `merge_trees`.
+    let current_index = Index::load(&index_path)
+        .map_err(|e| StashError::IndexLoad(format!("{}: {e}", index_path.display())))?;
+    let worktree_tree = create_tree_from_workdir(workdir, &git_dir, &current_index)
+        .map_err(StashError::ReadObject)?;
+
+    let merged_tree = merge_trees(&base_tree, &worktree_tree, &stash_tree, &git_dir)
+        .map_err(StashError::MergeConflict)?;
+    let restored_index = if let Some(stash_index_tree) = stash_index_tree.as_ref() {
+        let current_index_tree = tree::create_tree_from_index(&current_index)
+            .map_err(|error| StashError::WriteObject(error.to_string()))?;
+        let merged_index_tree =
+            merge_trees(&base_tree, &current_index_tree, stash_index_tree, &git_dir)
+                .map_err(StashError::MergeConflict)?;
+        let mut restored = Index::new();
+        rebuild_index_from_tree(&merged_index_tree, &mut restored, "")
+            .map_err(StashError::IndexLoad)?;
+        Some(restored)
+    } else {
+        None
+    };
+
+    let worktree_files = tree::get_tree_files_recursive(&worktree_tree, &git_dir, &PathBuf::new())
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
     let merged_files = tree::get_tree_files_recursive(&merged_tree, &git_dir, &PathBuf::new())
         .map_err(|e| StashError::ReadObject(e.to_string()))?;
@@ -883,7 +1421,29 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
         ensure_untracked_restore_paths_clear(untracked_tree, workdir, &git_dir)?;
     }
 
-    for path in head_files.keys() {
+    // A pure ADDITION in the merge result (absent from the current worktree
+    // tree) must not silently overwrite an untracked file the user created at
+    // the same path with different content — fail all-or-nothing instead
+    // (the caller keeps/promotes the stash; nothing is lost on either side).
+    for (path, merged_item) in &merged_files {
+        if worktree_files.contains_key(path) {
+            continue;
+        }
+        let full_path = workdir.join(path);
+        if full_path.exists() {
+            let existing = crate::command::calc_file_blob_hash(&full_path)
+                .map_err(|e| StashError::ReadObject(e.to_string()))?;
+            if existing != merged_item.id {
+                return Err(StashError::MergeConflict(format!(
+                    "untracked file '{path}' would be overwritten by the stashed addition"
+                )));
+            }
+        }
+    }
+
+    // Remove any currently-tracked file the merge result drops (e.g. a deletion
+    // recorded in the stash), based on the actual working tree rather than HEAD.
+    for path in worktree_files.keys() {
         if !merged_files.contains_key(path) {
             let full_path = workdir.join(path);
             if full_path.exists() {
@@ -894,26 +1454,38 @@ async fn do_apply(stash: Option<String>) -> Result<StashOutput, StashError> {
 
     restore_working_directory_from_tree(&merged_tree, workdir, "")
         .map_err(StashError::WriteObject)?;
-    rebuild_index_from_tree(&merged_tree, &mut new_index, "").map_err(StashError::IndexSave)?;
     if let Some(untracked_tree) = untracked_tree.as_ref() {
         restore_working_directory_from_tree(untracked_tree, workdir, "")
             .map_err(StashError::WriteObject)?;
     }
 
-    new_index
-        .save(&index_path)
-        .map_err(|e| StashError::IndexSave(e.to_string()))?;
+    if let Some(restored_index) = restored_index {
+        restored_index
+            .save(&index_path)
+            .map_err(|error| StashError::IndexSave(error.to_string()))?;
+    }
 
-    let branch = match Head::current().await {
-        Head::Branch(name) => name,
-        Head::Detached(_) => "(no branch)".to_string(),
-    };
+    // Git's default `stash apply/pop` restores changes to the working tree only.
+    // Keep the existing index intact unless the caller is restoring a held
+    // autostash, whose reset removed the staged layer as well. A future public
+    // `--index` mode can reuse that path explicitly.
 
-    Ok(StashOutput::Apply {
-        index,
-        stash_id: hash_str,
-        branch,
-    })
+    Ok(())
+}
+
+fn load_stash_index_parent_tree(stash_commit: &Commit, git_dir: &Path) -> Result<Tree, StashError> {
+    let index_commit_hash = stash_commit
+        .parent_commit_ids
+        .get(1)
+        .ok_or_else(|| StashError::ReadObject("stash index parent is missing".into()))?;
+    let index_commit_data = object::read_git_object(git_dir, index_commit_hash)
+        .map_err(|error| StashError::ReadObject(error.to_string()))?;
+    let index_commit = Commit::from_bytes(&index_commit_data, *index_commit_hash)
+        .map_err(|error| StashError::ReadObject(error.to_string()))?;
+    let index_tree_data = object::read_git_object(git_dir, &index_commit.tree_id)
+        .map_err(|error| StashError::ReadObject(error.to_string()))?;
+    Tree::from_bytes(&index_tree_data, index_commit.tree_id)
+        .map_err(|error| StashError::ReadObject(error.to_string()))
 }
 
 fn load_untracked_parent_tree(
@@ -960,7 +1532,7 @@ fn ensure_untracked_restore_paths_clear(
 }
 
 fn do_drop(stash: Option<String>) -> Result<StashOutput, StashError> {
-    if !has_stash() {
+    if !has_stash()? {
         return Err(StashError::NoStashFound);
     }
 
@@ -1095,11 +1667,25 @@ async fn has_changes() -> bool {
     false
 }
 
-fn has_stash() -> bool {
-    util::try_get_storage_path(None)
-        .ok()
-        .map(|p| p.join("refs/stash").is_file())
-        .unwrap_or(false)
+fn has_stash() -> Result<bool, StashError> {
+    let storage = util::try_get_storage_path(None).map_err(|error| {
+        StashError::ReadObject(format!(
+            "failed to resolve storage while inspecting the stash ref: {error}"
+        ))
+    })?;
+    let stash_ref = storage.join("refs/stash");
+    match fs::symlink_metadata(&stash_ref) {
+        Ok(metadata) if metadata.is_file() => Ok(true),
+        Ok(_) => Err(StashError::ReadObject(format!(
+            "stash ref '{}' is not a regular file",
+            stash_ref.display()
+        ))),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+        Err(error) => Err(StashError::ReadObject(format!(
+            "failed to inspect stash ref '{}': {error}",
+            stash_ref.display()
+        ))),
+    }
 }
 
 fn empty_tree() -> Result<Tree, String> {
@@ -1168,8 +1754,71 @@ fn parse_stash_log_entries(lines: Vec<String>) -> Result<Vec<StashLogEntry>, Sta
     Ok(entries)
 }
 
+/// Return every file-backed stash object that repository maintenance must
+/// trace. Older stash entries live only in the stash reflog; tracing just the
+/// refs/stash tip would let GC delete stash@{1} and later entries.
+pub(crate) fn gc_roots() -> Result<Vec<ObjectHash>, StashError> {
+    let storage = util::try_get_storage_path(None).map_err(|error| {
+        StashError::ReadObject(format!("failed to resolve stash GC roots: {error}"))
+    })?;
+    let mut roots = HashSet::new();
+    let stash_ref_path = storage.join("refs/stash");
+    match fs::read_to_string(&stash_ref_path) {
+        Ok(raw_oid) => {
+            let oid = ObjectHash::from_str(raw_oid.trim()).map_err(|error| {
+                StashError::ReadObject(format!(
+                    "stash ref '{}' contains an invalid object id: {error}",
+                    stash_ref_path.display()
+                ))
+            })?;
+            roots.insert(oid);
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(StashError::ReadObject(format!(
+                "failed to read stash ref '{}': {error}",
+                stash_ref_path.display()
+            )));
+        }
+    }
+
+    let stash_log_path = storage.join("logs/refs/stash");
+    match fs::symlink_metadata(&stash_log_path) {
+        Ok(metadata) if metadata.is_file() => {
+            let entries = parse_stash_log_entries(read_stash_log_lines(&stash_log_path)?)?;
+            for entry in entries {
+                let oid = ObjectHash::from_str(&entry.stash_id).map_err(|error| {
+                    StashError::ReadObject(format!(
+                        "stash log '{}' contains an invalid object id '{}': {error}",
+                        stash_log_path.display(),
+                        entry.stash_id
+                    ))
+                })?;
+                roots.insert(oid);
+            }
+        }
+        Ok(_) => {
+            return Err(StashError::ReadObject(format!(
+                "stash log '{}' is not a regular file",
+                stash_log_path.display()
+            )));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(StashError::ReadObject(format!(
+                "failed to inspect stash log '{}': {error}",
+                stash_log_path.display()
+            )));
+        }
+    }
+
+    let mut roots = roots.into_iter().collect::<Vec<_>>();
+    roots.sort_by_key(ToString::to_string);
+    Ok(roots)
+}
+
 fn resolve_stash_to_commit_hash(stash_ref: Option<String>) -> Result<(usize, String), StashError> {
-    if !has_stash() {
+    if !has_stash()? {
         return Err(StashError::NoStashFound);
     }
 
@@ -1470,31 +2119,45 @@ fn merge_trees(base: &Tree, head: &Tree, stash: &Tree, git_dir: &Path) -> Result
     let stash_items = tree::get_tree_files_recursive(stash, git_dir, &PathBuf::new())?;
     let mut conflicts = Vec::new();
 
-    // Replay only paths changed by the stash snapshot. If HEAD diverged from
-    // the stash base in a different way, stop instead of overwriting newer work.
+    // Two tree entries are equal only when BOTH content and mode match, so a
+    // mode-only change (e.g. the executable bit) still counts as a real change.
+    let same = |a: &TreeItem, b: &TreeItem| a.id == b.id && a.mode == b.mode;
+
+    // Replay only paths changed by the stash snapshot. If the working tree
+    // (`head`) diverged from the stash base in a different way, stop instead of
+    // overwriting newer work.
     for (path, stash_item) in stash_items.iter() {
         let base_item = base_items.get(path);
         let head_item = head_items.get(path);
 
         match (base_item, head_item) {
             (Some(b), Some(h)) => {
-                if b.id != h.id && b.id != stash_item.id && h.id != stash_item.id {
+                if !same(b, h) && !same(b, stash_item) && !same(h, stash_item) {
                     conflicts.push(path.clone());
                     continue;
                 }
-
-                // Stash version differs from base: apply stash change
-                if b.id != stash_item.id {
+                // Stash version differs from base: apply the stash change.
+                if !same(b, stash_item) {
                     head_items.insert(path.clone(), stash_item.clone());
                 }
             }
-            (Some(_), None) => {
-                head_items.insert(path.clone(), stash_item.clone());
+            (Some(b), None) => {
+                // The path was deleted in the working tree. Keep the deletion if
+                // the stash left it unchanged; conflict if the stash changed it
+                // (a delete/modify clash). Never resurrect an unrelated file.
+                if !same(b, stash_item) {
+                    conflicts.push(path.clone());
+                }
             }
-            (None, Some(_)) => {
-                head_items.insert(path.clone(), stash_item.clone());
+            (None, Some(h)) => {
+                // Added relative to base on both sides: take the stash's version
+                // when they agree, otherwise it is an add/add conflict.
+                if !same(h, stash_item) {
+                    conflicts.push(path.clone());
+                }
             }
             (None, None) => {
+                // A pure stash addition (absent from base and the working tree).
                 head_items.insert(path.clone(), stash_item.clone());
             }
         }
@@ -1503,7 +2166,7 @@ fn merge_trees(base: &Tree, head: &Tree, stash: &Tree, git_dir: &Path) -> Result
     for (path, base_item) in base_items.iter() {
         if !stash_items.contains_key(path) {
             if let Some(head_item) = head_items.get(path)
-                && head_item.id != base_item.id
+                && !same(head_item, base_item)
             {
                 conflicts.push(path.clone());
                 continue;
@@ -1526,13 +2189,18 @@ fn merge_trees(base: &Tree, head: &Tree, stash: &Tree, git_dir: &Path) -> Result
 
 /// Get the number of stashes
 pub(crate) fn get_stash_num() -> Result<usize, String> {
-    if !has_stash() {
+    if !has_stash().map_err(|error| error.to_string())? {
         return Ok(0);
     }
 
     let git_dir = util::try_get_storage_path(None).map_err(|e| e.to_string())?;
     let stash_log_path = git_dir.join("logs/refs/stash");
-    if !stash_log_path.exists() {
+    if !stash_log_path.try_exists().map_err(|error| {
+        format!(
+            "failed to inspect stash log '{}': {error}",
+            stash_log_path.display()
+        )
+    })? {
         return Ok(0);
     }
     let count =
@@ -1769,7 +2437,7 @@ mod tests {
     /// in both human and `--json` envelopes for `stash`.
     ///
     /// Source-chained variants whose body is solely a wrapped string
-    /// (ReadObject, WriteObject, IndexSave, ResetFailed, Other) are
+    /// (ReadObject, WriteObject, IndexLoad, IndexSave, ResetFailed, Other) are
     /// covered indirectly by pinning the inner `{0}` echo form here for
     /// representative cases (Other does that explicitly).
     #[test]
@@ -1817,6 +2485,10 @@ mod tests {
             "failed to write object: disk full",
         );
         assert_eq!(
+            StashError::IndexLoad("corrupt".to_string()).to_string(),
+            "failed to load index: corrupt",
+        );
+        assert_eq!(
             StashError::IndexSave("io error".to_string()).to_string(),
             "failed to save index: io error",
         );
@@ -1835,8 +2507,8 @@ mod tests {
     /// [`StashError`]. JSON consumers branch on the
     /// [`StableErrorCode`] in the error envelope; three variants
     /// share `IoWriteFailed` (WriteObject / IndexSave / ResetFailed)
-    /// and two share both `IoReadFailed` (BranchLookupFailed /
-    /// ReadObject) and `CliInvalidArguments` (InvalidStashRef /
+    /// and three share `IoReadFailed` (BranchLookupFailed /
+    /// ReadObject / IndexLoad), while two share `CliInvalidArguments` (InvalidStashRef /
     /// ClearRequiresForce). A future refactor that reroutes any
     /// variant — for example flipping `BranchExists` from
     /// `ConflictOperationBlocked` to `CliInvalidTarget` — silently
@@ -1893,6 +2565,10 @@ mod tests {
         assert_eq!(
             StashError::WriteObject("ignored".to_string()).stable_code(),
             StableErrorCode::IoWriteFailed,
+        );
+        assert_eq!(
+            StashError::IndexLoad("ignored".to_string()).stable_code(),
+            StableErrorCode::IoReadFailed,
         );
         assert_eq!(
             StashError::IndexSave("ignored".to_string()).stable_code(),

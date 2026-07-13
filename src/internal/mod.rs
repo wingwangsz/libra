@@ -20,19 +20,33 @@
 //! Modules here may depend on `git-internal` and on each other but should *not* depend
 //! on `src/command/*` — that direction is the CLI dispatch boundary.
 
+pub mod account;
 pub mod ai;
+pub mod alternates;
+pub mod auth;
 pub mod branch;
 pub mod config;
 pub mod db;
+pub mod deps;
+pub mod dirty;
 pub mod head;
+pub mod layer;
 pub mod log;
+pub mod merge_base;
+pub mod metadata;
 pub mod model;
 pub mod notes;
+pub mod obliteration;
 pub mod operation;
 pub mod operation_wrapper;
+pub mod pack_writer;
 pub mod protocol;
 pub mod publish;
 pub mod reflog;
+pub mod revision_ordinal;
+pub mod sequencer;
+pub mod sparse;
 pub mod tag;
+pub mod tree_plumbing;
 pub mod tui;
 pub mod vault;

@@ -759,9 +759,10 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
         )));
     }
 
-    create_worktree_storage_link(&storage, &link_path).map_err(|source| {
+    let worktree_id = util::worktree_instance_id(&canonical_target);
+    create_worktree_gitdir(&storage, &link_path, &worktree_id).map_err(|source| {
         WorktreeError::IoWrite(format!(
-            "failed to link shared .libra storage into '{}': {source}",
+            "failed to create per-worktree .libra gitdir in '{}': {source}",
             link_path.display()
         ))
     })?;
@@ -782,7 +783,21 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
         }
     };
 
-    if Head::current_commit().await.is_some() {
+    // The main worktree's current commit (cwd is still the main repo here).
+    // Codex P1: use the RESULT-returning API so a storage error is not silently
+    // downgraded to "unborn repo" — only a genuinely unborn HEAD (Ok(None))
+    // skips seeding; a real read error rolls back the half-created worktree.
+    let seed_commit = match Head::current_commit_result().await {
+        Ok(commit) => commit,
+        Err(e) => {
+            rollback_partial_add();
+            return Err(WorktreeError::IoRead(format!(
+                "failed to read HEAD while creating worktree '{}': {e}",
+                target.display()
+            )));
+        }
+    };
+    if let Some(commit) = seed_commit {
         let _guard = match DirGuard::change_to(&target) {
             Ok(g) => g,
             Err(e) => {
@@ -793,13 +808,38 @@ async fn add_worktree(path: String) -> WorktreeResult<WorktreeAddOutput> {
                 )));
             }
         };
+        // lore.md 2.1: cwd is now the new worktree, so `current_worktree_id()`
+        // resolves to its private id. Seed its OWN HEAD as DETACHED at the main
+        // worktree's commit (v1 detaches to avoid a same-branch collision), so
+        // `Head::current()` resolves here and the populate below can read it.
+        // Codex P1: a seed-update failure must roll back, not silently leave the
+        // worktree without a private HEAD.
+        if let Err(e) = Head::update_result(Head::Detached(commit), None).await {
+            drop(_guard);
+            rollback_partial_add();
+            return Err(WorktreeError::IoWrite(format!(
+                "failed to seed HEAD for worktree '{}': {e}",
+                target.display()
+            )));
+        }
         // Populate from HEAD so new worktrees reflect committed state instead
         // of carrying staged-but-uncommitted index content.
         if let Err(e) = restore::execute_checked(RestoreArgs {
+            overlay: false,
+            no_overlay: false,
+            ours: false,
+            theirs: false,
+            ignore_unmerged: false,
+            merge: false,
+            conflict: None,
             pathspec: vec![util::working_dir_string()],
             source: Some("HEAD".to_string()),
             worktree: true,
-            staged: false,
+            // lore.md 2.1: also restore the PRIVATE index to HEAD (a linked
+            // worktree no longer shares the main index, so a fresh worktree's
+            // index must be seeded to match HEAD or every file reads as a
+            // phantom change).
+            staged: true,
             pathspec_from_file: None,
             pathspec_file_nul: false,
             no_progress: false,
@@ -846,14 +886,61 @@ fn render_add_worktree(result: &WorktreeAddOutput, output: &OutputConfig) -> Cli
     Ok(())
 }
 
-#[cfg(unix)]
-fn create_worktree_storage_link(storage: &Path, link_path: &Path) -> io::Result<()> {
-    std::os::unix::fs::symlink(storage, link_path)
+/// Resolve a (possibly already-deleted) worktree's stable instance id: read
+/// its `.libra/worktree_id` file if present, else recompute deterministically
+/// from the canonical path (lore.md 2.1).
+fn resolve_worktree_id(target: &Path) -> Option<String> {
+    if let Ok(id) = fs::read_to_string(target.join(util::ROOT_DIR).join("worktree_id")) {
+        let id = id.trim();
+        if !id.is_empty() {
+            return Some(id.to_string());
+        }
+    }
+    fs::canonicalize(target)
+        .ok()
+        .map(|c| util::worktree_instance_id(&c))
+        .or_else(|| Some(util::worktree_instance_id(target)))
 }
 
-#[cfg(windows)]
-fn create_worktree_storage_link(storage: &Path, link_path: &Path) -> io::Result<()> {
-    std::os::windows::fs::symlink_dir(storage, link_path)
+/// GC a removed worktree's PRIVATE HEAD + HEAD-reflog rows (lore.md 2.1) so a
+/// reused instance id never inherits stale state. Best-effort: a failure is
+/// logged, not fatal (the registry drop is the source of truth).
+async fn gc_worktree_scoped_rows(worktree_id: &str) {
+    use sea_orm::{ConnectionTrait, DbBackend, Statement};
+    let db = crate::internal::db::get_db_conn_instance().await;
+    for sql in [
+        "DELETE FROM reference WHERE worktree_id = ? AND kind = 'Head'",
+        "DELETE FROM reflog WHERE worktree_id = ?",
+    ] {
+        if let Err(e) = db
+            .execute(Statement::from_sql_and_values(
+                DbBackend::Sqlite,
+                sql,
+                [worktree_id.into()],
+            ))
+            .await
+        {
+            tracing::warn!(worktree_id, error = %e, "failed to GC per-worktree rows");
+        }
+    }
+}
+
+/// Create a linked worktree's REAL `.libra` gitdir (lore.md 2.1) instead of a
+/// symlink: it holds `commondir` (pointing at the shared `.libra` for
+/// db/objects/hooks) and `worktree_id` (its private HEAD/index scope). The
+/// per-worktree `index` is created later when the worktree is populated.
+fn create_worktree_gitdir(
+    common_storage: &Path,
+    gitdir: &Path,
+    worktree_id: &str,
+) -> io::Result<()> {
+    fs::create_dir_all(gitdir)?;
+    fs::write(
+        gitdir.join("commondir"),
+        format!("{}\n", common_storage.display()),
+    )?;
+    fs::write(gitdir.join("worktree_id"), format!("{worktree_id}\n"))?;
+    Ok(())
 }
 
 fn remove_worktree_storage_link(link_path: &Path) -> io::Result<()> {
@@ -861,7 +948,10 @@ fn remove_worktree_storage_link(link_path: &Path) -> io::Result<()> {
     if metadata.file_type().is_symlink() {
         return fs::remove_file(link_path);
     }
-    fs::remove_dir(link_path)
+    if metadata.is_dir() {
+        return fs::remove_dir_all(link_path);
+    }
+    fs::remove_file(link_path)
 }
 
 /// Implements `worktree list`.
@@ -1190,6 +1280,10 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
         });
     }
 
+    // Resolve the instance id BEFORE any directory removal so its private
+    // HEAD/reflog rows can be GC'd (lore.md 2.1).
+    let worktree_id_for_gc = resolve_worktree_id(&target);
+
     if delete_dir {
         // Dirty-check: refuse on staged or unstaged changes. The check runs
         // inside the target worktree so the ignore policy and storage path
@@ -1221,6 +1315,9 @@ async fn remove_worktree(path: String, delete_dir: bool) -> WorktreeResult<Workt
         })?;
     }
 
+    if let Some(id) = worktree_id_for_gc {
+        gc_worktree_scoped_rows(&id).await;
+    }
     state.worktrees.remove(index);
     write_state(&state)?;
 

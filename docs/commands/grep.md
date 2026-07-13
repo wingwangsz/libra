@@ -16,9 +16,14 @@ libra grep -f <file> [-- <pathspec>...]
 
 Multiple patterns can be supplied via `-e` flags or read from files via `-f`. When multiple patterns are active, a file matches if any pattern matches at least one line (OR semantics). With `--all-match`, a file is included only if every pattern matches at least one line in that file (AND semantics across patterns, not across lines).
 
-Output can be tuned with flags to show only filenames (`-l`, `-L`), match counts per file (`-c`), line numbers (`-n`), byte offsets (`-b`), or inverted matches (`-v`). The command supports pathspec filtering to restrict the search to specific files or directories.
+Output can be tuned with flags to show only filenames (`-l`, `-L`), match counts per file (`-c`), line numbers (`-n`), byte offsets (`-b`), or inverted matches (`-v`). The command supports pathspec filtering to restrict the search to specific files or directories. Repository searches use the shared pathspec engine, including `:(top)`, `:(exclude)`, `:(icase)`, `:(literal)`, and `:(glob)` magic.
 
 When stdout is a terminal, output is sent through a pager. In JSON mode, structured output is emitted for programmatic consumption.
+
+When stdout is piped and the downstream command exits early, `libra grep` exits quietly without
+printing panic/backtrace or `Broken pipe` diagnostics.
+
+Exit codes follow Git's grep contract: matches exit 0, no selected matches exit 1 without an error diagnostic, and grep command errors (for example invalid regexes, unsupported `-P`, missing pattern files, or invalid `--tree` revisions) exit 2. Repository preflight errors such as running repository mode outside a Libra repository keep the standard Libra fatal exit code.
 
 ## Options
 
@@ -42,6 +47,9 @@ When stdout is a terminal, output is sent through a pager. In JSON mode, structu
 | Pathspec | | positional (trailing) | Restrict search to files matching the given paths. |
 | Tree | | `--tree <REVISION>` | Search in the specified revision or commit tree instead of the working tree. |
 | Cached | | `--cached` | Search in the index (staging area) instead of the working tree. |
+| Untracked | | `--untracked` | In addition to tracked files, also search untracked, non-ignored files in the working tree. Cannot be combined with `--cached` or `--tree`. |
+| No index | | `--no-index` | Search the filesystem directly (the given paths, or the current directory) without a repository or index. Works outside a repository, recurses every file including ignored ones (skipping `.git`/`.libra`), and shows paths relative to the current directory. Cannot be combined with `--cached`, `--untracked`, or `--tree`. |
+| Max depth | | `--max-depth <DEPTH>` | Descend at most DEPTH levels of directories below each pathspec. A file directly inside the pathspec directory is depth 0; a negative value means no limit. With no pathspec, depth is measured from the worktree root (not the current directory) — `libra grep` always searches the whole worktree with worktree-relative paths, so to limit to a subdirectory, pass it as a pathspec. |
 | Heading | | `--heading` / `--no-heading` | Print each file name once as a heading above its matches instead of prefixing every line. `--no-heading` is the default. |
 | Break | | `--break` / `--no-break` | Print an empty line between matches from different files. `--no-break` is the default. |
 | Null | `-z` | `--null` | Output a NUL byte after the file name (and line number) instead of `:`, for machine consumption. |
@@ -379,11 +387,11 @@ jj does not have a built-in grep command. Users are expected to use external too
 | Index search | `--cached` | `--cached` | N/A |
 | Context lines | `-A` / `-B` / `-C` | `-C` / `-A` / `-B` | N/A |
 | Extended regexp | `-E` / `--extended-regexp` | `-E` / `--extended-regexp` | N/A |
-| Perl regexp | Rejected (exit 129) | `-P` / `--perl-regexp` | N/A |
+| Perl regexp | Rejected (exit 2) | `-P` / `--perl-regexp` | N/A |
 | Max count | `-m` / `--max-count` | `-m` / `--max-count` | N/A |
 | Only matching | `-o` / `--only-matching` | `-o` / `--only-matching` | N/A |
 | Show function | Not supported | `-p` / `--show-function` | N/A |
-| Max depth | Not supported | `--max-depth` | N/A |
+| Max depth | `--max-depth <DEPTH>` | `--max-depth <DEPTH>` | Equivalent when a pathspec is given (depth is measured relative to the pathspec). With no pathspec, Libra measures depth from the worktree root rather than the current directory, because `libra grep` always searches the whole worktree with worktree-relative paths — pass the directory as a pathspec to scope it. |
 | Threads | Not supported | `--threads` | N/A |
 | Color | Automatic (terminal detection) | `--color` | N/A |
 | JSON output | Built-in JSON structure | Not supported | N/A |
@@ -396,8 +404,8 @@ Note: jj does not have a built-in grep command. Users rely on external tools lik
 |----------|-----------------|------|
 | Not a libra repository | `LBR-REPO-001` | 128 |
 | No pattern provided (and no `-e` or `-f`) | Clap argument error | 2 |
-| Invalid regex pattern | `LBR-CLI-003` (CliInvalidTarget) | 129 |
-| Revision not found (`--tree`) | `LBR-CLI-003` (CliInvalidTarget) | 129 |
-| No matches found | `LBR-CLI-003` (CliInvalidTarget) | 129 |
+| Invalid regex pattern | `LBR-CLI-002` (CliInvalidArguments) | 2 |
+| Revision not found (`--tree`) | `LBR-CLI-003` (CliInvalidTarget) | 2 |
+| No matches found | Status-only signal | 1 |
 | Failed to read file (non-fatal) | Warning in output, file skipped | 0 |
-| Failed to read pattern file (`-f`) | Error with file path details | 128 |
+| Failed to read pattern file (`-f`) | Error with file path details | 2 |

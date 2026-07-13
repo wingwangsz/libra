@@ -8,14 +8,23 @@
 //! command flows without missing repository, index, worktree, network, or
 //! rendering consequences.
 
+pub mod account;
 pub mod add;
 pub mod agent;
+pub mod alternates;
+pub mod apply;
 pub mod archive;
+pub mod auth;
 pub mod automation;
 pub mod bisect;
 pub mod blame;
 pub mod branch;
+pub mod bundle;
+pub mod cache;
 pub mod cat_file;
+pub mod check_attr;
+pub mod check_ignore;
+pub mod check_mailmap;
 pub mod checkout;
 pub mod cherry_pick;
 pub mod clean;
@@ -25,49 +34,75 @@ pub mod code;
 pub mod code_control;
 pub mod code_control_files;
 pub mod commit;
+pub mod commit_tree;
+pub mod completions;
 pub mod config;
+pub mod credential;
+pub mod deps;
 pub mod describe;
 pub mod diff;
+pub mod diff_plumbing;
+pub mod dirty;
 pub mod editor;
+pub mod fast_export;
+pub mod fast_import;
 pub mod fetch;
+pub mod file;
 pub mod for_each_ref;
 pub mod format_patch;
 pub mod fsck;
 pub mod graph;
 pub mod grep;
 pub mod hash_object;
+pub(crate) mod history_config;
 pub mod hooks;
+pub mod hydrate;
 pub mod index_pack;
 mod index_pack_support;
 mod index_pack_v1;
 mod index_pack_v2;
 pub mod init;
+pub mod layer;
 pub mod lfs;
 pub mod lfs_schema;
 pub mod log;
+pub mod logfile;
 pub mod ls_files;
 pub mod ls_remote;
 pub mod ls_tree;
 pub mod maintenance;
+#[cfg(feature = "fastcdc")]
+pub mod media;
 pub mod merge;
+pub mod merge_base;
+pub mod merge_file;
+pub(crate) mod merge_message;
+pub mod metadata;
 pub mod mv;
 pub mod notes;
 pub mod op;
 pub mod open;
+pub mod pack_objects;
 pub mod package;
 pub mod publish;
 pub mod pull;
 pub mod push;
+pub mod read_tree;
 pub mod rebase;
 pub mod reflog;
 pub mod remote;
 pub mod remove;
+pub mod repack;
+pub mod replace;
+pub mod rerere;
 pub mod reset;
 pub mod restore;
 pub mod rev_list;
 pub mod rev_parse;
 pub mod revert;
+pub mod revision;
 pub mod sandbox;
+pub mod service;
 pub mod shortlog;
 pub mod show;
 pub mod show_ref;
@@ -75,8 +110,12 @@ mod show_ref_check;
 mod show_ref_deref;
 mod show_ref_exclude_existing;
 mod show_ref_render;
+pub mod sparse_view;
 pub mod symbolic_ref;
 pub mod tag;
+pub(crate) mod unmerged;
+pub mod update_index;
+pub mod update_ref;
 pub mod usage;
 pub mod verify_pack;
 mod verify_pack_decode;
@@ -94,32 +133,60 @@ pub mod worktree;
 
 pub mod stash;
 pub mod status;
+pub(crate) mod status_untracked;
+pub(crate) mod status_untracked_paths;
 pub mod switch;
 pub mod web_assets;
+pub mod write_tree;
 
-use std::{io, io::Write, path::Path};
+use std::{
+    fs::{self, File},
+    io::{self, Read, Write},
+    path::Path,
+};
 
 use git_internal::{
     errors::GitError,
     hash::ObjectHash,
     internal::object::{ObjectTrait, blob::Blob},
+    utils::HashAlgorithm,
 };
 use rpassword::read_password;
 
 use crate::{
     internal::protocol::https_client::BasicAuth,
     utils,
-    utils::{client_storage::ClientStorage, error::emit_warning, object_ext::BlobExt, util},
+    utils::{client_storage::ClientStorage, error::emit_warning, util},
 };
 
 // impl load for all objects
+/// lore.md 2.1: refuse an in-progress sequencer operation inside a LINKED
+/// worktree. Merge/rebase/cherry-pick/revert/bisect state (rebase_state /
+/// sequence_state / MERGE_HEAD) is still shared across worktrees in v1, so
+/// running one in a linked worktree could collide with the main worktree's
+/// operation. Allowed in the main worktree.
+pub fn ensure_main_worktree(op: &str) -> crate::utils::error::CliResult<()> {
+    if crate::utils::util::is_linked_worktree() {
+        return Err(crate::utils::error::CliError::fatal(format!(
+            "'{op}' is not yet supported inside a linked worktree (lore.md 2.1: in-progress \
+             operation state is shared across worktrees) \u{2014} run it in the main worktree"
+        ))
+        .with_stable_code(crate::utils::error::StableErrorCode::Unsupported));
+    }
+    Ok(())
+}
+
 pub fn load_object<T>(hash: &ObjectHash) -> Result<T, GitError>
 where
     T: ObjectTrait,
 {
+    // Apply any `refs/replace/<oid>` substitution before reading, so `log`,
+    // `show`, `rev-parse` peeling, etc. transparently see the replacement.
+    // Cheap no-op when no replacements exist.
+    let hash = replace::resolve(*hash);
     let storage = util::objects_storage();
-    let data = storage.get(hash)?;
-    T::from_bytes(&data.to_vec(), *hash)
+    let data = storage.get(&hash)?;
+    T::from_bytes(&data.to_vec(), hash)
 }
 
 // impl save for all objects
@@ -197,13 +264,72 @@ pub fn ask_basic_auth() -> BasicAuth {
 /// Calculate the hash of a file blob
 /// - for `lfs` file: calculate hash of the pointer data
 pub fn calc_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
-    let blob = if utils::lfs::is_lfs_tracked(&path) {
-        let (pointer, _) = utils::lfs::generate_pointer_file(&path);
-        Blob::from_content(&pointer)
-    } else {
-        Blob::from_file(&path)
-    };
-    Ok(blob.id)
+    let path = path.as_ref();
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Ok(Blob::from_content_bytes(read_symlink_blob_bytes(path)?).id);
+    }
+    if utils::lfs::is_lfs_tracked(path) {
+        let (pointer, _) = utils::lfs::generate_pointer_file(path);
+        return Ok(Blob::from_content(&pointer).id);
+    }
+
+    stream_file_blob_hash(path)
+}
+
+/// Read the bytes Git would store for a worktree path's blob.
+///
+/// Regular files use their file content (or the generated LFS pointer when the
+/// path is LFS-tracked). Symlinks use the link target bytes and are never
+/// followed.
+pub fn read_worktree_blob_bytes(path: impl AsRef<Path>) -> io::Result<Vec<u8>> {
+    let path = path.as_ref();
+    if fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return read_symlink_blob_bytes(path);
+    }
+    if utils::lfs::is_lfs_tracked(path) {
+        let (pointer, _) = utils::lfs::generate_pointer_file(path);
+        return Ok(pointer.into_bytes());
+    }
+    fs::read(path)
+}
+
+pub(crate) fn read_symlink_blob_bytes(path: &Path) -> io::Result<Vec<u8>> {
+    Ok(symlink_target_blob_bytes(&fs::read_link(path)?))
+}
+
+#[cfg(unix)]
+pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    target.as_os_str().as_bytes().to_vec()
+}
+
+#[cfg(not(unix))]
+pub fn symlink_target_blob_bytes(target: &Path) -> Vec<u8> {
+    target.to_string_lossy().as_bytes().to_vec()
+}
+
+fn stream_file_blob_hash(path: impl AsRef<Path>) -> io::Result<ObjectHash> {
+    let path = path.as_ref();
+    let file = File::open(path)?;
+    let len = file.metadata()?.len();
+    let mut reader = io::BufReader::new(file);
+    let mut hasher = HashAlgorithm::new();
+
+    hasher.update(b"blob ");
+    hasher.update(len.to_string().as_bytes());
+    hasher.update(b"\0");
+
+    let mut buffer = [0_u8; 64 * 1024];
+    loop {
+        let read = reader.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        hasher.update(&buffer[..read]);
+    }
+
+    ObjectHash::from_bytes(&hasher.finalize()).map_err(io::Error::other)
 }
 
 /// Get the commit hash from branch name or commit hash, support remote branch

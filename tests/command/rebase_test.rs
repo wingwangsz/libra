@@ -104,6 +104,7 @@ async fn test_rebase_json_abort_outputs_restored_branch() {
         stopped_sha: None,
         current_head: head,
         autosquash: false,
+        empty_mode: libra::command::rebase::RebaseEmptyMode::Keep,
     }
     .save()
     .await
@@ -180,6 +181,7 @@ fn test_rebase_machine_abort_outputs_restored_branch() {
                 stopped_sha: None,
                 current_head: head,
                 autosquash: false,
+                empty_mode: libra::command::rebase::RebaseEmptyMode::Keep,
             }
             .save()
             .await
@@ -907,6 +909,37 @@ fn test_rebase_reapply_cherry_picks_flag_is_accepted() {
 }
 
 #[test]
+fn test_rebase_no_autostash_flag_is_accepted_noop() {
+    let repo = create_cli_rebase_success_repo();
+
+    // `--no-autostash` is accepted and a no-op: Libra's rebase never autostashes
+    // (it requires a clean tree), so the rebase proceeds normally.
+    let output = run_libra_command(&["--json", "rebase", "--no-autostash", "main"], repo.path());
+    assert_cli_success(&output, "rebase --no-autostash");
+
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["status"], "completed");
+    assert_eq!(json["data"]["replay_count"], 1);
+}
+
+#[test]
+fn test_rebase_no_rerere_autoupdate_flag_is_accepted_noop() {
+    let repo = create_cli_rebase_success_repo();
+
+    // `--no-rerere-autoupdate` is accepted and a no-op: Libra has no rerere, so
+    // the rebase proceeds normally.
+    let output = run_libra_command(
+        &["--json", "rebase", "--no-rerere-autoupdate", "main"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "rebase --no-rerere-autoupdate");
+
+    let json = parse_json_stdout(&output);
+    assert_eq!(json["data"]["status"], "completed");
+    assert_eq!(json["data"]["replay_count"], 1);
+}
+
+#[test]
 fn test_rebase_human_start_uses_structured_runner_output() {
     let repo = create_cli_rebase_success_repo();
 
@@ -1190,6 +1223,9 @@ async fn test_basic_rebase() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1221,6 +1257,9 @@ async fn test_basic_rebase() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1241,6 +1280,7 @@ async fn test_basic_rebase() {
 
     // 2. Create and switch to feature branch
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -1267,6 +1307,9 @@ async fn test_basic_rebase() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1298,6 +1341,9 @@ async fn test_basic_rebase() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1318,6 +1364,7 @@ async fn test_basic_rebase() {
 
     // 4. Switch back to master and make it diverge
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -1343,6 +1390,9 @@ async fn test_basic_rebase() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1363,6 +1413,7 @@ async fn test_basic_rebase() {
 
     // 5. Switch back to feature and perform rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -1376,6 +1427,17 @@ async fn test_basic_rebase() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -1449,6 +1511,9 @@ async fn test_rebase_preserves_untracked_files() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1469,6 +1534,7 @@ async fn test_rebase_preserves_untracked_files() {
 
     // Create feature branch and add a commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -1494,6 +1560,9 @@ async fn test_rebase_preserves_untracked_files() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1514,6 +1583,7 @@ async fn test_rebase_preserves_untracked_files() {
 
     // Advance master to force a real rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -1539,6 +1609,9 @@ async fn test_rebase_preserves_untracked_files() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1559,6 +1632,7 @@ async fn test_rebase_preserves_untracked_files() {
 
     // Switch back to feature and create an untracked file
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -1575,6 +1649,17 @@ async fn test_rebase_preserves_untracked_files() {
     fs::write(temp_path.path().join("notes.txt"), "keep me").unwrap();
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -1620,6 +1705,9 @@ async fn test_rebase_already_up_to_date() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1651,6 +1739,9 @@ async fn test_rebase_already_up_to_date() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1671,6 +1762,7 @@ async fn test_rebase_already_up_to_date() {
 
     // Create feature branch from current master (no divergence)
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -1685,6 +1777,17 @@ async fn test_rebase_already_up_to_date() {
 
     // Try to rebase feature onto master (should be up to date)
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -1722,6 +1825,9 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1742,6 +1848,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     // Create feature branch and make a commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -1767,6 +1874,9 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1787,6 +1897,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     // Switch back to master and make a conflicting commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -1812,6 +1923,9 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1832,6 +1946,7 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     // Switch back to feature
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -1846,6 +1961,17 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
 
     // Start rebase
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -1867,6 +1993,17 @@ async fn test_rebase_abort_when_no_rebase_in_progress() {
     // Rebase should complete (no conflict in this case)
     // But let's test abort when no rebase is in progress
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -1922,6 +2059,9 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1942,6 +2082,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
     // Create feature branch and commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -1966,6 +2107,9 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1987,6 +2131,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
     // Advance master to force a rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -2011,6 +2156,9 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2032,6 +2180,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
     // Rebase feature onto master
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -2044,6 +2193,17 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
     })
     .await;
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -2079,6 +2239,7 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
         stopped_sha: None,
         current_head: rebased_head,
         autosquash: false,
+        empty_mode: libra::command::rebase::RebaseEmptyMode::Keep,
     };
     state
         .save()
@@ -2092,6 +2253,17 @@ async fn test_rebase_abort_restores_branch_after_finalize_failure() {
 
     // Abort should restore the original branch ref.
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -2145,6 +2317,9 @@ async fn test_rebase_continue_no_rebase() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2165,6 +2340,17 @@ async fn test_rebase_continue_no_rebase() {
 
     // Try to continue when no rebase is in progress
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -2200,6 +2386,9 @@ async fn test_rebase_skip_no_rebase() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2220,6 +2409,17 @@ async fn test_rebase_skip_no_rebase() {
 
     // Try to skip when no rebase is in progress
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -2257,6 +2457,9 @@ async fn test_rebase_with_conflict_and_abort() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2277,6 +2480,7 @@ async fn test_rebase_with_conflict_and_abort() {
 
     // 2. Create feature branch and modify the file
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -2306,6 +2510,9 @@ async fn test_rebase_with_conflict_and_abort() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2326,6 +2533,7 @@ async fn test_rebase_with_conflict_and_abort() {
 
     // 3. Switch to master and make a conflicting modification
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -2351,6 +2559,9 @@ async fn test_rebase_with_conflict_and_abort() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2371,6 +2582,7 @@ async fn test_rebase_with_conflict_and_abort() {
 
     // 4. Switch back to feature and attempt rebase (should conflict)
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -2384,6 +2596,17 @@ async fn test_rebase_with_conflict_and_abort() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -2412,6 +2635,17 @@ async fn test_rebase_with_conflict_and_abort() {
 
     // 6. Abort the rebase
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -2480,6 +2714,9 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2500,6 +2737,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
     // 2. Feature branch modifies binary content
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -2524,6 +2762,9 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2544,6 +2785,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
     // 3. Master modifies binary content differently
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -2568,6 +2810,9 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2588,6 +2833,7 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
     // 4. Rebase feature onto master (should conflict)
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -2600,6 +2846,17 @@ async fn test_rebase_binary_conflict_writes_markers() {
     })
     .await;
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -2631,6 +2888,17 @@ async fn test_rebase_binary_conflict_writes_markers() {
 
     // Cleanup: abort rebase
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -2673,6 +2941,9 @@ async fn test_rebase_with_conflict_and_skip() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2693,6 +2964,7 @@ async fn test_rebase_with_conflict_and_skip() {
 
     // 2. Create feature branch with two commits
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -2723,6 +2995,9 @@ async fn test_rebase_with_conflict_and_skip() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2759,6 +3034,9 @@ async fn test_rebase_with_conflict_and_skip() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2779,6 +3057,7 @@ async fn test_rebase_with_conflict_and_skip() {
 
     // 3. Switch to master and make a conflicting change
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -2804,6 +3083,9 @@ async fn test_rebase_with_conflict_and_skip() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2824,6 +3106,7 @@ async fn test_rebase_with_conflict_and_skip() {
 
     // 4. Switch back to feature and attempt rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -2837,6 +3120,17 @@ async fn test_rebase_with_conflict_and_skip() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -2857,6 +3151,17 @@ async fn test_rebase_with_conflict_and_skip() {
     );
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -2904,6 +3209,9 @@ async fn test_rebase_with_conflict_and_continue() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2924,6 +3232,7 @@ async fn test_rebase_with_conflict_and_continue() {
 
     // 2. Create feature branch and modify the file
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -2953,6 +3262,9 @@ async fn test_rebase_with_conflict_and_continue() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -2973,6 +3285,7 @@ async fn test_rebase_with_conflict_and_continue() {
 
     // 3. Switch to master and make a conflicting modification
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -2998,6 +3311,9 @@ async fn test_rebase_with_conflict_and_continue() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3018,6 +3334,7 @@ async fn test_rebase_with_conflict_and_continue() {
 
     // 4. Switch back to feature and attempt rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -3031,6 +3348,17 @@ async fn test_rebase_with_conflict_and_continue() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -3070,11 +3398,25 @@ async fn test_rebase_with_conflict_and_continue() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
     // Continue the rebase
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -3137,6 +3479,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3157,6 +3502,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     // 2. Create feature branch with 3 commits
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -3183,6 +3529,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3219,6 +3568,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3251,6 +3603,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3271,6 +3626,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     // 3. Switch to master and make conflicting change to file1
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -3296,6 +3652,9 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3316,6 +3675,7 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     // 4. Switch back to feature and attempt rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -3329,6 +3689,17 @@ async fn test_rebase_multiple_commits_partial_conflict() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -3350,6 +3721,17 @@ async fn test_rebase_multiple_commits_partial_conflict() {
 
     // Skip the conflicting commit (F1)
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -3413,6 +3795,9 @@ async fn test_rebase_state_persistence() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3433,6 +3818,7 @@ async fn test_rebase_state_persistence() {
 
     // 2. Create feature branch with conflicting change
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -3458,6 +3844,9 @@ async fn test_rebase_state_persistence() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3478,6 +3867,7 @@ async fn test_rebase_state_persistence() {
 
     // 3. Create conflicting change on master
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -3503,6 +3893,9 @@ async fn test_rebase_state_persistence() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3523,6 +3916,7 @@ async fn test_rebase_state_persistence() {
 
     // 4. Start rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -3536,6 +3930,17 @@ async fn test_rebase_state_persistence() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -3574,6 +3979,17 @@ async fn test_rebase_state_persistence() {
 
     // Clean up - abort the rebase
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -3621,6 +4037,9 @@ async fn test_rebase_fast_forward_branch_behind() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3641,6 +4060,7 @@ async fn test_rebase_fast_forward_branch_behind() {
 
     // Create feature branch at the same commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -3655,6 +4075,7 @@ async fn test_rebase_fast_forward_branch_behind() {
 
     // Advance master by one commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -3680,6 +4101,9 @@ async fn test_rebase_fast_forward_branch_behind() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3702,6 +4126,7 @@ async fn test_rebase_fast_forward_branch_behind() {
 
     // Rebase feature onto master (fast-forward)
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -3715,6 +4140,17 @@ async fn test_rebase_fast_forward_branch_behind() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -3764,6 +4200,9 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3784,6 +4223,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 
     // Create feature branch at base
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -3798,6 +4238,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 
     // Advance master by one commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -3823,6 +4264,9 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3843,6 +4287,7 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
 
     // Switch to feature and introduce a dirty tracked file
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -3859,6 +4304,17 @@ async fn test_rebase_fast_forward_blocks_dirty_workdir() {
     fs::write(temp_path.path().join("file.txt"), "local-modification").unwrap();
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -3908,6 +4364,9 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3928,6 +4387,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 
     // Create feature branch at base
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -3942,6 +4402,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 
     // Advance master with a new file that will conflict with untracked
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -3967,6 +4428,9 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -3987,6 +4451,7 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
 
     // Switch to feature and create untracked file that would be overwritten
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -4003,6 +4468,17 @@ async fn test_rebase_fast_forward_blocks_untracked_overwrite() {
     fs::write(temp_path.path().join("new.txt"), "local-untracked").unwrap();
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -4052,6 +4528,9 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4072,6 +4551,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
     // Create feature branch and add a commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -4097,6 +4577,9 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4117,6 +4600,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
     // Advance master to force a non-fast-forward rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -4142,6 +4626,9 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4162,6 +4649,7 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
 
     // Switch back to feature and introduce a dirty tracked file
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -4178,6 +4666,17 @@ async fn test_rebase_blocks_dirty_workdir_non_fast_forward() {
     fs::write(temp_path.path().join("file.txt"), "dirty").unwrap();
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -4234,6 +4733,9 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4254,6 +4756,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     // Feature commit modifies both files (conflict + clean)
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -4280,6 +4783,9 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4300,6 +4806,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     // Master conflicting change
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -4325,6 +4832,9 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4345,6 +4855,7 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     // Rebase feature onto master; should stop with conflict
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -4358,6 +4869,17 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -4384,6 +4906,17 @@ async fn test_rebase_conflict_preserves_non_conflicting_workdir() {
 
     // Clean up
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -4419,6 +4952,9 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4439,6 +4975,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     // Feature commit adds a file and changes conflict.txt
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -4465,6 +5002,9 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4503,6 +5043,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     // Master conflicting change
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -4528,6 +5069,9 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4548,6 +5092,7 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     // Rebase feature onto master with an untracked file at the added path.
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -4563,6 +5108,17 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
     fs::write(temp_path.path().join("new.txt"), "keep me").unwrap();
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -4586,6 +5142,17 @@ async fn test_rebase_conflict_does_not_overwrite_untracked_paths() {
 
     // Clean up
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -4621,6 +5188,9 @@ async fn test_rebase_continue_requires_resolution() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4641,6 +5211,7 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Feature commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -4666,6 +5237,9 @@ async fn test_rebase_continue_requires_resolution() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4686,6 +5260,7 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Master conflict
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -4711,6 +5286,9 @@ async fn test_rebase_continue_requires_resolution() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -4731,6 +5309,7 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Start rebase
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("feature".to_string()),
         create: None,
         force_create: None,
@@ -4744,6 +5323,17 @@ async fn test_rebase_continue_requires_resolution() {
     .await;
 
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: Some("main".to_string()),
@@ -4766,6 +5356,17 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Continue without resolving conflicts
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -4788,6 +5389,17 @@ async fn test_rebase_continue_requires_resolution() {
 
     // Clean up
     execute(RebaseArgs {
+        no_rerere_autoupdate: false,
+        keep_empty: false,
+        no_keep_empty: false,
+        empty: None,
+        autostash: false,
+        no_autostash: false,
+        exec: Vec::new(),
+        update_refs: false,
+        no_update_refs: false,
+        fork_point: false,
+        no_fork_point: false,
         onto: None,
         branch: None,
         upstream: None,
@@ -5100,5 +5712,400 @@ fn test_rebase_help_lists_onto_and_examples() {
     assert!(
         stdout.contains("EXAMPLES:"),
         "rebase --help must render the EXAMPLES banner: {stdout}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_rebase_keep_empty_is_accepted_noop_and_preserves_empty_commit() {
+    // Libra's rebase keeps empty commits by default, so `--keep-empty` (which
+    // explicitly requests that default) is an accepted no-op: it must not error,
+    // and the empty commit must survive the rebase.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // dev branch: an empty commit followed by a real one.
+    assert_cli_success(&run_libra_command(&["branch", "dev"], p), "branch dev");
+    assert_cli_success(&run_libra_command(&["checkout", "dev"], p), "checkout dev");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "empty-commit",
+                "--no-verify",
+            ],
+            p,
+        ),
+        "empty commit",
+    );
+    fs::write(p.join("dev.txt"), "dev\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "dev.txt"], p), "add dev.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "real-dev", "--no-verify"], p),
+        "real dev commit",
+    );
+
+    // Advance main.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    fs::write(p.join("main.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "main.txt"], p), "add main.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-advance", "--no-verify"], p),
+        "main advance",
+    );
+
+    // Rebase dev onto main with --keep-empty: accepted, succeeds, empty commit kept.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "dev"], p),
+        "checkout dev again",
+    );
+    let out = run_libra_command(&["rebase", "--keep-empty", "main"], p);
+    assert_cli_success(&out, "rebase --keep-empty");
+    let log =
+        String::from_utf8_lossy(&run_libra_command(&["log", "--pretty=%s"], p).stdout).into_owned();
+    assert!(
+        log.contains("empty-commit"),
+        "--keep-empty must preserve the empty commit through the rebase:\n{log}"
+    );
+    assert!(
+        log.contains("real-dev") && log.contains("main-advance"),
+        "rebase should have replayed dev onto the advanced main:\n{log}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_rebase_no_keep_empty_drops_start_empty_commits() {
+    // `--no-keep-empty` drops commits that are already empty in the source history
+    // (no change vs their parent), while a real commit is still replayed. The
+    // default (and `--keep-empty`) keeps the empty commit.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // dev: an empty commit followed by a real one.
+    assert_cli_success(&run_libra_command(&["branch", "dev"], p), "branch dev");
+    assert_cli_success(&run_libra_command(&["checkout", "dev"], p), "checkout dev");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--allow-empty",
+                "-m",
+                "empty-commit",
+                "--no-verify",
+            ],
+            p,
+        ),
+        "empty commit",
+    );
+    std::fs::write(p.join("dev.txt"), "dev\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "dev.txt"], p), "add dev.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "real-dev", "--no-verify"], p),
+        "real dev commit",
+    );
+
+    // Advance main so the rebase actually replays.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    std::fs::write(p.join("main.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "main.txt"], p), "add main.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-advance", "--no-verify"], p),
+        "main advance",
+    );
+
+    // rebase --no-keep-empty: the empty commit is dropped, the real one replayed.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "dev"], p),
+        "checkout dev again",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--no-keep-empty", "main"], p),
+        "rebase --no-keep-empty",
+    );
+    let log =
+        String::from_utf8_lossy(&run_libra_command(&["log", "--pretty=%s"], p).stdout).into_owned();
+    assert!(
+        !log.contains("empty-commit"),
+        "--no-keep-empty must drop the start-empty commit:\n{log}"
+    );
+    assert!(
+        log.contains("real-dev") && log.contains("main-advance"),
+        "the real commit is still replayed onto the advanced main:\n{log}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_rebase_no_keep_empty_all_empty_range_moves_branch_to_base() {
+    // When `--no-keep-empty` drops EVERY commit in the range (all start-empty),
+    // the branch must still be rebased onto the advanced upstream — not left at
+    // its old tip with the empty commits silently retained.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // dev: only empty commits.
+    assert_cli_success(&run_libra_command(&["branch", "dev"], p), "branch dev");
+    assert_cli_success(&run_libra_command(&["checkout", "dev"], p), "checkout dev");
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "--allow-empty", "-m", "empty-1", "--no-verify"],
+            p,
+        ),
+        "empty-1",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "--allow-empty", "-m", "empty-2", "--no-verify"],
+            p,
+        ),
+        "empty-2",
+    );
+
+    // Advance main.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "main"], p),
+        "checkout main",
+    );
+    std::fs::write(p.join("main.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "main.txt"], p), "add main.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main-advance", "--no-verify"], p),
+        "main advance",
+    );
+    let main_tip = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "main"], p).stdout)
+        .trim()
+        .to_string();
+
+    // rebase --no-keep-empty: all commits dropped, dev moves to main's tip.
+    assert_cli_success(
+        &run_libra_command(&["checkout", "dev"], p),
+        "checkout dev again",
+    );
+    assert_cli_success(
+        &run_libra_command(&["rebase", "--no-keep-empty", "main"], p),
+        "rebase --no-keep-empty (all empty)",
+    );
+    let dev_tip = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_eq!(
+        dev_tip, main_tip,
+        "dev with only empty commits must rebase onto main's tip, not stay put"
+    );
+    let log =
+        String::from_utf8_lossy(&run_libra_command(&["log", "--pretty=%s"], p).stdout).into_owned();
+    assert!(
+        !log.contains("empty-1") && !log.contains("empty-2"),
+        "all start-empty commits must be dropped:\n{log}"
+    );
+}
+
+/// Build a repo where `topic` has a commit that BECOMES empty when rebased onto
+/// `main` (both add the identical change) plus a genuinely new commit. Leaves
+/// HEAD on `topic`, with `main` as the rebase upstream.
+fn build_become_empty_rebase_repo() -> tempfile::TempDir {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "branch topic",
+    );
+    std::fs::write(p.join("shared.txt"), "X\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add topic X");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "topic adds X", "--no-verify"], p),
+        "commit topic X",
+    );
+    std::fs::write(p.join("shared.txt"), "X\nY\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add topic Y");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "topic adds Y", "--no-verify"], p),
+        "commit topic Y",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("shared.txt"), "X\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main X");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main adds X", "--no-verify"], p),
+        "commit main X",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "topic"], p), "switch topic");
+    repo
+}
+
+/// `--empty=drop` skips a commit that becomes empty after replay (its change is
+/// already on the new base), reporting the git-style `dropping … upstream`
+/// notice, while still replaying the genuinely-new commit.
+#[test]
+#[serial]
+fn test_rebase_empty_drop_skips_become_empty_commit() {
+    let repo = build_become_empty_rebase_repo();
+    let p = repo.path();
+    let out = run_libra_command(&["rebase", "--empty=drop", "main"], p);
+    assert_cli_success(&out, "rebase --empty=drop");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("dropping")
+            && stdout.contains("topic adds X")
+            && stdout.contains("already upstream"),
+        "--empty=drop reports the dropped become-empty commit:\n{stdout}"
+    );
+    let log =
+        String::from_utf8_lossy(&run_libra_command(&["log", "--pretty=%s"], p).stdout).into_owned();
+    assert!(
+        log.contains("topic adds Y"),
+        "the new commit is replayed:\n{log}"
+    );
+    assert!(
+        !log.contains("topic adds X"),
+        "the become-empty commit was dropped:\n{log}"
+    );
+    assert!(log.contains("main adds X"), "main's commit remains:\n{log}");
+}
+
+/// Without `--empty` (Libra's default) the become-empty commit is KEPT — an
+/// intentional divergence from Git, which drops it.
+#[test]
+#[serial]
+fn test_rebase_empty_default_keeps_become_empty_commit() {
+    let repo = build_become_empty_rebase_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["rebase", "main"], p),
+        "rebase (default keep)",
+    );
+    let log =
+        String::from_utf8_lossy(&run_libra_command(&["log", "--pretty=%s"], p).stdout).into_owned();
+    assert!(
+        log.contains("topic adds X") && log.contains("topic adds Y"),
+        "default rebase keeps the become-empty commit:\n{log}"
+    );
+}
+
+/// `--empty=stop`/`--empty=ask` (valid Git modes Libra does not support) and any
+/// unknown value are usage errors (exit 129) naming `--empty`.
+#[test]
+#[serial]
+fn test_rebase_empty_invalid_mode_rejected() {
+    let repo = build_become_empty_rebase_repo();
+    let p = repo.path();
+    for mode in ["stop", "ask", "bogus"] {
+        let out = run_libra_command(&["rebase", &format!("--empty={mode}"), "main"], p);
+        assert_eq!(
+            out.status.code(),
+            Some(129),
+            "--empty={mode} is a usage error: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains("--empty"),
+            "--empty={mode} error names --empty"
+        );
+    }
+}
+
+/// `--empty=drop` survives a conflict + `--continue`: the mode round-trips
+/// through `RebaseState`, so a LATER commit that becomes empty is dropped when
+/// the resume reaches it (not replayed as an empty commit).
+#[test]
+#[serial]
+fn test_rebase_empty_drop_survives_conflict_resume() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // topic: f1 conflicts on conflict.txt; f2 adds shared.txt=S (will become empty).
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "topic"], p),
+        "branch topic",
+    );
+    std::fs::write(p.join("conflict.txt"), "topic-line\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "conflict.txt"], p), "add f1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "topic f1", "--no-verify"], p),
+        "commit f1",
+    );
+    std::fs::write(p.join("shared.txt"), "S\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "topic f2 adds S", "--no-verify"], p),
+        "commit f2",
+    );
+    // main: conflicting edit to conflict.txt AND already add the identical shared.txt.
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("conflict.txt"), "main-line\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "conflict.txt"], p),
+        "add main edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main edits conflict", "--no-verify"], p),
+        "commit main edit",
+    );
+    std::fs::write(p.join("shared.txt"), "S\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main S");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main adds S", "--no-verify"], p),
+        "commit main S",
+    );
+    assert_cli_success(&run_libra_command(&["switch", "topic"], p), "switch topic");
+
+    // Start rebase --empty=drop: f1 conflicts and stops with resumable state.
+    let start = run_libra_command(&["rebase", "--empty=drop", "main"], p);
+    assert_eq!(
+        start.status.code(),
+        Some(128),
+        "f1 conflict stops the rebase"
+    );
+    assert!(
+        String::from_utf8_lossy(&start.stderr).contains("--continue"),
+        "the conflict stop points at --continue (resumable state): {}",
+        String::from_utf8_lossy(&start.stderr)
+    );
+
+    // Resolve f1 and continue; the resume reaches f2 (become-empty) and, because
+    // --empty=drop round-tripped through the state, drops it.
+    std::fs::write(p.join("conflict.txt"), "resolved\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "conflict.txt"], p),
+        "stage resolution",
+    );
+    let cont = run_libra_command(&["rebase", "--continue"], p);
+    assert_cli_success(&cont, "--continue drops the redundant f2 and finishes");
+    let cont_out = String::from_utf8_lossy(&cont.stdout);
+    assert!(
+        cont_out.contains("dropping")
+            && cont_out.contains("topic f2 adds S")
+            && cont_out.contains("already upstream"),
+        "the resumed become-empty f2 is reported as dropped:\n{cont_out}"
+    );
+    let log =
+        String::from_utf8_lossy(&run_libra_command(&["log", "--pretty=%s"], p).stdout).into_owned();
+    assert!(
+        log.contains("topic f1"),
+        "f1 (resolved) is replayed:\n{log}"
+    );
+    assert!(
+        !log.contains("topic f2 adds S"),
+        "the become-empty f2 was dropped on resume:\n{log}"
+    );
+    // State cleared (sequence complete): another --continue errors with no rebase.
+    let after = run_libra_command(&["rebase", "--continue"], p);
+    assert_ne!(
+        after.status.code(),
+        Some(0),
+        "no rebase in progress after completion"
+    );
+    assert!(
+        String::from_utf8_lossy(&after.stderr).contains("no rebase in progress"),
+        "state cleared after the sequence completes: {}",
+        String::from_utf8_lossy(&after.stderr)
     );
 }

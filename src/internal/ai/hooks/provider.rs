@@ -47,6 +47,12 @@ pub enum ProviderHookCommand {
     Compaction,
     Stop,
     SessionEnd,
+    /// AG-19: nested sub-agent run started. Codex emits this natively
+    /// (`SubagentStart` hook event); other providers may synthesize it
+    /// from transcript analysis.
+    SubagentStart,
+    /// AG-19: nested sub-agent run finished (Codex `SubagentStop`).
+    SubagentEnd,
 }
 
 impl ProviderHookCommand {
@@ -63,6 +69,8 @@ impl ProviderHookCommand {
             ProviderHookCommand::Compaction => LifecycleEventKind::Compaction,
             ProviderHookCommand::Stop => LifecycleEventKind::TurnEnd,
             ProviderHookCommand::SessionEnd => LifecycleEventKind::SessionEnd,
+            ProviderHookCommand::SubagentStart => LifecycleEventKind::SubagentStart,
+            ProviderHookCommand::SubagentEnd => LifecycleEventKind::SubagentEnd,
         }
     }
 }
@@ -77,6 +85,8 @@ impl fmt::Display for ProviderHookCommand {
             ProviderHookCommand::Compaction => "compaction",
             ProviderHookCommand::Stop => "stop",
             ProviderHookCommand::SessionEnd => "session-end",
+            ProviderHookCommand::SubagentStart => "subagent-start",
+            ProviderHookCommand::SubagentEnd => "subagent-end",
         };
         write!(f, "{value}")
     }
@@ -95,7 +105,9 @@ pub struct ProviderInstallOptions {
 /// A statically registered provider that can parse lifecycle payloads and manage hook setup.
 ///
 /// Implementations are expected to be cheap to construct (typically zero-sized
-/// types) and are looked up by name at runtime via [`super::providers::find_provider`].
+/// types) and are reached at runtime through the observed-agents registry
+/// (`AgentKind` -> `agent_for` -> `as_hooks()`) or the typed singleton
+/// accessors in [`super::providers`] — never by name string (AG-19).
 /// All methods are sync because hook ingestion runs on the agent's main thread and
 /// IO that providers perform is bounded by user-controlled config files.
 pub trait HookProvider: Sync {
@@ -115,6 +127,18 @@ pub trait HookProvider: Sync {
         hook_event_name: &str,
         envelope: &SessionHookEnvelope,
     ) -> Result<LifecycleEvent>;
+    /// Whether this provider's parser recognizes `hook_event_name`.
+    ///
+    /// AG-19 forward compatibility: when a newer upstream agent emits an
+    /// event name Libra does not know yet, the dispatcher must
+    /// skip-and-log (`unknown_event_type`) instead of failing the whole
+    /// ingest — never panic, never write a checkpoint, never block later
+    /// known events. The conservative default (`true`) preserves each
+    /// provider's parse-time error behaviour until it opts in with a
+    /// real name table.
+    fn recognizes_event(&self, _hook_event_name: &str) -> bool {
+        true
+    }
     /// Identity field names this provider checks when building dedup keys.
     fn dedup_identity_keys(&self) -> &'static [&'static str];
     /// Provider-native event names that should fall back to `session_id` when no
@@ -209,9 +233,9 @@ mod tests {
     }
 
     /// `ProviderHookCommand::Copy` + `Eq` + `Hash` are required for
-    /// the `HashMap<Command, ...>` lookup table in
-    /// `providers::find_provider`. Pin the derives via a static
-    /// type-system check + duplicate-detection via HashSet.
+    /// `HashMap<Command, ...>` lookup tables in provider installers.
+    /// Pin the derives via a static type-system check +
+    /// duplicate-detection via HashSet.
     #[test]
     fn provider_hook_command_derives_copy_and_hash() {
         use std::collections::HashSet;
@@ -223,11 +247,13 @@ mod tests {
             ProviderHookCommand::Compaction,
             ProviderHookCommand::Stop,
             ProviderHookCommand::SessionEnd,
+            ProviderHookCommand::SubagentStart,
+            ProviderHookCommand::SubagentEnd,
         ]
         .into_iter()
         .collect();
-        // 7 distinct variants must populate 7 hash buckets.
-        assert_eq!(set.len(), 7, "all variants must be hash-distinct");
+        // 9 distinct variants must populate 9 hash buckets.
+        assert_eq!(set.len(), 9, "all variants must be hash-distinct");
     }
 
     /// `ProviderInstallOptions::default()` initialises both fields

@@ -79,6 +79,149 @@ fn test_blame_json_output_includes_lines() {
     assert!(json["data"]["lines"].as_array().is_some());
 }
 
+/// Scenario: a line is introduced in commit A and only re-indented (whitespace
+/// change) in commit B. Default blame attributes it to B; `blame -w` ignores the
+/// whitespace difference and attributes it to A.
+#[test]
+fn test_blame_ignore_whitespace_attributes_to_older_commit() {
+    let repo = create_committed_repo_via_cli();
+
+    // Commit A: introduce the line with no surrounding whitespace.
+    std::fs::write(repo.path().join("ws.txt"), "value\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "ws.txt"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "add ws", "--no-verify"], repo.path())
+            .status
+            .success()
+    );
+    let head_a = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    let commit_a = String::from_utf8_lossy(&head_a.stdout).trim().to_string();
+
+    // Commit B: change only the whitespace (re-indent the same content).
+    std::fs::write(repo.path().join("ws.txt"), "    value\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "ws.txt"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "reindent ws", "--no-verify"], repo.path())
+            .status
+            .success()
+    );
+    let head_b = run_libra_command(&["rev-parse", "HEAD"], repo.path());
+    let commit_b = String::from_utf8_lossy(&head_b.stdout).trim().to_string();
+    assert_ne!(commit_a, commit_b, "the two commits must differ");
+
+    // Default blame: the whitespace-only change is attributed to commit B.
+    let default = run_libra_command(&["--json", "blame", "ws.txt"], repo.path());
+    assert!(
+        default.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&default.stderr)
+    );
+    let default_json = parse_json_stdout(&default);
+    assert_eq!(
+        default_json["data"]["lines"][0]["hash"], commit_b,
+        "default blame attributes the re-indent to commit B"
+    );
+
+    // `-w`: the whitespace difference is ignored, so the line traces to commit A.
+    let ignored = run_libra_command(&["--json", "blame", "-w", "ws.txt"], repo.path());
+    assert!(
+        ignored.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ignored.stderr)
+    );
+    let ignored_json = parse_json_stdout(&ignored);
+    assert_eq!(
+        ignored_json["data"]["lines"][0]["hash"], commit_a,
+        "blame -w attributes the whitespace-only change to commit A"
+    );
+}
+
+/// Scenario: a whitespace-only change is followed by an intervening commit that
+/// inserts a line *above* it, shifting its line number. `blame -w` must still
+/// trace the shifted line to the commit that introduced its content, which
+/// requires remapping diff line numbers through the back-walk (not a direct
+/// `new_line - 1` index into the final file).
+#[test]
+fn test_blame_ignore_whitespace_after_line_shift() {
+    let repo = create_committed_repo_via_cli();
+
+    // Commit A: introduce the line (no surrounding whitespace).
+    std::fs::write(repo.path().join("shift.txt"), "value\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "shift.txt"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "A add value", "--no-verify"], repo.path())
+            .status
+            .success()
+    );
+    let commit_a =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+
+    // Commit B: re-indent the line (whitespace-only change).
+    std::fs::write(repo.path().join("shift.txt"), "    value\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "shift.txt"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "B reindent", "--no-verify"], repo.path())
+            .status
+            .success()
+    );
+
+    // Commit C: insert a header line ABOVE, shifting "value" to line 2.
+    std::fs::write(repo.path().join("shift.txt"), "header\n    value\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "shift.txt"], repo.path())
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(
+            &["commit", "-m", "C add header", "--no-verify"],
+            repo.path()
+        )
+        .status
+        .success()
+    );
+    let commit_c =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], repo.path()).stdout)
+            .trim()
+            .to_string();
+
+    // `-w`: line 2 ("value", shifted) traces past the whitespace-only B to A;
+    // line 1 (the inserted header) is attributed to C.
+    let ignored = run_libra_command(&["--json", "blame", "-w", "shift.txt"], repo.path());
+    assert!(
+        ignored.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&ignored.stderr)
+    );
+    let json = parse_json_stdout(&ignored);
+    assert_eq!(
+        json["data"]["lines"][0]["hash"], commit_c,
+        "the inserted header line is attributed to commit C"
+    );
+    assert_eq!(
+        json["data"]["lines"][1]["hash"], commit_a,
+        "the shifted whitespace-only line still traces to commit A under -w"
+    );
+}
+
 /// Scenario: `blame --porcelain` emits the machine-readable format — a
 /// `<sha> <orig> <final> [<group>]` header followed (once per commit) by the
 /// author/committer/summary/filename metadata block and tab-prefixed content.
@@ -343,6 +486,69 @@ fn test_blame_invalid_line_range_uses_stable_cli_error() {
     assert_eq!(report.category, "cli");
 }
 
+/// Scenario: `-L` accepts Git's `/regex/` endpoints (start and/or end), a single
+/// endpoint spans to the end of the file, and a non-matching regex errors — all
+/// matching `git blame -L` semantics.
+#[test]
+#[serial]
+fn test_blame_regex_line_range() {
+    let repo = tempdir().unwrap();
+    let p = repo.path();
+    init_repo_via_cli(p);
+    configure_identity_via_cli(p);
+    fs::write(
+        p.join("f.rs"),
+        "fn alpha() {}\nfn beta() {}\nfn gamma() {}\nfn delta() {}\nfn eps() {}\n",
+    )
+    .unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.rs"], p), "add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit",
+    );
+
+    let line_numbers = |args: &[&str]| -> Vec<u64> {
+        let output = run_libra_command(args, p);
+        assert_cli_success(&output, "blame line range");
+        parse_json_stdout(&output)["data"]["lines"]
+            .as_array()
+            .expect("lines array")
+            .iter()
+            .map(|line| line["line_number"].as_u64().expect("line_number"))
+            .collect()
+    };
+
+    // /regex/ start and end resolve to matching line numbers.
+    assert_eq!(
+        line_numbers(&["--json", "blame", "-L", "/beta/,/delta/", "f.rs"]),
+        vec![2, 3, 4]
+    );
+    // A single /regex/ (or numeric) endpoint spans to the end of the file (like Git).
+    assert_eq!(
+        line_numbers(&["--json", "blame", "-L", "/beta/", "f.rs"]),
+        vec![2, 3, 4, 5]
+    );
+    assert_eq!(
+        line_numbers(&["--json", "blame", "-L", "2", "f.rs"]),
+        vec![2, 3, 4, 5]
+    );
+    // Numeric start + regex end, and regex start + `+COUNT`.
+    assert_eq!(
+        line_numbers(&["--json", "blame", "-L", "2,/delta/", "f.rs"]),
+        vec![2, 3, 4]
+    );
+    assert_eq!(
+        line_numbers(&["--json", "blame", "-L", "/beta/,+1", "f.rs"]),
+        vec![2]
+    );
+
+    // A regex with no match is a usage error (LBR-CLI-002, exit 129).
+    let no_match = run_libra_command(&["blame", "-L", "/nomatch/", "f.rs"], p);
+    assert_eq!(no_match.status.code(), Some(129));
+    let (_stderr, report) = parse_cli_error_stderr(&no_match.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+}
+
 /// Bootstrap a repo with the requested hash algorithm (`"sha1"` or
 /// `"sha256"`), set a stable identity, and return the
 /// `ChangeDirGuard` that pins the process CWD to the repo for the
@@ -398,6 +604,9 @@ async fn prepare_history() -> (ObjectHash, ObjectHash) {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -425,6 +634,9 @@ async fn prepare_history() -> (ObjectHash, ObjectHash) {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -452,6 +664,9 @@ async fn commit_foo(message: &str) -> ObjectHash {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -539,6 +754,9 @@ async fn test_blame_empty_file_returns_empty_result() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -592,6 +810,7 @@ async fn blame_runs_with_sha1() {
         abbrev: None,
         root: false,
         show_name: false,
+        ignore_whitespace: false,
     })
     .await;
 }
@@ -620,6 +839,7 @@ async fn blame_runs_with_sha256() {
         abbrev: None,
         root: false,
         show_name: false,
+        ignore_whitespace: false,
     })
     .await;
 }
@@ -730,6 +950,7 @@ async fn blame_root_flag_is_accepted_noop() {
         abbrev: None,
         root: true,
         show_name: false,
+        ignore_whitespace: false,
     })
     .await;
 }

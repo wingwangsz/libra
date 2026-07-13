@@ -56,6 +56,12 @@ fn format_patch_help_lists_expected_flags() {
         "--signature",
         "--no-signature",
         "--numbered-files",
+        "--to",
+        "--cc",
+        "--no-to",
+        "--no-cc",
+        "--from",
+        "--base",
         "revision-range",
     ] {
         assert!(

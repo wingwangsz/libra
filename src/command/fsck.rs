@@ -30,7 +30,6 @@ use sea_orm::EntityTrait;
 use serde::Serialize;
 
 use crate::{
-    command::load_object,
     internal::{
         branch::Branch,
         db,
@@ -39,7 +38,7 @@ use crate::{
     },
     utils::{
         client_storage::ClientStorage,
-        error::{CliError, CliResult},
+        error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
         path,
     },
@@ -61,6 +60,10 @@ pub enum FsckMsgId {
     HashMismatch,
     Dangling,
     Unreachable,
+    /// lore.md 2.5: the object's payload was intentionally obliterated. A
+    /// DIAGNOSTIC (stdout), distinct from Missing, that NEVER flips the exit
+    /// code.
+    IntentionalAbsence,
     // ===== Error messages (stderr) - Object integrity =====
     BadObjectSha1,
     BadTree,
@@ -114,13 +117,17 @@ impl FsckMsgId {
                 | FsckMsgId::HashMismatch
                 | FsckMsgId::Dangling
                 | FsckMsgId::Unreachable
+                | FsckMsgId::IntentionalAbsence
         )
     }
 
     /// Check if this message should cause non-zero exit code
     /// Only dangling and unreachable are informational; all others cause failure
     pub fn causes_failure(&self) -> bool {
-        !matches!(self, FsckMsgId::Dangling | FsckMsgId::Unreachable)
+        !matches!(
+            self,
+            FsckMsgId::Dangling | FsckMsgId::Unreachable | FsckMsgId::IntentionalAbsence
+        )
     }
 
     /// Get the output format string for this message
@@ -131,6 +138,9 @@ impl FsckMsgId {
             FsckMsgId::HashMismatch => format!("hash mismatch {} {}", obj_type, obj_id),
             FsckMsgId::Dangling => format!("dangling {} {}", obj_type, obj_id),
             FsckMsgId::Unreachable => format!("unreachable {} {}", obj_type, obj_id),
+            FsckMsgId::IntentionalAbsence => {
+                format!("intentionally absent (obliterated) {} {}", obj_type, obj_id)
+            }
             // Error messages - stderr
             FsckMsgId::BadObjectSha1 => format!("bad object sha1: {} {}", obj_type, obj_id),
             FsckMsgId::BadTree => format!("bad tree: {}", obj_id),
@@ -188,6 +198,18 @@ pub fn report(msg_id: FsckMsgId, obj_type: &str, obj_id: &str) -> bool {
     msg_id.causes_failure()
 }
 
+/// lore.md 2.5: report a referenced object that is ABSENT from storage as
+/// either intentionally-absent (obliterated — diagnostic, exit code stays 0)
+/// or the given `missing_id` (a real integrity error). Returns whether it
+/// flips the exit code.
+fn report_absent_or_intentional(hash: &ObjectHash, obj_type: &str, missing_id: FsckMsgId) -> bool {
+    if is_intentionally_absent(hash) {
+        report(FsckMsgId::IntentionalAbsence, obj_type, &hash.to_string())
+    } else {
+        report(missing_id, obj_type, &hash.to_string())
+    }
+}
+
 fn tag_parse_error_msg_id(error: &impl std::fmt::Display) -> FsckMsgId {
     let message = error.to_string().to_ascii_lowercase();
     if message.contains("missing object type")
@@ -238,6 +260,7 @@ const FSCK_AFTER_HELP: &str = "EXAMPLES:
     libra fsck --tags                   Print tag ids in the report
     libra fsck --connectivity-only      Skip blob content checks; verify graph only
     libra fsck --strict                 Apply stricter commit/tree format checks
+    libra fsck --heal                   Re-fetch missing/corrupt objects from the durable tier
     libra fsck <object-id>              Verify a single object by id";
 
 /// Verify repository integrity by checking objects, refs, and index
@@ -298,9 +321,31 @@ pub struct FsckArgs {
     /// and tree entries must be in Git's canonical sort order.
     #[arg(long)]
     pub strict: bool,
+
+    /// Also verify packfile integrity (this is the default, like Git). Each
+    /// `.pack` and its `.idx` are checked against their trailing checksum.
+    #[arg(long, overrides_with = "no_full")]
+    pub full: bool,
+
+    /// Skip the packfile-integrity check.
+    #[arg(long = "no-full", overrides_with = "full")]
+    pub no_full: bool,
+
+    /// Repair missing or corrupted objects by re-fetching them from the
+    /// configured durable tier (`LIBRA_STORAGE_*` remote), verifying, and
+    /// writing them locally. Never fabricates objects; objects marked as
+    /// intentionally absent (obliterated) are skipped, not resurrected.
+    #[arg(long)]
+    pub heal: bool,
 }
 
 impl FsckArgs {
+    /// Whether packfile integrity is verified. Git's `--full` is the default;
+    /// `--no-full` disables it.
+    fn full_enabled(&self) -> bool {
+        !self.no_full
+    }
+
     /// Returns whether dangling objects should be reported.
     /// Default is true (only dangling commits).
     /// Use --dangling or --dangling=true to enable, --no-dangling to disable.
@@ -334,6 +379,28 @@ pub enum CheckStatus {
     Missing,
     InvalidFormat,
     HashMismatch,
+    /// lore.md 2.5: the object's payload was intentionally obliterated (not
+    /// corruption; does not fail fsck).
+    IntentionalAbsence,
+}
+
+/// Outcome of a `libra fsck --heal` repair pass (lore.md §0.4).
+#[derive(Debug, Default, Serialize)]
+pub struct HealReport {
+    /// Objects re-fetched from the durable tier, verified, and written locally.
+    pub healed: usize,
+    /// Objects that could not be recovered: absent from the durable tier, or no
+    /// durable tier is configured. Not fabricated.
+    pub unrecoverable: usize,
+    /// Objects skipped because they are marked intentionally absent
+    /// (obliterated) — heal must not resurrect them (lore.md §2.5).
+    pub skipped_intentional_absence: usize,
+    /// Objects whose heal attempt errored (e.g. a durable-tier transport error
+    /// after retries). Messages are credential-redacted.
+    pub failed: usize,
+    /// Human-readable, credential-redacted notes about unrecoverable/failed
+    /// objects.
+    pub messages: Vec<String>,
 }
 
 /// Result of fsck verification
@@ -342,6 +409,10 @@ pub struct FsckResult {
     pub objects_checked: usize,
     pub objects_ok: usize,
     pub objects_corrupted: usize,
+    /// lore.md 2.5: objects reported as intentionally obliterated (diagnostic,
+    /// counted separately from corruption; never fails fsck).
+    #[serde(default)]
+    pub objects_intentionally_absent: usize,
     pub refs_checked: usize,
     pub refs_ok: usize,
     pub refs_broken: usize,
@@ -350,6 +421,9 @@ pub struct FsckResult {
     pub cross_ref_issues: usize,
     pub overall_status: CheckStatus,
     pub has_errors: bool, // Track if any error was printed to stderr
+    /// Repair outcome, present only when `--heal` was requested.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub heal: Option<HealReport>,
 }
 
 /// Result of checking the index file
@@ -361,11 +435,22 @@ pub struct IndexCheckResult {
     pub entries_corrupted: usize,
 }
 
+/// Whether fsck should exit non-zero: a normal integrity error, or a `--heal`
+/// pass that left objects unrecoverable/failed (which the post-heal checks may
+/// not re-surface, e.g. under `--object` scoping or `--connectivity-only`).
+fn fsck_failed(result: &FsckResult) -> bool {
+    result.has_errors
+        || result
+            .heal
+            .as_ref()
+            .is_some_and(|heal| heal.unrecoverable > 0 || heal.failed > 0)
+}
+
 pub async fn execute(args: FsckArgs) {
     let exit_code = match run_fsck(&args).await {
         Ok(fsck_result) => {
             // Exit with failure code only for serious issues (not dangling/unreachable).
-            if fsck_result.has_errors { 1 } else { 0 }
+            if fsck_failed(&fsck_result) { 1 } else { 0 }
         }
         Err(error) => {
             error.print_stderr();
@@ -378,13 +463,232 @@ pub async fn execute(args: FsckArgs) {
 }
 
 async fn run_fsck(args: &FsckArgs) -> CliResult<FsckResult> {
-    let storage = ClientStorage::init(path::objects());
-
-    if let Some(ref object_id) = args.object {
-        check_single_object(object_id, &storage, args.strict).await
-    } else {
-        check_all_objects(args, &storage).await
+    // lore.md 2.5: load the intentional-absence (obliteration) tombstone
+    // snapshot so every seam below distinguishes obliterated objects from
+    // corruption and does NOT flip the exit code (empty set = no-op).
+    crate::internal::obliteration::refresh_snapshot().await;
+    // lore.md 2.3: a DANGLING alternate (a registered object dir that no longer
+    // exists / is not a readable object store) is an actionable ERROR — a
+    // borrowed read would fail — and MUST flip the exit code (Codex P1).
+    let mut dangling_alternate = false;
+    {
+        let objects_dir = path::objects();
+        for alt in crate::internal::alternates::list(&objects_dir) {
+            let readable = alt.is_dir()
+                && (alt.join("info").is_dir()
+                    || alt.join("pack").is_dir()
+                    || std::fs::read_dir(&alt).is_ok());
+            if !readable {
+                eprintln!("error: dangling object alternate: {}", alt.display());
+                dangling_alternate = true;
+            }
+        }
     }
+    // `--heal` repairs FIRST, so the checks below (and therefore the exit code)
+    // observe the post-repair state. The repair itself is reported separately.
+    let heal_report = if args.heal {
+        // A well-formed `--heal <OBJECT>` seeds that OID so it is healed even if
+        // unreachable; a malformed one is left to the single-object check below
+        // to report as invalid.
+        let explicit = args.object.as_deref().and_then(parse_object_hash);
+        Some(run_heal_pass(explicit).await?)
+    } else {
+        None
+    };
+
+    // Storage for the verification checks. Under `--heal` every read is
+    // local-only, so the hook-gated heal step is the ONLY path that can reach
+    // the durable tier — otherwise a normal verification read (e.g. `check_refs`
+    // → `verify_object` → `storage.get`) on a tiered backend could fetch and
+    // cache an object the intentional-absence hook just skipped, resurrecting it
+    // (lore.md §0.4 / §2.5). Without `--heal`, keep the existing behavior where a
+    // tiered repo's checks may read through to the durable tier.
+    let storage = if args.heal {
+        ClientStorage::init_local(path::objects())
+    } else {
+        ClientStorage::init(path::objects())
+    };
+
+    let mut result = if let Some(ref object_id) = args.object {
+        check_single_object(object_id, &storage, args.strict).await?
+    } else {
+        check_all_objects(args, &storage).await?
+    };
+    result.heal = heal_report;
+    // lore.md 2.3: a dangling alternate is an integrity error (fails fsck).
+    if dangling_alternate {
+        result.has_errors = true;
+        if result.overall_status == CheckStatus::Ok {
+            result.overall_status = CheckStatus::Missing;
+        }
+    }
+    Ok(result)
+}
+
+/// Objects fsck considers candidates for `--heal`: referenced-but-absent
+/// (missing) and present-but-corrupt (bytes do not hash to their OID).
+struct HealTargets {
+    missing: Vec<ObjectHash>,
+    corrupt: Vec<ObjectHash>,
+}
+
+/// Forward-compat hook for lore.md §2.5 obliteration: query the object index for
+/// an intentional-absence (tombstone) marker so `--heal` never resurrects an
+/// object that was deliberately obliterated.
+///
+/// The obliteration state machine (§2.5) is not yet implemented, so no such
+/// markers exist and this always returns `false` today. It is the single point
+/// §2.5 will extend; keeping the call here means heal is tombstone-aware from
+/// day one and cannot regress into resurrecting obliterated payloads.
+fn is_intentionally_absent(hash: &ObjectHash) -> bool {
+    crate::internal::obliteration::is_tombstoned_cached(hash)
+}
+
+/// Whether a stored object's bytes fail to hash back to its OID (corruption).
+/// Unreadable/undecompressable objects also count as corrupt.
+fn stored_object_is_corrupt(hash: &ObjectHash, storage: &ClientStorage) -> bool {
+    let Ok(obj_type) = storage.get_object_type(hash) else {
+        return true;
+    };
+    match storage.get(hash) {
+        Ok(data) => {
+            crate::utils::storage::tiered::verify_fetched_object(hash, obj_type, &data).is_err()
+        }
+        Err(_) => true,
+    }
+}
+
+/// Collect the objects `--heal` should try to repair: referenced objects absent
+/// from storage (missing), and stored objects whose bytes are corrupt.
+///
+/// Discovery uses a strictly **local** read path (`init_local`) via the
+/// storage-bound [`walk_object_refs`]/[`bfs_mark_reachable`]. This is a
+/// correctness requirement, not an optimisation: a tiered read would fetch — and
+/// cache — a missing object from the durable tier *during* discovery, before the
+/// intentional-absence hook in [`run_heal_pass`] runs, which could resurrect a
+/// deliberately obliterated object (lore.md §0.4/§2.5). Only the heal step
+/// itself, after the hook, may reach the durable tier.
+async fn collect_heal_candidates(
+    local: &ClientStorage,
+    extra_roots: &HashSet<ObjectHash>,
+) -> CliResult<HealTargets> {
+    let ctx = collect_reachability_context(local).await?;
+
+    // Roots: refs + reflogs + index, plus any `extra_roots` (e.g. an object
+    // named on `fsck --heal <OBJECT>` that is not reachable from those roots).
+    // Walking the reference closure surfaces every referenced OID, including
+    // ones that are absent from storage.
+    let mut roots: HashSet<ObjectHash> = HashSet::new();
+    roots.extend(ctx.refs_reachable.iter().copied());
+    roots.extend(ctx.reflog_objects.iter().copied());
+    roots.extend(ctx.index_objects.iter().copied());
+    roots.extend(extra_roots.iter().copied());
+    let reachable = bfs_mark_reachable(&roots, local);
+
+    // Missing = referenced but genuinely absent. Classify with `local.exist`,
+    // which consults BOTH loose objects and pack indexes — `ctx.all_objects`
+    // only inventories loose objects, so a packed object would otherwise be
+    // mis-classified as missing and (with no durable tier) falsely reported
+    // unrecoverable.
+    let missing: Vec<ObjectHash> = reachable
+        .iter()
+        .filter(|hash| !local.exist(hash))
+        .copied()
+        .collect();
+
+    // Corrupt = a present loose object whose bytes no longer hash to its OID.
+    // Only loose objects are re-hashed here; packed-object integrity is covered
+    // by fsck's separate pack-checksum verification.
+    let corrupt: Vec<ObjectHash> = ctx
+        .all_objects
+        .iter()
+        .filter(|hash| stored_object_is_corrupt(hash, local))
+        .copied()
+        .collect();
+
+    Ok(HealTargets { missing, corrupt })
+}
+
+/// Run the `--heal` repair pass to a fixed point: for every missing/corrupt
+/// candidate, skip the intentionally-absent ones, otherwise re-fetch from the
+/// durable tier, verify, and write locally. Never fabricates objects (lore.md
+/// §0.4).
+///
+/// Healing a missing commit/tree makes its own references locally discoverable,
+/// which can reveal further missing descendants; the pass therefore re-discovers
+/// (local-only, so it sees the objects just written) and repairs until a round
+/// heals nothing new. Each OID is attempted at most once (`attempted`), so the
+/// loop is bounded by the number of distinct candidates and always terminates.
+async fn run_heal_pass(explicit: Option<ObjectHash>) -> CliResult<HealReport> {
+    // Discovery uses a strictly-local storage; the durable tier is touched ONLY
+    // through the hook-gated `heal` calls below, so no discovery or verification
+    // read can resurrect an obliterated object.
+    let local = ClientStorage::init_local(path::objects());
+    let tiered = ClientStorage::init(path::objects());
+    let mut report = HealReport::default();
+    let mut attempted: HashSet<ObjectHash> = HashSet::new();
+    // An explicit `fsck --heal <OBJECT>` target is seeded as an extra root, so it
+    // is healed even when unreachable from refs/reflogs/index — and, once healed
+    // to a commit/tree, the fixed-point loop discovers and heals its subtree.
+    let extra_roots: HashSet<ObjectHash> = explicit.into_iter().collect();
+
+    loop {
+        let targets = collect_heal_candidates(&local, &extra_roots).await?;
+        let mut healed_this_round = 0usize;
+
+        for hash in targets.missing.iter().chain(targets.corrupt.iter()) {
+            // Attempt each OID only once across rounds (dedupes re-discovered
+            // still-unrecoverable objects and bounds the loop).
+            if !attempted.insert(*hash) {
+                continue;
+            }
+            // Tombstone check BEFORE any remote action (lore.md §0.4 / §2.5).
+            // Heal is RESURRECTION-CAPABLE, so this uses the error-aware
+            // lookup and FAILS CLOSED (Codex P1): an unreadable tombstone
+            // table aborts the heal rather than risk rebuilding an obliterated
+            // object.
+            match crate::internal::obliteration::ObliterationStore::lookup(hash).await {
+                Ok(Some(_)) => {
+                    report.skipped_intentional_absence += 1;
+                    continue;
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    return Err(CliError::fatal(format!(
+                        "cannot verify obliteration tombstones during heal; aborting to avoid                          resurrecting an obliterated object: {e}"
+                    ))
+                    .with_stable_code(StableErrorCode::IoReadFailed));
+                }
+            }
+            match tiered.heal(hash) {
+                Ok(true) => {
+                    report.healed += 1;
+                    healed_this_round += 1;
+                }
+                Ok(false) => {
+                    report.unrecoverable += 1;
+                    report.messages.push(format!(
+                        "unrecoverable: {hash} not available in durable tier"
+                    ));
+                }
+                Err(err) => {
+                    report.failed += 1;
+                    report.messages.push(format!(
+                        "heal failed for {hash}: {}",
+                        crate::utils::redact::redact_url_credentials(&err.to_string())
+                    ));
+                }
+            }
+        }
+
+        // Only a successful heal can make new objects reachable; if this round
+        // healed nothing, further rounds cannot discover anything new.
+        if healed_this_round == 0 {
+            break;
+        }
+    }
+
+    Ok(report)
 }
 
 pub async fn execute_safe(args: FsckArgs, output: &OutputConfig) -> CliResult<()> {
@@ -399,11 +703,34 @@ pub async fn execute_safe(args: FsckArgs, output: &OutputConfig) -> CliResult<()
     let fsck_result = fsck_result?;
     if json_mode {
         emit_json_data("fsck", &fsck_result, output)?;
+    } else if let Some(heal) = &fsck_result.heal {
+        print_heal_summary(heal);
     }
-    if fsck_result.has_errors {
+    if fsck_failed(&fsck_result) {
         return Err(CliError::failure("fsck found repository integrity issues").with_exit_code(1));
     }
     Ok(())
+}
+
+/// Print the `--heal` repair summary in human mode (fsck diagnostics go to
+/// stdout). Silent under `--json` (the report is in the JSON envelope) and when
+/// stdout is suppressed.
+fn print_heal_summary(heal: &HealReport) {
+    if stdout_suppressed() {
+        return;
+    }
+    let total = heal.healed + heal.unrecoverable + heal.skipped_intentional_absence + heal.failed;
+    if total == 0 {
+        println!("heal: no missing or corrupted objects to repair");
+        return;
+    }
+    println!(
+        "heal: {} repaired, {} unrecoverable, {} skipped (intentional absence), {} failed",
+        heal.healed, heal.unrecoverable, heal.skipped_intentional_absence, heal.failed
+    );
+    for message in &heal.messages {
+        println!("  {message}");
+    }
 }
 
 /// Parse hex string to ObjectHash
@@ -484,14 +811,21 @@ async fn check_single_object(
             // Error already reported by verify_object, no need to report again
             check_result.status
         }
+        CheckStatus::IntentionalAbsence => {
+            // Diagnostic already emitted by verify_object; not corruption.
+            check_result.status
+        }
     };
 
     let is_ok = overall_status == CheckStatus::Ok;
+    let intentional = overall_status == CheckStatus::IntentionalAbsence;
 
     Ok(FsckResult {
         objects_checked: 1,
         objects_ok: if is_ok { 1 } else { 0 },
-        objects_corrupted: if is_ok { 0 } else { 1 },
+        // An intentionally-obliterated object is neither ok nor corrupt.
+        objects_corrupted: if is_ok || intentional { 0 } else { 1 },
+        objects_intentionally_absent: if intentional { 1 } else { 0 },
         refs_checked: 0,
         refs_ok: 0,
         refs_broken: 0,
@@ -500,6 +834,7 @@ async fn check_single_object(
         cross_ref_issues: 0,
         overall_status,
         has_errors,
+        heal: None,
     })
 }
 
@@ -508,6 +843,7 @@ async fn check_all_objects(args: &FsckArgs, storage: &ClientStorage) -> CliResul
         objects_checked: 0,
         objects_ok: 0,
         objects_corrupted: 0,
+        objects_intentionally_absent: 0,
         refs_checked: 0,
         refs_ok: 0,
         refs_broken: 0,
@@ -516,6 +852,7 @@ async fn check_all_objects(args: &FsckArgs, storage: &ClientStorage) -> CliResul
         cross_ref_issues: 0,
         overall_status: CheckStatus::Ok,
         has_errors: false,
+        heal: None,
     };
 
     // Get all object hashes
@@ -586,10 +923,203 @@ async fn check_all_objects(args: &FsckArgs, storage: &ClientStorage) -> CliResul
         find_and_report_tags().await?;
     }
 
+    // Stage 11: Verify packfile integrity (Git's `--full`, on by default).
+    if args.full_enabled() {
+        check_packs(storage, &mut result, args.verbose)?;
+    }
+
     // Print notices
     print_notices(head_is_unborn, &result);
 
     Ok(result)
+}
+
+/// Verify the integrity of every packfile by checking its trailing checksum
+/// (Git's `fsck --full`). This reads the raw `.pack` / `.idx` bytes and compares
+/// the trailing hash against a recomputation of the preceding content — it does
+/// NOT decode pack objects, so a body-corrupt pack is reported rather than
+/// crashing the decoder. Panic-safe by construction.
+fn check_packs(storage: &ClientStorage, result: &mut FsckResult, verbose: bool) -> CliResult<()> {
+    let pack_dir = storage.base_path().join("pack");
+    if !pack_dir.exists() {
+        return Ok(());
+    }
+
+    // A pack-directory read failure is itself an integrity problem — report it
+    // and fail rather than silently skipping packfile verification.
+    let read_dir = match fs::read_dir(&pack_dir) {
+        Ok(rd) => rd,
+        Err(e) => {
+            eprintln!(
+                "error: cannot read pack directory {}: {e}",
+                pack_dir.display()
+            );
+            result.has_errors = true;
+            return Ok(());
+        }
+    };
+    let mut packs: Vec<std::path::PathBuf> = Vec::new();
+    for entry in read_dir {
+        match entry {
+            Ok(e) => {
+                let path = e.path();
+                if path.extension().and_then(|x| x.to_str()) == Some("pack") {
+                    packs.push(path);
+                }
+            }
+            Err(e) => {
+                eprintln!("error: cannot read pack directory entry: {e}");
+                result.has_errors = true;
+            }
+        }
+    }
+    packs.sort();
+
+    let kind = git_internal::hash::get_hash_kind();
+    let hash_len = kind.size();
+
+    for pack in &packs {
+        if verbose && !stdout_suppressed() {
+            println!("Checking pack {}", pack.display());
+        }
+        // The `.pack` self-checksum (detects body corruption without decoding),
+        // streamed so a multi-GB pack is not read into memory at once.
+        let pack_trailer = match verify_pack_self_checksum(pack, kind, hash_len) {
+            Ok(trailer) => Some(trailer),
+            Err(detail) => {
+                report_pack_error(result, pack, &detail);
+                None
+            }
+        };
+        // The paired `.idx`: validate via the shared index parser (checks the
+        // index checksum — accepting Git's and Libra's index-hash variants — and
+        // the fanout/entry structure) without decoding pack objects.
+        let idx = pack.with_extension("idx");
+        if idx.exists() {
+            match fs::read(&idx) {
+                Ok(idx_bytes) => match super::verify_pack_index::parse_index(&idx_bytes) {
+                    Ok(parsed) => {
+                        // Cross-check: the index's recorded pack checksum must
+                        // match the pack's own trailer (catches a stale/swapped
+                        // index paired with the wrong pack).
+                        if let Some(trailer) = &pack_trailer
+                            && parsed.pack_hash.to_string() != hex::encode(trailer)
+                        {
+                            report_pack_error(
+                                result,
+                                &idx,
+                                "index pack checksum does not match the packfile",
+                            );
+                        }
+                    }
+                    Err(detail) => report_pack_error(result, &idx, &detail),
+                },
+                Err(e) => report_pack_error(result, &idx, &format!("cannot read index: {e}")),
+            }
+        }
+    }
+
+    Ok(())
+}
+
+/// Record a packfile integrity error against the fsck result.
+fn report_pack_error(result: &mut FsckResult, path: &std::path::Path, detail: &str) {
+    eprintln!("error: {}: {}", path.display(), detail);
+    result.has_errors = true;
+    result.objects_corrupted += 1;
+    if result.overall_status == CheckStatus::Ok {
+        result.overall_status = CheckStatus::HashMismatch;
+    }
+}
+
+/// Incremental hasher over the repository's object hash algorithm. The `sha1`
+/// and `sha2` crates expose different `Digest` trait versions, so the two arms
+/// bring the matching trait into scope locally.
+enum PackHasher {
+    Sha1(sha1::Sha1),
+    Sha256(sha2::Sha256),
+}
+
+impl PackHasher {
+    fn new(kind: git_internal::hash::HashKind) -> Self {
+        use git_internal::hash::HashKind;
+        match kind {
+            HashKind::Sha1 => {
+                use sha1::Digest as _;
+                PackHasher::Sha1(sha1::Sha1::new())
+            }
+            HashKind::Sha256 => {
+                use sha2::Digest as _;
+                PackHasher::Sha256(sha2::Sha256::new())
+            }
+        }
+    }
+
+    fn update(&mut self, data: &[u8]) {
+        match self {
+            PackHasher::Sha1(h) => {
+                use sha1::Digest as _;
+                h.update(data);
+            }
+            PackHasher::Sha256(h) => {
+                use sha2::Digest as _;
+                h.update(data);
+            }
+        }
+    }
+
+    fn finalize(self) -> Vec<u8> {
+        match self {
+            PackHasher::Sha1(h) => {
+                use sha1::Digest as _;
+                h.finalize().to_vec()
+            }
+            PackHasher::Sha256(h) => {
+                use sha2::Digest as _;
+                h.finalize().to_vec()
+            }
+        }
+    }
+}
+
+/// Verify a `.pack` ends with a trailing hash equal to the hash of all the
+/// preceding bytes, streaming the body so the whole file is never buffered.
+/// Returns the verified trailer bytes (for the index cross-check), or an error
+/// detail string. Does NOT decode pack objects, so it is panic-safe.
+fn verify_pack_self_checksum(
+    path: &std::path::Path,
+    kind: git_internal::hash::HashKind,
+    hash_len: usize,
+) -> Result<Vec<u8>, String> {
+    use std::io::Read;
+
+    let mut file = fs::File::open(path).map_err(|e| format!("cannot read packfile: {e}"))?;
+    let total = file
+        .metadata()
+        .map_err(|e| format!("cannot stat packfile: {e}"))?
+        .len();
+    if total < hash_len as u64 {
+        return Err("file is too short to contain a checksum trailer".to_string());
+    }
+
+    let mut hasher = PackHasher::new(kind);
+    let mut remaining = total - hash_len as u64;
+    let mut buf = vec![0u8; 64 * 1024];
+    while remaining > 0 {
+        let want = remaining.min(buf.len() as u64) as usize;
+        file.read_exact(&mut buf[..want])
+            .map_err(|e| format!("cannot read packfile: {e}"))?;
+        hasher.update(&buf[..want]);
+        remaining -= want as u64;
+    }
+    let mut trailer = vec![0u8; hash_len];
+    file.read_exact(&mut trailer)
+        .map_err(|e| format!("cannot read packfile: {e}"))?;
+
+    if hasher.finalize() != trailer {
+        return Err("bad packfile checksum (corrupt or truncated)".to_string());
+    }
+    Ok(trailer)
 }
 
 /// Check all 256 object directories and print progress
@@ -684,7 +1214,7 @@ async fn check_objects(
             None => continue,
         };
 
-        if verbose {
+        if verbose && !stdout_suppressed() {
             // Get object type for verbose output only
             if let Ok(obj_type) = storage.get_object_type(&hash) {
                 let type_name = match obj_type {
@@ -724,6 +1254,10 @@ async fn check_objects(
                 if result.overall_status == CheckStatus::Ok {
                     result.overall_status = CheckStatus::InvalidFormat;
                 }
+            }
+            CheckStatus::IntentionalAbsence => {
+                // Diagnostic — NOT corruption, does not change overall_status.
+                result.objects_intentionally_absent += 1;
             }
         }
     }
@@ -853,7 +1387,7 @@ async fn check_reflogs(
         .map_err(|e| CliError::fatal(format!("failed to load reflogs: {}", e)))?;
 
     for entry in reflogs {
-        if verbose {
+        if verbose && !stdout_suppressed() {
             println!("Checking reflog {}->{}", entry.old_oid, entry.new_oid);
         }
 
@@ -881,7 +1415,7 @@ async fn check_reflogs(
 
 /// Check index
 fn check_index(storage: &ClientStorage, result: &mut FsckResult, verbose: bool) -> CliResult<()> {
-    if verbose {
+    if verbose && !stdout_suppressed() {
         println!("Checking cache tree of .libra/index");
     }
 
@@ -904,7 +1438,7 @@ async fn check_connectivity(
     connectivity_only: bool,
 ) -> CliResult<()> {
     let count = all_hashes.len();
-    if verbose {
+    if verbose && !stdout_suppressed() {
         println!("Checking connectivity ({} objects)", count);
     }
 
@@ -916,7 +1450,7 @@ async fn check_connectivity(
     };
 
     for hash in all_hashes {
-        if verbose {
+        if verbose && !stdout_suppressed() {
             let hash_str = hash.to_string();
             if name_objects {
                 let name = object_names
@@ -1019,25 +1553,36 @@ async fn collect_reachability_context(storage: &ClientStorage) -> CliResult<Reac
     Ok(ctx)
 }
 
-/// Walk object references: returns objects referenced by the given object
-/// For commits: returns tree and parent commits
-/// For trees: returns child blobs and subtrees
+/// Walk object references: returns objects referenced by the given object.
+/// For commits: returns tree and parent commits. For trees: child blobs/subtrees.
+///
+/// Reads exclusively through the passed `storage` (never the global
+/// `load_object`, which resolves through the cached tiered
+/// `util::objects_storage()`). This keeps the walk honest about which backend it
+/// touches: under `libra fsck --heal` the caller passes a strictly-local
+/// storage, so discovery and verification cannot fetch — or, once §2.5 lands,
+/// resurrect an obliterated — object from the durable tier. It also skips
+/// `refs/replace` resolution, so a replacement ref cannot redirect the walk to a
+/// remote-only object.
 fn walk_object_refs(hash: &ObjectHash, storage: &ClientStorage) -> Vec<ObjectHash> {
     let mut refs = Vec::new();
 
     let Ok(obj_type) = storage.get_object_type(hash) else {
         return refs;
     };
+    let Ok(data) = storage.get(hash) else {
+        return refs;
+    };
 
     match obj_type {
         ObjectType::Commit => {
-            if let Ok(commit) = load_object::<Commit>(hash) {
+            if let Ok(commit) = Commit::from_bytes(&data, *hash) {
                 refs.push(commit.tree_id);
                 refs.extend(commit.parent_commit_ids.iter().copied());
             }
         }
         ObjectType::Tree => {
-            if let Ok(tree) = load_object::<Tree>(hash) {
+            if let Ok(tree) = Tree::from_bytes(&data, *hash) {
                 for item in &tree.tree_items {
                     refs.push(item.id);
                 }
@@ -1167,8 +1712,12 @@ async fn find_and_report_roots(storage: &ClientStorage) -> CliResult<()> {
             continue;
         }
 
-        // Load the commit and check if it has no parents
-        let Ok(commit) = load_object::<Commit>(&hash) else {
+        // Load the commit through the passed storage (not the global
+        // `load_object`) so the walk honours the caller's backend choice.
+        let Ok(data) = storage.get(&hash) else {
+            continue;
+        };
+        let Ok(commit) = Commit::from_bytes(&data, hash) else {
             continue;
         };
 
@@ -1400,17 +1949,32 @@ async fn verify_object(
 ) -> CliResult<(ObjectCheckResult, bool)> {
     let mut has_error = false;
 
-    // Check if object exists
+    // Check if object exists.
     if !storage.exist(hash) {
+        // lore.md 2.5: an intentionally-obliterated object is a DIAGNOSTIC,
+        // distinct from Missing, and never flips the exit code.
+        let intentional = is_intentionally_absent(hash);
         if report_errors {
-            has_error |= report(FsckMsgId::Missing, "unknown", &hash.to_string());
+            has_error |= if intentional {
+                report(FsckMsgId::IntentionalAbsence, "unknown", &hash.to_string())
+            } else {
+                report(FsckMsgId::Missing, "unknown", &hash.to_string())
+            };
         }
         return Ok((
             ObjectCheckResult {
                 object_id: hash.to_string(),
                 object_type: "unknown".to_string(),
-                status: CheckStatus::Missing,
-                error_message: Some("Object not found in storage".to_string()),
+                status: if intentional {
+                    CheckStatus::IntentionalAbsence
+                } else {
+                    CheckStatus::Missing
+                },
+                error_message: Some(if intentional {
+                    "Object payload intentionally obliterated".to_string()
+                } else {
+                    "Object not found in storage".to_string()
+                }),
                 size: 0,
             },
             has_error,
@@ -1566,8 +2130,11 @@ async fn verify_object(
                         for item in &tree.tree_items {
                             // Each entry's target must exist with a matching type.
                             if !storage.exist(&item.id) {
-                                has_error |=
-                                    report(FsckMsgId::Missing, "tree", &item.id.to_string());
+                                has_error |= report_absent_or_intentional(
+                                    &item.id,
+                                    "tree",
+                                    FsckMsgId::Missing,
+                                );
                             } else if let Ok(actual) = storage.get_object_type(&item.id)
                                 && actual != expected_type_for_mode(item.mode)
                             {
@@ -1637,8 +2204,11 @@ async fn verify_object(
                         }
                         // The tree must exist and be a tree.
                         if !storage.exist(&commit.tree_id) {
-                            has_error |=
-                                report(FsckMsgId::MissingTree, "commit", &hash.to_string());
+                            has_error |= report_absent_or_intentional(
+                                &commit.tree_id,
+                                "commit",
+                                FsckMsgId::MissingTree,
+                            );
                         } else if let Ok(tree_type) = storage.get_object_type(&commit.tree_id)
                             && tree_type != ObjectType::Tree
                         {
@@ -1648,8 +2218,11 @@ async fn verify_object(
                         // Parents must exist and be commits.
                         for parent in &commit.parent_commit_ids {
                             if !storage.exist(parent) {
-                                has_error |=
-                                    report(FsckMsgId::Missing, "commit", &parent.to_string());
+                                has_error |= report_absent_or_intentional(
+                                    parent,
+                                    "commit",
+                                    FsckMsgId::Missing,
+                                );
                             } else if let Ok(parent_type) = storage.get_object_type(parent)
                                 && parent_type != ObjectType::Commit
                             {
@@ -1724,22 +2297,38 @@ async fn verify_object(
             }
 
             if !storage.exist(&tag.object_hash) {
+                // lore.md 2.5: an obliterated tag TARGET is intentionally
+                // absent, not corruption — reflect it in the returned status
+                // too (Codex P1: aggregation/JSON must not count it as
+                // corrupt), not only in the diagnostic.
+                let intentional = is_intentionally_absent(&tag.object_hash);
                 if report_errors {
-                    has_error |= report(
-                        FsckMsgId::Missing,
+                    has_error |= report_absent_or_intentional(
+                        &tag.object_hash,
                         &tag.object_type.to_string(),
-                        &tag.object_hash.to_string(),
+                        FsckMsgId::Missing,
                     );
                 }
                 return Ok((
                     ObjectCheckResult {
                         object_id: hash.to_string(),
                         object_type: obj_type.to_string(),
-                        status: CheckStatus::Missing,
-                        error_message: Some(format!(
-                            "Tag {} points to missing {} {}",
-                            hash, tag.object_type, tag.object_hash
-                        )),
+                        status: if intentional {
+                            CheckStatus::IntentionalAbsence
+                        } else {
+                            CheckStatus::Missing
+                        },
+                        error_message: Some(if intentional {
+                            format!(
+                                "Tag {} points to intentionally-obliterated {} {}",
+                                hash, tag.object_type, tag.object_hash
+                            )
+                        } else {
+                            format!(
+                                "Tag {} points to missing {} {}",
+                                hash, tag.object_type, tag.object_hash
+                            )
+                        }),
                         size,
                     },
                     has_error,
@@ -1896,6 +2485,13 @@ fn check_index_file(storage: &ClientStorage) -> CliResult<IndexCheckResult> {
         result.entries_checked += 1;
 
         if let Some(msg_id) = validate_index_entry(entry, storage) {
+            // An intentionally-absent (obliterated) blob is a DIAGNOSTIC, not
+            // index corruption — report it but keep the index valid.
+            if msg_id == FsckMsgId::IntentionalAbsence {
+                let _ = report(msg_id, "blob", &entry.hash.to_string());
+                result.entries_ok += 1;
+                continue;
+            }
             result.entries_corrupted += 1;
             result.valid = false;
             // Report and track error
@@ -1948,6 +2544,11 @@ fn validate_index_entry(
     }
 
     if !storage.exist(&entry.hash) {
+        // lore.md 2.5: an obliterated blob still referenced by the index is
+        // intentionally absent, not corruption.
+        if is_intentionally_absent(&entry.hash) {
+            return Some(FsckMsgId::IntentionalAbsence);
+        }
         return Some(FsckMsgId::Missing);
     }
 

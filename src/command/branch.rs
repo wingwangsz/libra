@@ -16,7 +16,10 @@
 //! - For listing, supports `--contains` / `--no-contains` commit filters
 //!   that BFS-walk the commit graph from each branch tip.
 
-use std::collections::{HashSet, VecDeque};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    io::IsTerminal,
+};
 
 use clap::{ArgGroup, Parser};
 use colored::Colorize;
@@ -56,6 +59,9 @@ pub enum BranchListMode {
 
 const BRANCH_AFTER_HELP: &str = "\
 NOTES:
+    `libra branch diff [<base>] [<branch>]` is a Libra verb — tip-to-tip diff
+    (see `libra branch diff --help`); `diff` is reserved as a branch name here.
+
     Libra's global --quiet suppresses the branch listing itself.
     This differs from `git branch --quiet`, which still prints the primary list.
 
@@ -66,8 +72,11 @@ EXAMPLES:
     libra branch -D topic                 Force-delete a branch
     libra branch -c topic topic-backup    Copy a branch, keeping the original
     libra branch -u origin/main           Set upstream for the current branch
+    libra branch --edit-description       Edit the current branch's description in an editor
     libra branch --merged main            List branches already merged into main
     libra branch --sort version:refname   List branches sorted by version-aware name
+    libra branch --sort=-committerdate    List branches by tip commit date (newest first)
+    libra branch --format='%(refname:short) %(objectname:short)'  Render branches with a for-each-ref format
     libra branch --column                 List branches laid out in columns
     libra branch -v                       List branches with tip sha and subject
     libra branch -vv                      Also show upstream tracking [ahead/behind]
@@ -101,6 +110,14 @@ pub enum BranchOutput {
         #[serde(skip_serializing)]
         sorted: bool,
     },
+    /// `branch reset <name> <target>` succeeded (lore.md 1.13).
+    #[serde(rename = "reset")]
+    Reset {
+        name: String,
+        old_commit: String,
+        new_commit: String,
+        target: String,
+    },
     /// `branch <name> [base]` succeeded.
     #[serde(rename = "create")]
     Create { name: String, commit: String },
@@ -126,6 +143,10 @@ pub enum BranchOutput {
     /// `--unset-upstream` succeeded.
     #[serde(rename = "unset-upstream")]
     UnsetUpstream { branch: String },
+    /// `--edit-description` succeeded. `set` is true when a non-empty
+    /// description was stored, false when the (empty) buffer unset it.
+    #[serde(rename = "edit-description")]
+    EditDescription { branch: String, set: bool },
     /// `--show-current` result. `detached` is true when HEAD is detached;
     /// `name` is `None` in that case.
     #[serde(rename = "show-current")]
@@ -141,11 +162,13 @@ impl BranchOutput {
         matches!(
             self,
             Self::Create { .. }
+                | Self::Reset { .. }
                 | Self::Delete { .. }
                 | Self::Rename { .. }
                 | Self::Copy { .. }
                 | Self::SetUpstream { .. }
                 | Self::UnsetUpstream { .. }
+                | Self::EditDescription { .. }
         )
     }
 }
@@ -166,8 +189,97 @@ pub struct BranchListEntry {
 
 // action options are mutually exclusive with query options
 // query options can be combined
+pub const BRANCH_DIFF_EXAMPLES: &str = "\
+EXAMPLES:
+    libra branch diff                     Current branch vs its upstream
+    libra branch diff main                What the current branch changes vs main
+    libra branch diff main feature       What feature changes vs main (diff main..feature)
+    libra branch diff --merge-base main feature   Three-dot: merge-base(main,feature)..feature
+    libra branch diff main -- src/       Limit to a path
+    libra branch diff main --stat        Diffstat only
+
+NOTES:
+    Tip-to-tip only — the working tree is never involved. Full diff options
+    live on `libra diff <base>..<branch>`. Exit 0 even with differences
+    (use --exit-code for 1-on-diff).";
+
+/// Branch verbs (Libra extensions to the flat Git-style flag surface).
+#[derive(clap::Subcommand, Debug)]
+pub enum BranchSubcommand {
+    /// Show what a branch changes relative to a base (tip-to-tip diff;
+    /// reuses the diff engine — Lore's `branch diff`).
+    #[command(after_help = BRANCH_DIFF_EXAMPLES)]
+    Diff(BranchDiffArgs),
+    /// Move a branch tip to a target commit without touching the worktree
+    /// (Lore's `branch reset`; enforces protect/archive metadata).
+    #[command(after_help = BRANCH_RESET_EXAMPLES)]
+    Reset(BranchResetArgs),
+}
+
+pub const BRANCH_RESET_EXAMPLES: &str = "\
+EXAMPLES:
+    libra branch reset feature main~2     Move feature's tip to main~2
+    libra branch reset hotfix abc123      Move hotfix to a commit by OID prefix
+    libra metadata set --branch rel protect true    Protect rel from resets
+    libra metadata unset --branch rel protect       Lift the protection
+
+NOTES:
+    The index and working tree are NEVER touched — resetting the CURRENTLY
+    checked-out branch is refused (use `libra reset` for that). Protected or
+    archived branches (metadata) refuse with LBR-POLICY-001; there is no
+    --force — lift the flag explicitly, reset, then re-protect (auditable).
+    A reflog entry is written for the moved branch.";
+
+#[derive(Parser, Debug)]
+pub struct BranchResetArgs {
+    /// The LOCAL branch whose tip to move.
+    #[clap(value_name = "BRANCH")]
+    pub branch: String,
+
+    /// The commit-ish to move it to (branch, tag, OID prefix, HEAD~n, …).
+    #[clap(value_name = "TARGET")]
+    pub target: String,
+}
+
+#[derive(Parser, Debug)]
+pub struct BranchDiffArgs {
+    /// The base (old side). Defaults to the current branch's upstream.
+    #[clap(value_name = "BASE")]
+    pub base: Option<String>,
+
+    /// The branch (new side). Defaults to the current branch.
+    #[clap(value_name = "BRANCH")]
+    pub branch: Option<String>,
+
+    /// Three-dot semantics: diff from merge-base(BASE, BRANCH) to BRANCH
+    /// (mirrors `git diff --merge-base`).
+    #[clap(long = "merge-base")]
+    pub merge_base: bool,
+
+    /// Exit 1 when differences exist (0 when clean), like `diff --exit-code`.
+    #[clap(long = "exit-code")]
+    pub exit_code: bool,
+
+    /// Show a diffstat instead of the patch.
+    #[clap(long)]
+    pub stat: bool,
+
+    /// Show only names of changed files.
+    #[clap(long = "name-only", conflicts_with = "name_status")]
+    pub name_only: bool,
+
+    /// Show names and status letters of changed files.
+    #[clap(long = "name-status")]
+    pub name_status: bool,
+
+    /// Limit the diff to the given paths (always after `--`).
+    #[clap(last = true, value_name = "PATH")]
+    pub paths: Vec<String>,
+}
+
 #[derive(Parser, Debug)]
 #[command(after_help = BRANCH_AFTER_HELP)]
+#[command(args_conflicts_with_subcommands = true)]
 #[command(group(
     ArgGroup::new("action")
         .multiple(false)
@@ -180,6 +292,12 @@ pub struct BranchListEntry {
         .conflicts_with("action")
 ))]
 pub struct BranchArgs {
+    /// Branch verbs (Libra extensions). NOTE: when flags make clap fall back
+    /// to the positional parse, a literal `diff` in `new_branch` is refused
+    /// at execute time (never silently creates a branch named `diff`).
+    #[command(subcommand)]
+    pub subcommand: Option<BranchSubcommand>,
+
     /// new branch name
     #[clap(group = "action")]
     pub new_branch: Option<String>,
@@ -207,6 +325,12 @@ pub struct BranchArgs {
     /// Remove the branch's upstream configuration. Defaults to current branch.
     #[clap(long = "unset-upstream", group = "action", value_name = "BRANCH", num_args = 0..=1, default_missing_value = "")]
     pub unset_upstream: Option<String>,
+
+    /// Edit the description of a branch (defaults to the current branch) in an
+    /// editor, storing it as `branch.<name>.description`. Saving an empty
+    /// (comment-only) buffer unsets the description.
+    #[clap(long = "edit-description", group = "action", value_name = "BRANCH", num_args = 0..=1, default_missing_value = "")]
+    pub edit_description: Option<String>,
 
     /// show current branch
     #[clap(long, group = "action")]
@@ -255,9 +379,12 @@ pub struct BranchArgs {
     #[clap(long = "no-merged", group = "query", value_name = "commit", num_args = 0..=1, default_missing_value = "HEAD")]
     pub no_merged: Option<String>,
 
-    /// Sort the listed branches by key: `refname` / `-refname` (default
-    /// reversible) or `version:refname` / `v:refname` (numeric-aware), with a
-    /// leading `-` reversing. Implies --list.
+    /// Sort the listed branches by key: `refname` (default), `version:refname` /
+    /// `v:refname` (numeric-aware), `committerdate` / `creatordate` / `authordate`
+    /// (the tip commit's committer / author date), `objectsize` (the tip
+    /// object's byte size), or `objectname` (the tip commit's object id). A
+    /// leading `-` reverses (e.g. `-committerdate` lists newest first). Implies
+    /// --list.
     #[clap(long, group = "query", value_name = "key")]
     pub sort: Option<String>,
 
@@ -265,10 +392,24 @@ pub struct BranchArgs {
     #[clap(long = "ignore-case", group = "query")]
     pub ignore_case: bool,
 
+    /// Render each branch with a for-each-ref format string (e.g.
+    /// `%(refname:short)` / `%(objectname:short)` / `%(HEAD)` / `%(upstream)`).
+    /// Replaces the default `* name` listing (and `-v`/`--column`). Implies
+    /// --list.
+    #[clap(long, group = "query", value_name = "format")]
+    pub format: Option<String>,
+
     /// Display the branch list in columns. Modes: `always`, `auto` (only when
     /// stdout is a terminal), `never`. Bare `--column` means `always`.
-    #[clap(long, num_args = 0..=1, default_missing_value = "always", value_name = "MODE")]
+    #[clap(long, num_args = 0..=1, default_missing_value = "always", value_name = "MODE", overrides_with = "no_column")]
     pub column: Option<String>,
+
+    /// Do not display the branch list in columns (equivalent to
+    /// `--column=never`), countermanding an earlier `--column` (last one on the
+    /// command line wins), matching `git branch --no-column`. Branches list one
+    /// per line by default, so on its own this is a no-op.
+    #[clap(long = "no-column", overrides_with = "column")]
+    pub no_column: bool,
 
     /// Show the sha1 and commit subject line for each branch (`-v`). Repeat
     /// (`-vv`) to also show the upstream-tracking segment
@@ -278,6 +419,290 @@ pub struct BranchArgs {
 }
 /// Fire-and-forget entry: prints the rendered error to stderr but does not
 /// signal exit code.
+/// `branch reset` (lore.md §1.13): move a LOCAL branch tip to a target
+/// commit through the authoritative SQLite transaction — reference update +
+/// branch reflog entry — WITHOUT touching the index or worktree. The first
+/// enforcement consumer of the 1.5 protect/archive metadata: both flags are
+/// re-checked fail-closed INSIDE the transaction (a metadata read error or a
+/// concurrently-set flag rolls back before any write), and the checked-out
+/// branch is re-checked in-txn too (a concurrent `switch` cannot slip a
+/// phantom-staged-diff state through). No `--force`: lift the flag
+/// explicitly via `metadata unset`, reset, re-protect — auditable.
+async fn execute_reset_safe(args: BranchResetArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::utils::util::require_repo().map_err(|_| CliError::repo_not_found())?;
+    let branch = args.branch.clone();
+
+    if crate::internal::branch::is_ai_managed_branch(&branch) {
+        return Err(CliError::failure(format!(
+            "branch '{branch}' is AI-managed; refusing to reset it"
+        ))
+        .with_stable_code(StableErrorCode::ConflictOperationBlocked));
+    }
+    // Existence (with suggestions) + current-branch preflights (UX; both are
+    // re-verified authoritatively inside the txn).
+    let existing = Branch::find_branch_result(&branch, None)
+        .await
+        .map_err(map_branch_store_error)
+        .map_err(CliError::from)?;
+    let Some(existing) = existing else {
+        return Err(CliError::from(branch_not_found_error(&branch).await));
+    };
+    if let Head::Branch(current) = Head::current().await
+        && current == branch
+    {
+        return Err(CliError::from(BranchError::ResetCurrentBranch(branch)));
+    }
+    // Target must resolve AND load as a commit — a ref is never pointed at a
+    // missing or non-commit object.
+    let target_commit = get_target_commit(&args.target).await.map_err(|_| {
+        CliError::fatal(format!("cannot resolve target '{}'", args.target))
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+    })?;
+    let _: Commit = load_object(&target_commit).map_err(|error| {
+        CliError::fatal(format!(
+            "target '{}' does not point at a loadable commit: {error}",
+            args.target
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidTarget)
+    })?;
+    // Preflight policy checks (friendly errors; authoritative re-check in-txn).
+    {
+        let db = crate::internal::db::get_db_conn_instance().await;
+        if crate::internal::metadata::MetadataKv::is_protected_with_conn(&db, &branch)
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!("failed to read branch policy metadata: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+        {
+            return Err(CliError::from(BranchError::Protected(branch)));
+        }
+        if crate::internal::metadata::MetadataKv::is_archived_with_conn(&db, &branch)
+            .await
+            .map_err(|e| {
+                CliError::fatal(format!("failed to read branch policy metadata: {e}"))
+                    .with_stable_code(StableErrorCode::IoReadFailed)
+            })?
+        {
+            return Err(CliError::from(BranchError::Archived(branch)));
+        }
+    }
+
+    let old_commit = existing.commit.to_string();
+    let new_commit = target_commit.to_string();
+    let meta = OperationMeta {
+        command_name: "branch".to_string(),
+        description: format!("reset branch {branch} to {}", args.target),
+        actor: operation_actor().await,
+        repo_id: current_repo_id_for_operation()
+            .await
+            .map_err(CliError::from)?,
+        args_digest: Some(branch_operation_args_digest("reset", &branch, &new_commit)),
+    };
+    // Sentinel prefixes preserve the TYPED refusal through DbErr::Custom so a
+    // race-window refusal still surfaces as LBR-POLICY-001 / the current-
+    // branch message rather than a generic storage error.
+    const SENTINEL_PROTECTED: &str = "LIBRA_POLICY_PROTECTED:";
+    const SENTINEL_ARCHIVED: &str = "LIBRA_POLICY_ARCHIVED:";
+    const SENTINEL_CURRENT: &str = "LIBRA_RESET_CURRENT:";
+    let branch_for_txn = branch.clone();
+    let target_for_txn = args.target.clone();
+    let new_for_txn = target_commit;
+    let result = with_operation_log(meta, OperationScope::default(), move |txn| {
+        Box::pin(async move {
+            // Authoritative, fail-closed policy gate (the 1.5 contract).
+            let protected =
+                crate::internal::metadata::MetadataKv::is_protected_with_conn(txn, &branch_for_txn)
+                    .await
+                    .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+            if protected {
+                return Err(DbErr::Custom(format!(
+                    "{SENTINEL_PROTECTED}{branch_for_txn}"
+                )));
+            }
+            let archived =
+                crate::internal::metadata::MetadataKv::is_archived_with_conn(txn, &branch_for_txn)
+                    .await
+                    .map_err(|e| DbErr::Custom(format!("policy metadata read failed: {e}")))?;
+            if archived {
+                return Err(DbErr::Custom(format!(
+                    "{SENTINEL_ARCHIVED}{branch_for_txn}"
+                )));
+            }
+            // Re-check the checked-out branch in-txn: a concurrent `switch`
+            // between preflight and here must not produce phantom staged
+            // diffs on a silently-moved current branch.
+            if let Head::Branch(current) = Head::current_with_conn(txn).await
+                && current == branch_for_txn
+            {
+                return Err(DbErr::Custom(format!("{SENTINEL_CURRENT}{branch_for_txn}")));
+            }
+            let live = Branch::find_branch_result_with_conn(txn, &branch_for_txn, None)
+                .await
+                .map_err(|e| DbErr::Custom(e.to_string()))?
+                .ok_or_else(|| {
+                    DbErr::Custom(format!("branch '{branch_for_txn}' vanished mid-reset"))
+                })?;
+            Branch::update_branch_with_conn(txn, &branch_for_txn, &new_for_txn.to_string(), None)
+                .await?;
+            let context = crate::internal::reflog::ReflogContext {
+                old_oid: live.commit.to_string(),
+                new_oid: new_for_txn.to_string(),
+                action: crate::internal::reflog::ReflogAction::Reset {
+                    target: target_for_txn.clone(),
+                },
+            };
+            crate::internal::reflog::Reflog::insert_single_entry(
+                txn,
+                &context,
+                &format!("refs/heads/{branch_for_txn}"),
+            )
+            .await
+            .map_err(|e| DbErr::Custom(format!("reflog write failed: {e}")))?;
+            Ok::<String, DbErr>(live.commit.to_string())
+        })
+    })
+    .await;
+    let old_commit = match result {
+        Ok(op) => op.payload,
+        Err(error) => {
+            let text = error.to_string();
+            if let Some(name) = text.split(SENTINEL_PROTECTED).nth(1) {
+                return Err(CliError::from(BranchError::Protected(name.to_string())));
+            }
+            if let Some(name) = text.split(SENTINEL_ARCHIVED).nth(1) {
+                return Err(CliError::from(BranchError::Archived(name.to_string())));
+            }
+            if let Some(name) = text.split(SENTINEL_CURRENT).nth(1) {
+                return Err(CliError::from(BranchError::ResetCurrentBranch(
+                    name.to_string(),
+                )));
+            }
+            let _ = &old_commit; // (superseded by the txn's own CAS read)
+            return Err(CliError::fatal(format!("branch reset failed: {text}"))
+                .with_stable_code(StableErrorCode::IoWriteFailed));
+        }
+    };
+
+    let reset_output = BranchOutput::Reset {
+        name: branch,
+        old_commit,
+        new_commit,
+        target: args.target,
+    };
+    render_branch_output(&reset_output, output, None, 0, None).await?;
+    if reset_output.mutated_repo_state() {
+        dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_BRANCH).await;
+    }
+    Ok(())
+}
+
+/// `branch diff` (lore.md §1.12): thin sugar over the diff engine — resolve
+/// branch-flavored defaults, then delegate. Tip-to-tip only (the working
+/// tree is never involved), byte-identical output to `libra diff BASE..BRANCH`.
+async fn execute_diff_safe(args: BranchDiffArgs, output: &OutputConfig) -> CliResult<()> {
+    crate::utils::util::require_repo().map_err(|_| CliError::repo_not_found())?;
+
+    // Subject (new side): explicit or the current branch.
+    let subject = match &args.branch {
+        Some(explicit) => explicit.clone(),
+        None => match Head::current().await {
+            Head::Branch(name) => name,
+            Head::Detached(_) => {
+                if args.base.is_some() && args.branch.is_some() {
+                    unreachable!("both sides explicit");
+                }
+                return Err(CliError::from(BranchError::DetachedHead));
+            }
+        },
+    };
+    // Base (old side): explicit or the current branch's upstream.
+    let base = match &args.base {
+        Some(explicit) => explicit.clone(),
+        None => {
+            let current = match Head::current().await {
+                Head::Branch(name) => name,
+                Head::Detached(_) => return Err(CliError::from(BranchError::DetachedHead)),
+            };
+            // Propagate real config-store failures — only a genuine ABSENCE
+            // of tracking config gets the setup hint.
+            let remote = ConfigKv::get(&format!("branch.{current}.remote"))
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read branch.{current}.remote: {error}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .map(|entry| entry.value);
+            let merge = ConfigKv::get(&format!("branch.{current}.merge"))
+                .await
+                .map_err(|error| {
+                    CliError::fatal(format!("failed to read branch.{current}.merge: {error}"))
+                        .with_stable_code(StableErrorCode::IoReadFailed)
+                })?
+                .map(|entry| entry.value);
+            match (remote, merge) {
+                (Some(remote), Some(merge)) => {
+                    let merge_short = merge.strip_prefix("refs/heads/").unwrap_or(&merge);
+                    if remote == "." {
+                        // Git's local-upstream form (branch.<n>.remote = "."):
+                        // the upstream is the LOCAL branch named by merge.
+                        merge_short.to_string()
+                    } else {
+                        format!("{remote}/{merge_short}")
+                    }
+                }
+                _ => {
+                    return Err(CliError::failure(format!(
+                        "there is no tracking information for branch '{current}'"
+                    ))
+                    .with_stable_code(StableErrorCode::CliInvalidTarget)
+                    .with_hint("set one with 'libra branch --set-upstream-to=<remote>/<branch>'")
+                    .with_hint(
+                        "or name the base explicitly: 'libra branch diff <base> [<branch>]'",
+                    ));
+                }
+            }
+        }
+    };
+    // Branch-flavored preflight: convert unknown sides into the branch UX
+    // (with the levenshtein suggestion) BEFORE delegating. On success the
+    // ORIGINAL strings are forwarded (the engine re-resolves identically).
+    for side in [&base, &subject] {
+        if get_target_commit(side).await.is_err() {
+            return Err(CliError::from(branch_not_found_error(side).await));
+        }
+    }
+
+    let mut argv: Vec<String> = vec!["diff".to_string()];
+    if args.merge_base {
+        // Three-dot: reuse the engine's own merge-base computation and
+        // NoMergeBase error. Refnames cannot contain '..', so the glued
+        // form cannot mis-split.
+        argv.push(format!("{base}...{subject}"));
+    } else {
+        // --old/--new route: skips the revision/path ambiguity walk entirely
+        // (a file named like the branch cannot shadow it).
+        argv.push("--old".to_string());
+        argv.push(base);
+        argv.push("--new".to_string());
+        argv.push(subject);
+    }
+    if args.exit_code {
+        argv.push("--exit-code".to_string());
+    }
+    if args.stat {
+        argv.push("--stat".to_string());
+    }
+    if args.name_only {
+        argv.push("--name-only".to_string());
+    }
+    if args.name_status {
+        argv.push("--name-status".to_string());
+    }
+    crate::command::diff_plumbing::push_paths(&mut argv, &args.paths);
+    crate::command::diff_plumbing::delegate_to_diff(argv, output, None).await
+}
+
 pub async fn execute(args: BranchArgs) {
     if let Err(err) = execute_safe(args, &OutputConfig::default()).await {
         err.print_stderr();
@@ -293,13 +718,43 @@ pub async fn execute(args: BranchArgs) {
 /// - All [`BranchError`] variants are mapped to [`CliError`] via the
 ///   `From` impl which sets stable codes and hints.
 pub async fn execute_safe(args: BranchArgs, output: &OutputConfig) -> CliResult<()> {
+    match args.subcommand {
+        Some(BranchSubcommand::Diff(diff_args)) => {
+            return execute_diff_safe(diff_args, output).await;
+        }
+        Some(BranchSubcommand::Reset(reset_args)) => {
+            return execute_reset_safe(reset_args, output).await;
+        }
+        None => {}
+    }
+    // Reserved verb guard: when flags force clap into the positional parse
+    // (`branch -v diff`, `branch --no-column diff main`, …), the `diff` token
+    // lands in `new_branch` — refuse rather than silently create a branch
+    // literally named `diff` (documented; escape hatch: `libra switch -c diff`).
+    if let Some(verb @ ("diff" | "reset")) = args.new_branch.as_deref() {
+        return Err(CliError::command_usage(format!(
+            "`{verb}` is a reserved branch verb here (`libra branch {verb} …`) and branch \
+             flags cannot be combined with it"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)
+        .with_hint(format!(
+            "to create a branch literally named `{verb}`: `libra switch -c {verb}`"
+        )));
+    }
     // Validate the `--column` mode up front so an invalid mode is rejected
     // regardless of output path; the enable decision is recomputed at render.
     if let Some(mode) = args.column.as_deref() {
         super::tag::resolve_column_enabled(mode)?;
     }
     let result = run_branch(&args).await.map_err(CliError::from)?;
-    render_branch_output(&result, output, args.column.as_deref(), args.verbose).await?;
+    render_branch_output(
+        &result,
+        output,
+        args.column.as_deref(),
+        args.verbose,
+        args.format.as_deref(),
+    )
+    .await?;
     if result.mutated_repo_state() {
         dispatch_current_repo_vcs_event_to_history(VCS_EVENT_POST_BRANCH).await;
     }
@@ -325,6 +780,15 @@ enum BranchError {
     #[error("branch '{name}' not found")]
     NotFound { name: String, similar: Vec<String> },
 
+    #[error("branch '{0}' is protected; refusing to reset it")]
+    Protected(String),
+
+    #[error("branch '{0}' is archived; refusing to reset it")]
+    Archived(String),
+
+    #[error("cannot reset branch '{0}': it is currently checked out")]
+    ResetCurrentBranch(String),
+
     #[error("Cannot delete the branch '{0}' which you are currently on")]
     DeleteCurrent(String),
 
@@ -345,6 +809,12 @@ enum BranchError {
 
     #[error("unsupported sort key '{0}'")]
     InvalidSortKey(String),
+
+    #[error("bad config value '{value}' for '{key}' (expected a for-each-ref sort key)")]
+    InvalidSortConfig { key: &'static str, value: String },
+
+    #[error("failed to read config '{key}': {detail}")]
+    SortConfigRead { key: &'static str, detail: String },
 
     #[error("invalid upstream '{0}'")]
     InvalidUpstream(String),
@@ -376,6 +846,12 @@ enum BranchError {
     #[error("failed to load commit {commit}: {detail}")]
     CommitLoadFailed { commit: String, detail: String },
 
+    #[error("no editor configured for --edit-description")]
+    NoEditor,
+
+    #[error("failed to edit branch description: {0}")]
+    EditorFailed(String),
+
     #[error("too many arguments")]
     RenameTooManyArgs,
 
@@ -387,6 +863,31 @@ impl From<BranchError> for CliError {
     fn from(error: BranchError) -> Self {
         match error {
             BranchError::NotInRepo => CliError::repo_not_found(),
+            BranchError::Protected(name) => {
+                CliError::fatal(format!("branch '{name}' is protected; refusing to reset it"))
+                    .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
+                    .with_hint(format!(
+                        "lift it explicitly: 'libra metadata unset --branch {name} protect', \
+                         reset, then re-protect (auditable; there is no --force)"
+                    ))
+            }
+            BranchError::Archived(name) => {
+                CliError::fatal(format!("branch '{name}' is archived; refusing to reset it"))
+                    .with_stable_code(StableErrorCode::PolicyRefUpdateBlocked)
+                    .with_hint(format!(
+                        "unarchive first: 'libra metadata unset --branch {name} archive'"
+                    ))
+            }
+            BranchError::ResetCurrentBranch(name) => {
+                CliError::fatal(format!(
+                    "cannot reset branch '{name}': it is currently checked out"
+                ))
+                .with_stable_code(StableErrorCode::RepoStateInvalid)
+                .with_hint(
+                    "use 'libra reset [--soft|--mixed|--hard] <target>' to move the checked-out \
+                     branch (it updates HEAD, index and worktree consistently)",
+                )
+            }
             BranchError::InvalidName(name) => {
                 CliError::fatal(format!("'{name}' is not a valid branch name"))
                     .with_stable_code(StableErrorCode::CliInvalidArguments)
@@ -442,8 +943,19 @@ impl From<BranchError> for CliError {
             ))
             .with_stable_code(StableErrorCode::CliInvalidArguments)
             .with_hint(
-                "supported keys: refname, -refname, version:refname (v:refname), -version:refname",
+                "supported keys: refname, version:refname (v:refname), committerdate, creatordate, authordate, objectsize, objectname, each reversible with a leading '-'",
             ),
+            BranchError::InvalidSortConfig { key, value } => {
+                CliError::command_usage(format!(
+                    "bad config value '{value}' for '{key}' (expected a for-each-ref sort key)"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint(format!(
+                    "fix the offending value with 'libra config {key} <key>' (e.g. refname, -committerdate, version:refname)"
+                ))
+            }
+            BranchError::SortConfigRead { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::IoReadFailed),
             BranchError::InvalidUpstream(upstream) => {
                 CliError::fatal(format!("invalid upstream '{upstream}'"))
                     .with_stable_code(StableErrorCode::CliInvalidTarget)
@@ -462,6 +974,14 @@ impl From<BranchError> for CliError {
                     .with_stable_code(StableErrorCode::IoWriteFailed)
                     .with_hint("check whether the repository database is writable.")
             }
+            BranchError::NoEditor => CliError::fatal(
+                "no editor configured; set core.editor, $GIT_EDITOR, $VISUAL, or $EDITOR",
+            )
+            .with_stable_code(StableErrorCode::IoReadFailed)
+            .with_hint("configure an editor, e.g. `libra config core.editor vim`"),
+            BranchError::EditorFailed(detail) => CliError::fatal(detail)
+                .with_stable_code(StableErrorCode::IoReadFailed)
+                .with_hint("set core.editor/$GIT_EDITOR to a working editor command"),
             BranchError::StorageQueryFailed(detail) => {
                 CliError::fatal(format!("failed to query branch storage: {detail}"))
                     .with_stable_code(StableErrorCode::IoReadFailed)
@@ -721,6 +1241,86 @@ async fn unset_upstream_impl(branch: &str) -> Result<(), BranchError> {
             .map_err(|e| branch_config_write_error(&key, e))?;
     }
     Ok(())
+}
+
+/// `--edit-description`: open the configured editor seeded with the branch's
+/// current `branch.<name>.description`, then store the cleaned result — or unset
+/// the key when the saved buffer is empty (comment-only). Returns `true` when a
+/// non-empty description was stored, `false` when it was unset.
+async fn edit_description_impl(branch: &str) -> Result<bool, BranchError> {
+    require_existing_local_branch(branch).await?;
+
+    let key = format!("branch.{branch}.description");
+    let current = crate::internal::config::ConfigKv::get(&key)
+        .await
+        .map_err(|e| branch_config_read_error(format!("config '{key}'"), e))?
+        .map(|entry| entry.value)
+        .unwrap_or_default();
+
+    // Seed the editor with the existing description followed by a comment block;
+    // lines starting with '#' are stripped on save (Git convention).
+    let template = format!(
+        "{current}\n\
+         # Please edit the description for the branch:\n\
+         #   {branch}\n\
+         # Lines starting with '#' will be stripped.\n"
+    );
+
+    // An explicitly configured editor runs even without a TTY (so scripted
+    // editors work in tests/automation); `vi` is only assumed on a terminal.
+    let editor_cmd = match crate::command::editor::resolve_editor().await {
+        Some(cmd) => cmd,
+        None if std::io::stdin().is_terminal() => "vi".to_string(),
+        None => return Err(BranchError::NoEditor),
+    };
+
+    let path = crate::utils::util::storage_path().join("BRANCH_DESCRIPTION_EDITMSG");
+    let raw = crate::command::editor::edit_message(&path, &template, &editor_cmd, true)
+        .await
+        .map_err(|e| BranchError::EditorFailed(e.to_string()))?;
+
+    let description = clean_branch_description(&raw);
+    if description.is_empty() {
+        crate::internal::config::ConfigKv::unset_all(&key)
+            .await
+            .map_err(|e| branch_config_write_error(&key, e))?;
+        Ok(false)
+    } else {
+        crate::internal::config::ConfigKv::set(&key, &description, false)
+            .await
+            .map_err(|e| branch_config_write_error(&key, e))?;
+        Ok(true)
+    }
+}
+
+/// Clean an edited branch-description buffer with `git stripspace` semantics
+/// (as `git branch --edit-description` does):
+/// - drop lines whose **first character** is the comment char `#` (an indented
+///   `  # heading` is content and is kept);
+/// - trim trailing whitespace from each line but preserve leading indentation;
+/// - collapse runs of blank lines into a single blank and drop leading/trailing
+///   blank lines.
+fn clean_branch_description(raw: &str) -> String {
+    let mut out: Vec<String> = Vec::new();
+    let mut pending_blank = false;
+    for line in raw.lines() {
+        if line.starts_with('#') {
+            continue;
+        }
+        let trimmed = line.trim_end();
+        if trimmed.is_empty() {
+            // Remember a blank only once we have content, so leading blanks are
+            // dropped and interior runs collapse to a single blank line.
+            pending_blank = !out.is_empty();
+            continue;
+        }
+        if pending_blank {
+            out.push(String::new());
+            pending_blank = false;
+        }
+        out.push(trimmed.to_string());
+    }
+    out.join("\n")
 }
 
 /// Enumerate every branch stored under each known remote.
@@ -996,6 +1596,22 @@ async fn rename_branch_impl(args: &[String]) -> Result<BranchOutput, BranchError
         Head::update(Head::Branch(new_name.clone()), None).await;
     }
 
+    // Move branch metadata (lore.md §1.5) BEFORE deleting the old ref — the
+    // delete's metadata cascade would otherwise wipe the rows being moved.
+    // The destination has no rows (rename onto an existing branch is refused
+    // above), so the defensive dest-clear inside rename_target is a no-op.
+    {
+        let db = get_db_conn_instance().await;
+        crate::internal::metadata::MetadataKv::rename_target_with_conn(
+            &db,
+            crate::internal::metadata::MetadataScope::Branch,
+            &old_name,
+            &new_name,
+        )
+        .await
+        .map_err(|e| branch_config_write_error("branch metadata", e))?;
+    }
+
     Branch::delete_branch_result(&old_name, None)
         .await
         .map_err(map_branch_store_error)?;
@@ -1069,6 +1685,18 @@ async fn copy_branch_impl(args: &[String], force: bool) -> Result<BranchOutput, 
                 .map_err(|e| branch_config_write_error(&dst_key, e))?;
         }
     }
+
+    // Copy branch metadata (lore.md §1.5). A forced copy (-C) replaces any
+    // metadata the overwritten destination carried — destructive by design,
+    // matching the ref overwrite itself.
+    crate::internal::metadata::MetadataKv::copy_target_with_conn(
+        &db,
+        crate::internal::metadata::MetadataScope::Branch,
+        &old_name,
+        &new_name,
+    )
+    .await
+    .map_err(|e| branch_config_write_error("branch metadata", e))?;
 
     Ok(BranchOutput::Copy { old_name, new_name })
 }
@@ -1173,13 +1801,33 @@ async fn collect_branch_output(args: &BranchArgs) -> Result<BranchOutput, Branch
 
     // `--sort` orders the entries here (reflected in both human and JSON
     // output); the renderer then preserves this order instead of applying its
-    // default current-first ordering.
+    // default current-first ordering. Without the flag, the Git-compatible
+    // `branch.sort` config default applies (strict local→global→system
+    // cascade). The config is resolved here — after `has_commit_filters` and
+    // `show_unborn_head` — so a configured sort, unlike the flag, neither
+    // implies `--list` nor suppresses the unborn-HEAD line (Git behavior).
+    let config_sort = if args.sort.is_none() {
+        configured_branch_sort().await?
+    } else {
+        None
+    };
     let sorted = match args.sort.as_deref() {
         Some(key) => {
             sort_branch_entries(&mut entries, key, args.ignore_case)?;
             true
         }
-        None => false,
+        None => match config_sort.as_deref() {
+            Some(key) => {
+                sort_branch_entries(&mut entries, key, args.ignore_case).map_err(|_| {
+                    BranchError::InvalidSortConfig {
+                        key: "branch.sort",
+                        value: key.to_string(),
+                    }
+                })?;
+                true
+            }
+            None => false,
+        },
     };
 
     Ok(BranchOutput::List {
@@ -1250,6 +1898,17 @@ async fn run_branch(args: &BranchArgs) -> Result<BranchOutput, BranchError> {
         };
         unset_upstream_impl(&branch).await?;
         Ok(BranchOutput::UnsetUpstream { branch })
+    } else if let Some(branch) = args.edit_description.as_deref() {
+        let branch = if branch.is_empty() {
+            match Head::current().await {
+                Head::Branch(name) => name,
+                Head::Detached(_) => return Err(detached_head_branch_error()),
+            }
+        } else {
+            branch.to_string()
+        };
+        let set = edit_description_impl(&branch).await?;
+        Ok(BranchOutput::EditDescription { branch, set })
     } else if !args.rename.is_empty() {
         rename_branch_impl(&args.rename).await
     } else if !args.copy.is_empty() {
@@ -1375,6 +2034,7 @@ async fn render_branch_output(
     output: &OutputConfig,
     column: Option<&str>,
     verbose: u8,
+    format: Option<&str>,
 ) -> CliResult<()> {
     if output.is_json() {
         return emit_json_data("branch", result, output);
@@ -1384,6 +2044,18 @@ async fn render_branch_output(
     }
 
     match result {
+        BranchOutput::Reset {
+            name,
+            old_commit,
+            new_commit,
+            ..
+        } => {
+            println!(
+                "Reset branch '{name}' (was {}, now {})",
+                crate::utils::text::short_display_hash(old_commit),
+                crate::utils::text::short_display_hash(new_commit)
+            );
+        }
         BranchOutput::List {
             branches,
             head_name,
@@ -1392,21 +2064,8 @@ async fn render_branch_output(
             ignore_case,
             sorted: presorted,
         } => {
-            if let Some(detached_head) = detached_head {
-                println!(
-                    "HEAD detached at {}",
-                    short_display_hash(detached_head).green()
-                );
-            }
-            if *show_unborn_head && let Some(head_name) = head_name {
-                println!("* {}", head_name.green());
-            }
-            if branches.is_empty() {
-                return Ok(());
-            }
-
-            // `--sort` already ordered the entries; otherwise apply the default
-            // current-first, then name (case-aware) ordering.
+            // Order the entries (shared by `--format` and the default listing):
+            // `--sort` already ordered them; otherwise current-first, then name.
             let mut sorted = branches.clone();
             if !*presorted {
                 sorted.sort_by(|a, b| {
@@ -1420,6 +2079,49 @@ async fn render_branch_output(
                         a.name.cmp(&b.name)
                     }
                 });
+            }
+
+            // `--format`: render each branch via the for-each-ref atom engine,
+            // replacing the default `* name` listing, `-v`, and `--column`. A
+            // remote entry's `plain_name` carries the `<remote>/<branch>` form
+            // (so `plain_name != name`); a local entry's matches its `name`.
+            if let Some(fmt) = format {
+                use std::io::IsTerminal;
+                let color_enabled = match output.color {
+                    crate::utils::output::ColorChoice::Always => true,
+                    crate::utils::output::ColorChoice::Never => false,
+                    crate::utils::output::ColorChoice::Auto => std::io::stdout().is_terminal(),
+                };
+                let refs: Vec<(String, String)> = sorted
+                    .iter()
+                    .map(|b| {
+                        let refname = if b.plain_name == b.name {
+                            format!("refs/heads/{}", b.name)
+                        } else {
+                            format!("refs/remotes/{}", b.plain_name)
+                        };
+                        (refname, b.commit.clone())
+                    })
+                    .collect();
+                let lines =
+                    super::for_each_ref::render_ref_format_lines(&refs, fmt, color_enabled).await?;
+                for line in lines {
+                    println!("{line}");
+                }
+                return Ok(());
+            }
+
+            if let Some(detached_head) = detached_head {
+                println!(
+                    "HEAD detached at {}",
+                    short_display_hash(detached_head).green()
+                );
+            }
+            if *show_unborn_head && let Some(head_name) = head_name {
+                println!("* {}", head_name.green());
+            }
+            if branches.is_empty() {
+                return Ok(());
             }
 
             // `-v` (per-branch sha + subject) takes precedence over `--column`
@@ -1481,6 +2183,13 @@ async fn render_branch_output(
         }
         BranchOutput::UnsetUpstream { branch } => {
             println!("Branch '{branch}' no longer tracks an upstream branch");
+        }
+        BranchOutput::EditDescription { branch, set } => {
+            if *set {
+                println!("Updated description for branch '{branch}'");
+            } else {
+                println!("Removed description for branch '{branch}'");
+            }
         }
         BranchOutput::ShowCurrent {
             name,
@@ -1596,6 +2305,8 @@ pub async fn list_branches(
     commits_no_contains: &[String],
 ) -> CliResult<()> {
     let args = BranchArgs {
+        subcommand: None,
+        no_column: false,
         new_branch: None,
         commit_hash: None,
         list: true,
@@ -1603,6 +2314,7 @@ pub async fn list_branches(
         delete_safe: None,
         set_upstream_to: None,
         unset_upstream: None,
+        edit_description: None,
         show_current: false,
         rename: vec![],
         copy: vec![],
@@ -1616,6 +2328,7 @@ pub async fn list_branches(
         no_merged: None,
         sort: None,
         ignore_case: false,
+        format: None,
         column: None,
         verbose: 0,
     };
@@ -1625,6 +2338,7 @@ pub async fn list_branches(
         &OutputConfig::default(),
         args.column.as_deref(),
         args.verbose,
+        args.format.as_deref(),
     )
     .await
 }
@@ -1690,19 +2404,110 @@ async fn resolve_commits(commits: &[String]) -> Result<HashSet<ObjectHash>, Bran
     Ok(set)
 }
 
-/// Sort branch list entries in place by `--sort` key. Supports `refname` /
-/// `-refname` and `version:refname` / `v:refname` (numeric-aware), with a
+/// Sort branch list entries in place by `--sort` key. Supports `refname`,
+/// `version:refname` / `v:refname` (numeric-aware), `committerdate` /
+/// `creatordate` / `authordate` (the tip commit's date), `objectsize` (the tip
+/// object's byte size), and `objectname` (the tip commit's object id), with a
 /// leading `-` reversing. Unknown keys are a usage error.
+/// Read the Git-compatible `branch.sort` default through the strict
+/// local → global → system cascade (P1-05d). Empty values are rejected by the
+/// caller via [`sort_branch_entries`]'s key validation.
+async fn configured_branch_sort() -> Result<Option<String>, BranchError> {
+    crate::internal::config::read_cascaded_config_value_strict(
+        crate::internal::config::LocalIdentityTarget::CurrentRepo,
+        "branch.sort",
+    )
+    .await
+    .map(|value| value.map(|v| v.trim().to_string()))
+    .map_err(|error| BranchError::SortConfigRead {
+        key: "branch.sort",
+        detail: format!("{error:#}"),
+    })
+}
+
 fn sort_branch_entries(
     entries: &mut [BranchListEntry],
     key: &str,
     ignore_case: bool,
 ) -> Result<(), BranchError> {
+    use std::str::FromStr;
+
     let (base, reverse) = match key.strip_prefix('-') {
         Some(rest) => (rest, true),
         None => (key, false),
     };
-    let ordering = |a: &BranchListEntry, b: &BranchListEntry| -> std::cmp::Ordering {
+
+    // Date keys sort by the tip commit's date: `committerdate`/`creatordate` use
+    // its committer date (for a branch ref to a commit, Git's creatordate is the
+    // committer date), `authordate` its author date. Pre-load the timestamps once
+    // (keyed by tip-commit hash) so the comparator is a cheap lookup; a commit
+    // that fails to load contributes timestamp 0 (sorts oldest) rather than
+    // aborting the listing.
+    let is_date_key = matches!(base, "committerdate" | "creatordate" | "authordate");
+    let use_author_date = base == "authordate";
+    let timestamps: HashMap<String, i64> = if is_date_key {
+        let mut map = HashMap::new();
+        for entry in entries.iter() {
+            if map.contains_key(&entry.commit) {
+                continue;
+            }
+            let ts = ObjectHash::from_str(&entry.commit)
+                .ok()
+                .and_then(|hash| load_object::<Commit>(&hash).ok())
+                .map(|commit| {
+                    if use_author_date {
+                        commit.author.timestamp as i64
+                    } else {
+                        commit.committer.timestamp as i64
+                    }
+                })
+                .unwrap_or(0);
+            map.insert(entry.commit.clone(), ts);
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    // `objectsize` sorts by the tip object's decompressed byte size (Git's
+    // for-each-ref `objectsize`). Pre-loaded like the date keys; an unreadable
+    // object contributes size 0.
+    let sizes: HashMap<String, i64> = if base == "objectsize" {
+        let mut map = HashMap::new();
+        for entry in entries.iter() {
+            if map.contains_key(&entry.commit) {
+                continue;
+            }
+            let size = ObjectHash::from_str(&entry.commit)
+                .ok()
+                .and_then(|hash| crate::utils::util::objects_storage().get(&hash).ok())
+                .map(|data| data.len() as i64)
+                .unwrap_or(0);
+            map.insert(entry.commit.clone(), size);
+        }
+        map
+    } else {
+        HashMap::new()
+    };
+
+    if !matches!(
+        base,
+        "refname"
+            | "version:refname"
+            | "v:refname"
+            | "committerdate"
+            | "creatordate"
+            | "authordate"
+            | "objectsize"
+            | "objectname"
+    ) {
+        return Err(BranchError::InvalidSortKey(base.to_string()));
+    }
+
+    // The PRIMARY key comparison; the refname tie-break is appended afterward so
+    // that `-` reverses only the primary key (Git keeps the refname tie-break
+    // ascending under a reversed sort).
+    let primary = |a: &BranchListEntry, b: &BranchListEntry| -> std::cmp::Ordering {
         match base {
             "refname" => {
                 if ignore_case {
@@ -1714,15 +2519,39 @@ fn sort_branch_entries(
             "version:refname" | "v:refname" => {
                 crate::utils::util::version_refname_cmp(&a.name, &b.name)
             }
+            // Date keys compare the tip commit's committer/author timestamp.
+            "committerdate" | "creatordate" | "authordate" => {
+                let ta = timestamps.get(&a.commit).copied().unwrap_or(0);
+                let tb = timestamps.get(&b.commit).copied().unwrap_or(0);
+                ta.cmp(&tb)
+            }
+            // Object size compares the tip object's byte size.
+            "objectsize" => {
+                let sa = sizes.get(&a.commit).copied().unwrap_or(0);
+                let sb = sizes.get(&b.commit).copied().unwrap_or(0);
+                sa.cmp(&sb)
+            }
+            // `objectname` compares the tip commit's object id. Branch hashes are
+            // equal-length hex, so a lexicographic string compare matches Git's
+            // binary-oid ordering; equal ids fall through to the refname tie-break.
+            "objectname" => a.commit.cmp(&b.commit),
             _ => std::cmp::Ordering::Equal,
         }
     };
-    if !matches!(base, "refname" | "version:refname" | "v:refname") {
-        return Err(BranchError::InvalidSortKey(base.to_string()));
-    }
+    // `refname`/`version:refname` ARE the name, so reversing them flips the whole
+    // order; the date/size keys reverse only the primary and keep the refname
+    // tie-break ascending (matching Git's for-each-ref).
+    let name_is_primary = matches!(base, "refname" | "version:refname" | "v:refname");
     entries.sort_by(|a, b| {
-        let ord = ordering(a, b);
-        if reverse { ord.reverse() } else { ord }
+        let mut ord = primary(a, b);
+        if reverse {
+            ord = ord.reverse();
+        }
+        if name_is_primary {
+            ord
+        } else {
+            ord.then_with(|| a.name.cmp(&b.name))
+        }
     });
     Ok(())
 }
@@ -1820,18 +2649,56 @@ pub fn is_valid_git_branch_name(name: &str) -> bool {
 mod tests {
     use std::{collections::HashSet, path::PathBuf, str::FromStr};
 
+    use clap::Parser;
     use git_internal::hash::{ObjectHash, get_hash_kind};
     use sea_orm::Database;
     use serial_test::serial;
 
     use super::{
-        Branch, BranchError, commit_contains, format_branch_name, load_remote_branches_with_conn,
-        map_head_commit_store_error,
+        Branch, BranchArgs, BranchError, clean_branch_description, commit_contains,
+        format_branch_name, load_remote_branches_with_conn, map_head_commit_store_error,
     };
     use crate::utils::{
         error::{CliError, StableErrorCode},
         test,
     };
+
+    #[test]
+    fn clean_branch_description_uses_stripspace_semantics() {
+        // Lines whose FIRST char is `#` are dropped; surrounding blanks removed.
+        assert_eq!(
+            clean_branch_description("my feature\n# a comment\n"),
+            "my feature"
+        );
+        // A comment-only / blank buffer collapses to empty (which unsets the key).
+        assert_eq!(
+            clean_branch_description("# Please edit\n#   branch\n\n  \n"),
+            ""
+        );
+        // An INDENTED `#` line is content (only a first-char `#` is a comment)
+        // and its leading indentation is preserved; trailing whitespace per line
+        // is trimmed; runs of blank lines collapse to one; leading/trailing
+        // blanks are dropped.
+        assert_eq!(
+            clean_branch_description(
+                "\n\n  keep me   \n  # indented heading\n\n\nlast\t\n# real comment\n\n"
+            ),
+            "  keep me\n  # indented heading\n\nlast"
+        );
+    }
+
+    #[test]
+    fn edit_description_flag_parses_optional_branch() {
+        // Bare flag defaults to "" (the current branch).
+        let args = BranchArgs::try_parse_from(["branch", "--edit-description"]).unwrap();
+        assert_eq!(args.edit_description.as_deref(), Some(""));
+        // An explicit branch name is captured.
+        let args = BranchArgs::try_parse_from(["branch", "--edit-description", "feature"]).unwrap();
+        assert_eq!(args.edit_description.as_deref(), Some("feature"));
+        // Absent when not requested.
+        let args = BranchArgs::try_parse_from(["branch"]).unwrap();
+        assert_eq!(args.edit_description, None);
+    }
 
     struct ColorOverrideReset;
 

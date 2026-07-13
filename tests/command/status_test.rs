@@ -226,6 +226,9 @@ async fn test_changes_to_be_staged() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -364,6 +367,9 @@ async fn test_status_porcelain() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -380,6 +386,9 @@ async fn test_status_porcelain() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     file2.write_all(b"modified content").unwrap();
@@ -520,6 +529,9 @@ async fn test_status_short_format() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -536,6 +548,9 @@ async fn test_status_short_format() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -633,6 +648,9 @@ async fn test_status_porcelain_v2_basic() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     file1.write_all(b" more").unwrap(); // unstaged modification
@@ -713,6 +731,9 @@ async fn test_status_porcelain_v2_branch_metadata_includes_upstream_counts() {
 
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         },
         &libra::utils::output::OutputConfig::default(),
     )
@@ -786,6 +807,9 @@ async fn test_status_porcelain_v2_untracked_files_no() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -799,7 +823,7 @@ async fn test_status_porcelain_v2_untracked_files_no() {
         StatusArgs {
             porcelain: Some(PorcelainVersion::V2),
             ignored: true,
-            untracked_files: UntrackedFiles::No,
+            untracked_files: Some(UntrackedFiles::No),
             ..Default::default()
         },
         &mut output,
@@ -846,6 +870,9 @@ async fn test_status_porcelain_v2_untracked_files_all() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -856,7 +883,7 @@ async fn test_status_porcelain_v2_untracked_files_all() {
     status_execute(
         StatusArgs {
             porcelain: Some(PorcelainVersion::V2),
-            untracked_files: UntrackedFiles::All,
+            untracked_files: Some(UntrackedFiles::All),
             ..Default::default()
         },
         &mut output,
@@ -898,6 +925,9 @@ async fn test_status_untracked_files_no() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -911,7 +941,7 @@ async fn test_status_untracked_files_no() {
         StatusArgs {
             porcelain: Some(PorcelainVersion::V1),
             ignored: true,
-            untracked_files: UntrackedFiles::No,
+            untracked_files: Some(UntrackedFiles::No),
             ..Default::default()
         },
         &mut output,
@@ -933,6 +963,153 @@ async fn test_status_untracked_files_no() {
         !output_str.contains("!! ignored.txt"),
         "ignored files should be hidden when --untracked-files=no even with --ignored: {}",
         output_str
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_status_untracked_files_no_skips_untracked_directory_scan() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    fs::create_dir_all("artifacts/deep").unwrap();
+    fs::write("artifacts/deep/blob.bin", "untracked build output").unwrap();
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut output = Vec::new();
+    let result = status_execute_inner(
+        StatusArgs {
+            short: true,
+            untracked_files: Some(UntrackedFiles::No),
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await;
+
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o700)).unwrap();
+    result.expect("status -uno should not scan hidden untracked directories");
+    let output_str = String::from_utf8(output).unwrap();
+    assert!(
+        !output_str.contains("artifacts"),
+        "status -uno should hide untracked directories: {output_str}"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_status_normal_reports_untracked_directory_without_descending() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    fs::create_dir_all("artifacts/deep").unwrap();
+    fs::write("artifacts/deep/blob.bin", "untracked build output").unwrap();
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o000)).unwrap();
+
+    let mut output = Vec::new();
+    let result = status_execute_inner(
+        StatusArgs {
+            short: true,
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await;
+
+    fs::set_permissions("artifacts", fs::Permissions::from_mode(0o700)).unwrap();
+    result.expect("status -s should report a top-level untracked directory without reading it");
+    let output_str = String::from_utf8(output).unwrap();
+    assert!(
+        output_str.lines().any(|line| line == "?? artifacts/"),
+        "status -s should report the untracked directory itself: {output_str}"
+    );
+}
+
+/// Regression (2026-07-05): the no-descend directory marker must follow
+/// git semantics — an untracked directory whose entire contents are
+/// skip-listed (`.libra`/`.git`) or ignored holds no visible untracked
+/// file and must not be reported at all. Pre-fix, `?? dir/` appeared for
+/// directories containing only a nested `.libra` (e.g. test harnesses'
+/// `.libra-test-home/`), breaking every clean-tree assertion downstream.
+#[tokio::test]
+#[serial]
+async fn test_status_hides_untracked_directory_with_only_skiplisted_content() {
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    // Only skip-listed / empty contents: a nested `.libra` with a file,
+    // a nested `.git`, and an empty subdirectory.
+    fs::create_dir_all("fake-home/.libra/vault-keys").unwrap();
+    fs::write("fake-home/.libra/vault-keys/key", "opaque").unwrap();
+    fs::create_dir_all("fake-home/.git").unwrap();
+    fs::write("fake-home/.git/config", "x").unwrap();
+    fs::create_dir_all("fake-home/.config").unwrap();
+    // Control: a sibling with one real untracked file IS reported.
+    fs::create_dir_all("real-dir").unwrap();
+    fs::write("real-dir/file.txt", "visible").unwrap();
+
+    let mut output = Vec::new();
+    status_execute_inner(
+        StatusArgs {
+            short: true,
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await
+    .expect("status -s");
+    let output_str = String::from_utf8(output).unwrap();
+    assert!(
+        !output_str.contains("fake-home"),
+        "directory with only skip-listed content must stay invisible: {output_str}"
+    );
+    assert!(
+        output_str.lines().any(|line| line == "?? real-dir/"),
+        "directory with a visible untracked file is still reported: {output_str}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_status_normal_untracked_directories_are_sorted() {
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+
+    fs::create_dir_all("zeta").unwrap();
+    fs::write("zeta/file.txt", "z").unwrap();
+    fs::create_dir_all("alpha").unwrap();
+    fs::write("alpha/file.txt", "a").unwrap();
+
+    let mut output = Vec::new();
+    status_execute(
+        StatusArgs {
+            untracked_files: Some(UntrackedFiles::Normal),
+            ..Default::default()
+        },
+        &mut output,
+    )
+    .await;
+
+    let output_str = String::from_utf8(output).unwrap().replace("\\", "/");
+    let alpha = output_str
+        .find("\talpha/")
+        .expect("normal status should list alpha/ as a collapsed directory");
+    let zeta = output_str
+        .find("\tzeta/")
+        .expect("normal status should list zeta/ as a collapsed directory");
+    assert!(
+        alpha < zeta,
+        "normal status should sort collapsed untracked directories: {output_str}"
     );
 }
 
@@ -958,6 +1135,9 @@ async fn test_status_untracked_files_all() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -968,7 +1148,7 @@ async fn test_status_untracked_files_all() {
     status_execute(
         StatusArgs {
             porcelain: Some(PorcelainVersion::V1),
-            untracked_files: UntrackedFiles::All,
+            untracked_files: Some(UntrackedFiles::All),
             ..Default::default()
         },
         &mut output,
@@ -1044,6 +1224,9 @@ async fn test_status_mixed_changes() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1110,6 +1293,9 @@ async fn test_status_deleted_files() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1181,6 +1367,9 @@ async fn test_status_with_subdirectories() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1188,7 +1377,7 @@ async fn test_status_with_subdirectories() {
     let mut output = Vec::new();
     status_execute(
         StatusArgs {
-            untracked_files: UntrackedFiles::All,
+            untracked_files: Some(UntrackedFiles::All),
             ..Default::default()
         },
         &mut output,
@@ -1211,7 +1400,7 @@ async fn test_status_with_subdirectories() {
     let mut output = Vec::new();
     status_execute(
         StatusArgs {
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             ..Default::default()
         },
         &mut output,
@@ -1269,6 +1458,9 @@ async fn test_status_verbose_output() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1325,6 +1517,9 @@ async fn test_status_short_format_with_branch() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1347,7 +1542,7 @@ async fn test_status_short_format_with_branch() {
             branch: true,
             show_stash: false,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1391,6 +1586,9 @@ async fn test_status_porcelain_format_with_branch() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1413,7 +1611,7 @@ async fn test_status_porcelain_format_with_branch() {
             branch: true,
             show_stash: false,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1457,6 +1655,9 @@ async fn test_status_show_stash_with_existing_stash() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1481,14 +1682,19 @@ async fn test_status_show_stash_with_existing_stash() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
     stash::execute(Stash::Push {
         message: Some("test stash".to_string()),
         include_untracked: false,
+        no_include_untracked: false,
         all: false,
         keep_index: false,
+        pathspec: Vec::new(),
     })
     .await;
 
@@ -1501,7 +1707,7 @@ async fn test_status_show_stash_with_existing_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1529,7 +1735,7 @@ async fn test_status_show_stash_with_existing_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1557,7 +1763,7 @@ async fn test_status_show_stash_with_existing_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1601,6 +1807,9 @@ async fn test_status_show_stash_without_stash() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1615,7 +1824,7 @@ async fn test_status_show_stash_without_stash() {
             branch: false,
             show_stash: true,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1658,6 +1867,9 @@ async fn test_status_branch_detached_head() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1682,6 +1894,9 @@ async fn test_status_branch_detached_head() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1689,6 +1904,7 @@ async fn test_status_branch_detached_head() {
 
     // checkout the first commit to enter the detached state
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some(current_commit.to_string()),
         create: None,
         force_create: None,
@@ -1710,7 +1926,7 @@ async fn test_status_branch_detached_head() {
             branch: true,
             show_stash: false,
             ignored: false,
-            untracked_files: UntrackedFiles::Normal,
+            untracked_files: Some(UntrackedFiles::Normal),
             exit_code: false,
             ..Default::default()
         },
@@ -1753,6 +1969,9 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(create_commit_args("Initial commit")).await;
@@ -1771,6 +1990,9 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1788,6 +2010,9 @@ async fn test_status_porcelain_v2_file_modes_and_hashes() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1913,6 +2138,9 @@ async fn test_status_porcelain_v2_executable_file() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -1979,6 +2207,9 @@ async fn test_status_porcelain_v2_deleted_file() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(create_commit_args("Initial commit")).await;
@@ -2066,6 +2297,9 @@ async fn test_status_after_add() {
         ignore_errors: false,
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -2559,4 +2793,111 @@ fn test_status_long_selects_default_and_conflicts() {
         !conflict_porcelain.status.success(),
         "--long --porcelain conflicts"
     );
+}
+
+#[test]
+fn status_no_column_countermands_column() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let p = temp.path();
+    assert!(run_libra_command(&["init"], p).status.success());
+    std::fs::write(p.join("f.txt"), "x\n").unwrap();
+
+    // `--no-column` alone is accepted (status is not columnar by default).
+    let out = run_libra_command(&["status", "--no-column"], p);
+    assert!(
+        out.status.success(),
+        "status --no-column: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--column --no-column` (last wins) is accepted: `--no-column` countermands
+    // `--column` via clap's symmetric override, so there is no conflict error.
+    let out2 = run_libra_command(&["status", "--column", "--no-column"], p);
+    assert!(
+        out2.status.success(),
+        "status --column --no-column (override): {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+}
+
+/// `-u`/`--untracked-files` parses like Git: bare = `all`, attached values
+/// (`-uno`, `-uall`, `-unormal`, `--untracked-files=no`) select the mode, and
+/// the default (absent) is `normal`.
+#[test]
+fn untracked_files_short_flag_parses_like_git() {
+    use clap::Parser;
+
+    let mode = |args: &[&str]| -> Option<UntrackedFiles> {
+        StatusArgs::try_parse_from(args)
+            .unwrap_or_else(|e| panic!("parse {args:?} failed: {e}"))
+            .untracked_files
+    };
+
+    assert_eq!(
+        mode(&["status"]),
+        None,
+        "absent flag leaves the mode to the status.showUntrackedFiles default"
+    );
+    assert_eq!(
+        mode(&["status", "-u"]),
+        Some(UntrackedFiles::All),
+        "bare -u is all"
+    );
+    assert_eq!(
+        mode(&["status", "--untracked-files"]),
+        Some(UntrackedFiles::All),
+        "bare --untracked-files is all"
+    );
+    assert_eq!(mode(&["status", "-uno"]), Some(UntrackedFiles::No));
+    assert_eq!(mode(&["status", "-uall"]), Some(UntrackedFiles::All));
+    assert_eq!(mode(&["status", "-unormal"]), Some(UntrackedFiles::Normal));
+    assert_eq!(
+        mode(&["status", "--untracked-files=no"]),
+        Some(UntrackedFiles::No)
+    );
+}
+
+/// P1-05d: the `/api/repo/status` envelope honors the same resolved
+/// `status.*` defaults (and fail-closed validation) as `status --json`.
+#[tokio::test]
+#[serial]
+async fn api_status_envelope_honors_status_config_defaults() {
+    use libra::internal::config::ConfigKv;
+
+    let test_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(test_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(test_dir.path());
+    fs::write("untracked.txt", "x").unwrap();
+
+    let envelope = libra::command::status::collect_status_json_envelope_for_api(test_dir.path())
+        .await
+        .expect("api status succeeds");
+    let untracked = envelope["data"]["untracked"]
+        .as_array()
+        .expect("untracked array")
+        .len();
+    assert!(untracked > 0, "untracked file expected by default");
+
+    ConfigKv::set("status.showUntrackedFiles", "no", false)
+        .await
+        .expect("set config");
+    let envelope = libra::command::status::collect_status_json_envelope_for_api(test_dir.path())
+        .await
+        .expect("api status succeeds with config");
+    assert_eq!(
+        envelope["data"]["untracked"]
+            .as_array()
+            .expect("untracked array")
+            .len(),
+        0,
+        "the API must honor status.showUntrackedFiles=no like the CLI"
+    );
+
+    ConfigKv::set("status.showUntrackedFiles", "sometimes", false)
+        .await
+        .expect("set config");
+    let error = libra::command::status::collect_status_json_envelope_for_api(test_dir.path())
+        .await
+        .expect_err("invalid config must fail closed in the API too");
+    assert!(error.to_string().contains("status.showUntrackedFiles"));
 }

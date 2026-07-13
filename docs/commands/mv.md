@@ -71,6 +71,17 @@ If every source is skipped, the command exits successfully without changing the 
 
 Accepted for Git CLI compatibility. Libra has no sparse-checkout cone state, so the flag does not change move planning, filesystem writes, index updates, or structured output.
 
+## Case-only renames (lore.md 1.14)
+
+`libra mv Foo foo` is a first-class case-only rename: on a case-insensitive
+filesystem the destination resolves to the source itself (same inode), which
+libra detects (device+inode) and renames in place — no `--force` needed, and
+the force-remove branch (which would have deleted the file's only copy) is
+bypassed. Directories work too (`mv Dir dir` renames instead of nesting).
+Related: `core.casehandling` (`error` default / `warn` / `allow`) governs
+implicit case collisions in `add`/`checkout`/`switch`; `core.ignorecase` is
+probed and recorded truthfully at `init` on every platform.
+
 ## Common Commands
 
 ```bash
@@ -134,7 +145,8 @@ warnings and errors on stderr.
 - `--machine` writes the same schema as compact single-line JSON
 - `stderr` stays clean on success
 - dry-run output reports the planned move pairs without changing the filesystem or index
-- `-k` reports only the source candidates that are actually planned or moved
+- `moves` / `index_updates` list only the source candidates that are actually planned or moved
+- `-k` / `--skip-errors` adds a `skipped` array — one `{ "source", "reason" }` entry per source it dropped (e.g. a missing or untracked source). The field is omitted when nothing was skipped. Human mode stays silent on skips (matching Git's `mv -k`); the detail is JSON-only.
 - `--sparse` is a no-op and does not add a `sparse` field
 
 Example:
@@ -185,6 +197,38 @@ Dry-run:
     "dry_run": true,
     "forced": false,
     "verbose": false
+  }
+}
+```
+
+Skipped sources (`-k` / `--skip-errors`):
+
+```json
+{
+  "ok": true,
+  "command": "mv",
+  "data": {
+    "moves": [
+      {
+        "source": "tracked.rs",
+        "destination": "src/tracked.rs"
+      }
+    ],
+    "index_updates": [
+      {
+        "source": "tracked.rs",
+        "destination": "src/tracked.rs"
+      }
+    ],
+    "dry_run": false,
+    "forced": false,
+    "verbose": false,
+    "skipped": [
+      {
+        "source": "missing.rs",
+        "reason": "bad source, source=missing.rs, destination=src"
+      }
+    ]
   }
 }
 ```

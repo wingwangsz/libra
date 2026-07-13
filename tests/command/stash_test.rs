@@ -10,7 +10,7 @@ use libra::{
         commit::{self, CommitArgs},
     },
     internal::branch::Branch,
-    utils::test::ChangeDirGuard,
+    utils::{error::StableErrorCode, test::ChangeDirGuard},
 };
 use serial_test::serial;
 use tempfile::tempdir;
@@ -24,6 +24,12 @@ fn latest_stash_commit(repo: &Path) -> Commit {
     let stash_hash =
         ObjectHash::from_str(stash_ref.trim()).expect("refs/stash must contain a valid object id");
     load_object::<Commit>(&stash_hash).expect("failed to load latest stash commit")
+}
+
+fn status_short(repo: &Path) -> String {
+    let output = run_libra_command(&["status", "--short"], repo);
+    assert_cli_success(&output, "status --short");
+    String::from_utf8(output.stdout).expect("status --short output should be UTF-8")
 }
 
 #[test]
@@ -60,6 +66,9 @@ async fn test_stash_push_no_changes() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -108,6 +117,9 @@ async fn test_stash_push_no_changes_json_output() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -157,6 +169,9 @@ async fn test_stash_push_and_pop() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -237,6 +252,9 @@ async fn test_stash_push_and_pop_preserves_dotfiles() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -293,6 +311,108 @@ async fn test_stash_push_and_pop_preserves_dotfiles() {
     );
 }
 
+#[test]
+fn test_stash_pop_restores_unstaged_change_without_staging() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a tracked file has only a working-tree edit.
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: the edit is back in the working tree but remains unstaged, matching
+    // Git's default `stash pop` behavior.
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_restores_staged_only_change_as_unstaged_by_default() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a tracked file has only a staged edit.
+    fs::write(p.join("tracked.txt"), "staged version\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage tracked file",
+    );
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: default pop restores the content as an unstaged working-tree edit.
+    assert_eq!(
+        fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "staged version\n"
+    );
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_restores_mixed_file_as_unstaged_worktree_content() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a file has both staged content and a newer working-tree edit.
+    fs::write(p.join("tracked.txt"), "staged version\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "tracked.txt"], p),
+        "stage tracked file",
+    );
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+
+    // When: the stash is popped without --index support.
+    assert_cli_success(&run_libra_command(&["stash", "pop"], p), "stash pop");
+
+    // Then: the working-tree content wins, but the index remains at HEAD.
+    assert_eq!(
+        fs::read_to_string(p.join("tracked.txt")).unwrap(),
+        "worktree version\n"
+    );
+    assert_eq!(status_short(p), " M tracked.txt\n");
+}
+
+#[test]
+fn test_stash_pop_reports_index_load_failure_without_dropping_stash() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Given: a valid stash exists, then the on-disk index becomes unreadable.
+    fs::write(p.join("tracked.txt"), "worktree version\n").unwrap();
+    assert_cli_success(&run_libra_command(&["stash", "push"], p), "stash push");
+    fs::write(p.join(".libra").join("index"), b"garb").unwrap();
+
+    // When: default pop tries to build the current-worktree side of the merge.
+    let output = run_libra_command(&["stash", "pop"], p);
+
+    // Then: the index load failure is reported instead of treating the index as
+    // empty, and pop leaves the stash entry in place.
+    assert_eq!(output.status.code(), Some(128));
+    let (human, report) = parse_cli_error_stderr(&output.stderr);
+    assert!(
+        human.contains("failed to load index"),
+        "unexpected human stderr: {human}"
+    );
+    assert_eq!(report.error_code, StableErrorCode::IoReadFailed.as_str());
+    assert!(
+        report.message.contains("failed to load index"),
+        "unexpected JSON message: {}",
+        report.message
+    );
+
+    let list = run_libra_command(&["stash", "list"], p);
+    assert_cli_success(&list, "stash list after failed pop");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains("stash@{0}:"),
+        "failed pop must keep the stash entry"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_stash_list() {
@@ -314,6 +434,9 @@ async fn test_stash_list() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -438,6 +561,9 @@ async fn test_stash_drop() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -502,6 +628,9 @@ async fn test_stash_drop_missing_reflog_returns_no_stash_found() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -562,6 +691,9 @@ async fn test_stash_json_output() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -940,6 +1072,60 @@ fn test_stash_show_reports_modified_file() {
     );
 }
 
+/// `stash show -p` emits a git-style unified diff of the stashed changes (and
+/// the `--json` envelope carries the diff in an additive `patch` field), while a
+/// plain `stash show` omits the `patch` field entirely.
+#[test]
+fn test_stash_show_patch_emits_unified_diff() {
+    let repo = create_committed_repo_via_cli();
+
+    fs::write(repo.path().join("tracked.txt"), "first line\nsecond line\n")
+        .expect("failed to modify tracked file");
+    assert_cli_success(
+        &run_libra_command(&["stash", "push"], repo.path()),
+        "stash push before show -p",
+    );
+
+    // Human `-p`: a unified diff with the git header + hunk for the change.
+    let human = run_libra_command(&["stash", "show", "-p"], repo.path());
+    assert_cli_success(&human, "stash show -p");
+    let patch = String::from_utf8_lossy(&human.stdout);
+    assert!(
+        patch.contains("diff --git a/tracked.txt b/tracked.txt"),
+        "expected a git diff header: {patch}"
+    );
+    assert!(patch.contains("@@"), "expected a hunk header: {patch}");
+    assert!(
+        patch.contains("+first line"),
+        "expected the added line in the diff: {patch}"
+    );
+    // `-p` replaces the file-level summary footer.
+    assert!(
+        !patch.contains("files changed,"),
+        "`-p` should not print the summary footer: {patch}"
+    );
+
+    // JSON `-p`: the `patch` field is present and holds the same diff.
+    let json_out = run_libra_command(&["--json", "stash", "show", "-p"], repo.path());
+    assert_cli_success(&json_out, "stash show -p --json");
+    let json = parse_json_stdout(&json_out);
+    assert_eq!(json["data"]["action"], "show");
+    assert!(
+        json["data"]["patch"]
+            .as_str()
+            .is_some_and(|p| p.contains("diff --git")),
+        "JSON patch field should hold the unified diff"
+    );
+
+    // Without `-p`, the additive `patch` field is absent (back-compatible).
+    let plain = run_libra_command(&["--json", "stash", "show"], repo.path());
+    assert_cli_success(&plain, "stash show --json");
+    assert!(
+        parse_json_stdout(&plain)["data"].get("patch").is_none(),
+        "plain stash show must not include the patch field"
+    );
+}
+
 /// `stash show --name-only` in human mode prints only the file path,
 /// without the "files changed" footer.
 #[test]
@@ -1154,4 +1340,366 @@ fn stash_push_dash_k_is_keep_index_alias() {
         String::from_utf8_lossy(&status.stdout).contains("k.txt"),
         "the staged file remains tracked after stash push -k"
     );
+}
+
+#[test]
+fn stash_no_include_untracked_countermands_u() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("tracked.txt"), "modified\n").unwrap();
+    std::fs::write(p.join("untracked.txt"), "new\n").unwrap();
+
+    // `-u --no-include-untracked` (last wins) countermands `-u`, so the untracked
+    // file is NOT stashed and remains in the working tree.
+    let out = run_libra_command(&["stash", "push", "-u", "--no-include-untracked"], p);
+    assert_cli_success(&out, "stash push -u --no-include-untracked");
+    assert!(
+        p.join("untracked.txt").exists(),
+        "untracked.txt not stashed (--no-include-untracked countermands -u)"
+    );
+}
+
+/// `stash push <pathspec>` stashes ONLY the matched path: the path is reset to
+/// HEAD while every other change stays in the working tree, and `pop` restores
+/// the stashed change while preserving a further edit made to the untouched
+/// path (exercising the working-tree-as-ours apply).
+#[tokio::test]
+#[serial]
+async fn test_stash_push_pathspec_stashes_only_matched() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    fs::write(p.join("b.txt"), "B0\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "a.txt", "b.txt"], p)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+    fs::write(p.join("b.txt"), "B1\n").unwrap();
+
+    let out = run_libra_command(&["stash", "push", "a.txt"], p);
+    assert!(
+        out.status.success(),
+        "stash push a.txt: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A0\n",
+        "matched path reset to HEAD"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("b.txt")).unwrap(),
+        "B1\n",
+        "unmatched path keeps its change"
+    );
+
+    // Edit the unmatched path further before popping.
+    fs::write(p.join("b.txt"), "B2\n").unwrap();
+
+    let out = run_libra_command(&["stash", "pop"], p);
+    assert!(
+        out.status.success(),
+        "stash pop: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A1\n",
+        "matched path restored on pop"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("b.txt")).unwrap(),
+        "B2\n",
+        "later edit to the unmatched path is preserved"
+    );
+}
+
+/// A directory pathspec selects every changed file beneath it; files outside the
+/// directory are left dirty.
+#[tokio::test]
+#[serial]
+async fn test_stash_push_pathspec_directory() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::create_dir_all(p.join("sub")).unwrap();
+    fs::write(p.join("sub/x.txt"), "X0\n").unwrap();
+    fs::write(p.join("top.txt"), "T0\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "sub/x.txt", "top.txt"], p)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+
+    fs::write(p.join("sub/x.txt"), "X1\n").unwrap();
+    fs::write(p.join("top.txt"), "T1\n").unwrap();
+
+    let out = run_libra_command(&["stash", "push", "sub"], p);
+    assert!(
+        out.status.success(),
+        "stash push sub: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("sub/x.txt")).unwrap(),
+        "X0\n",
+        "file under the directory pathspec is reset"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("top.txt")).unwrap(),
+        "T1\n",
+        "file outside the directory keeps its change"
+    );
+
+    assert!(run_libra_command(&["stash", "pop"], p).status.success());
+    assert_eq!(fs::read_to_string(p.join("sub/x.txt")).unwrap(), "X1\n");
+}
+
+/// A pathspec that matches no tracked path is a usage error (exit 128,
+/// `LBR-...` invalid-target), not an internal-invariant panic.
+#[tokio::test]
+#[serial]
+async fn test_stash_push_pathspec_no_match_errors() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], p).status.success());
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+
+    let out = run_libra_command(&["stash", "push", "nonexistent.txt"], p);
+    assert_eq!(out.status.code(), Some(129), "no-match pathspec exits 129");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("did not match"),
+        "expected a pathspec-no-match message: {stderr}"
+    );
+    // The working tree is untouched after the rejected push.
+    assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "A1\n");
+}
+
+/// Regression for the working-tree-as-ours apply: a FULL `stash push` followed
+/// by an unrelated edit then `pop` must preserve that unrelated edit rather than
+/// silently reverting it to HEAD.
+#[tokio::test]
+#[serial]
+async fn test_stash_pop_preserves_unrelated_uncommitted_change() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    fs::write(p.join("b.txt"), "B0\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "a.txt", "b.txt"], p)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+
+    // Stash only a.txt's change (full stash, since b is unchanged here).
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+    assert!(run_libra_command(&["stash", "push"], p).status.success());
+
+    // Now make an unrelated change to b.txt, then pop.
+    fs::write(p.join("b.txt"), "B-new\n").unwrap();
+    assert!(run_libra_command(&["stash", "pop"], p).status.success());
+
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A1\n",
+        "stashed change restored"
+    );
+    assert_eq!(
+        fs::read_to_string(p.join("b.txt")).unwrap(),
+        "B-new\n",
+        "unrelated uncommitted change preserved across pop"
+    );
+}
+
+/// Regression for the deletion-resurrection bug: after stashing a change and
+/// then DELETING an unrelated tracked file, `pop` must keep the deletion rather
+/// than silently resurrecting the file from the stash snapshot.
+#[tokio::test]
+#[serial]
+async fn test_stash_pop_preserves_unrelated_deletion() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    fs::write(p.join("b.txt"), "B0\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "a.txt", "b.txt"], p)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+
+    // Stash a change to a.txt (full stash; b is unchanged).
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+    assert!(run_libra_command(&["stash", "push"], p).status.success());
+
+    // Delete the unrelated file, then pop.
+    fs::remove_file(p.join("b.txt")).unwrap();
+    assert!(run_libra_command(&["stash", "pop"], p).status.success());
+
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A1\n",
+        "stashed change restored"
+    );
+    assert!(
+        !p.join("b.txt").exists(),
+        "the unrelated deletion must NOT be resurrected by pop"
+    );
+}
+
+/// A staged-only change (index differs from HEAD while the working tree matches
+/// HEAD) is still stashed by a pathspec push — the no-op check must consider the
+/// index overlay, not only the working tree.
+#[tokio::test]
+#[serial]
+async fn test_stash_push_pathspec_stashes_staged_only_change() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], p).status.success());
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+
+    // Stage A1, then restore the WORKING TREE to A0: index=A1, worktree=A0=HEAD.
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], p).status.success());
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+
+    let out = run_libra_command(&["stash", "push", "a.txt"], p);
+    assert!(
+        out.status.success(),
+        "staged-only change should be stashed, not a no-op: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("No local changes"),
+        "must not report a no-op for a staged-only change"
+    );
+    // The path is reset to HEAD after the push...
+    assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "A0\n");
+    // ...and `pop` restores the staged-only change to the working tree, rather
+    // than dropping it (Libra has no `--index`, so it is restored losslessly).
+    assert!(run_libra_command(&["stash", "pop"], p).status.success());
+    assert_eq!(
+        fs::read_to_string(p.join("a.txt")).unwrap(),
+        "A1\n",
+        "staged-only change is restored on pop, not lost"
+    );
+}
+
+/// `stash push -- .` (the root pathspec) selects every tracked change.
+#[tokio::test]
+#[serial]
+async fn test_stash_push_pathspec_dot_matches_all() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    fs::write(p.join("b.txt"), "B0\n").unwrap();
+    assert!(
+        run_libra_command(&["add", "a.txt", "b.txt"], p)
+            .status
+            .success()
+    );
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+    fs::write(p.join("b.txt"), "B1\n").unwrap();
+
+    let out = run_libra_command(&["stash", "push", "."], p);
+    assert!(
+        out.status.success(),
+        "stash push . : {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "A0\n");
+    assert_eq!(fs::read_to_string(p.join("b.txt")).unwrap(), "B0\n");
+    assert!(run_libra_command(&["stash", "pop"], p).status.success());
+    assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "A1\n");
+    assert_eq!(fs::read_to_string(p.join("b.txt")).unwrap(), "B1\n");
+}
+
+/// `-u`/`-a`/`-k` combined with a pathspec are rejected (exit 129) rather than
+/// silently ignored.
+#[tokio::test]
+#[serial]
+async fn test_stash_push_pathspec_rejects_options() {
+    let temp = tempdir().unwrap();
+    test::setup_with_new_libra_in(temp.path()).await;
+    let p = temp.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    fs::write(p.join("a.txt"), "A0\n").unwrap();
+    assert!(run_libra_command(&["add", "a.txt"], p).status.success());
+    assert!(
+        run_libra_command(&["commit", "-m", "base", "--no-verify"], p)
+            .status
+            .success()
+    );
+    fs::write(p.join("a.txt"), "A1\n").unwrap();
+
+    for opt in ["-u", "-a", "-k"] {
+        let out = run_libra_command(&["stash", "push", opt, "a.txt"], p);
+        assert_eq!(
+            out.status.code(),
+            Some(129),
+            "stash push {opt} -- pathspec must be rejected with exit 129"
+        );
+        // The working tree is left untouched by the rejected push.
+        assert_eq!(fs::read_to_string(p.join("a.txt")).unwrap(), "A1\n");
+    }
 }

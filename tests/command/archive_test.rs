@@ -125,6 +125,74 @@ fn archive_pathspec_limits_tar_entries_to_matching_file() {
 }
 
 #[test]
+fn archive_add_file_includes_untracked_working_tree_file() {
+    let repo = create_archive_test_repo();
+    let p = repo.path();
+    // An untracked file in the working tree (never committed).
+    std::fs::write(p.join("EXTRA.txt"), "added bytes\n").expect("write untracked file");
+
+    // `--add-file` must precede the tree-ish (the `paths` positional is
+    // trailing_var_arg), matching `git archive --add-file=<file> <tree>`.
+    let out = p.join("with-extra.tar");
+    let output = run_libra_command(
+        &[
+            "archive",
+            "-o",
+            out.to_str().unwrap(),
+            "--add-file=EXTRA.txt",
+            "HEAD",
+        ],
+        p,
+    );
+    assert_cli_success(&output, "archive --add-file");
+    let text = String::from_utf8_lossy(&read_bytes(&out)).to_string();
+    assert!(
+        text.contains("README.md"),
+        "tracked tree files must still be archived"
+    );
+    assert!(
+        text.contains("EXTRA.txt") && text.contains("added bytes"),
+        "the added file's name and content must be in the archive"
+    );
+
+    // Under --prefix the added file sits at <prefix><basename>.
+    let prefixed = p.join("prefixed.tar");
+    let output = run_libra_command(
+        &[
+            "archive",
+            "-o",
+            prefixed.to_str().unwrap(),
+            "--prefix=proj/",
+            "--add-file=EXTRA.txt",
+            "HEAD",
+        ],
+        p,
+    );
+    assert_cli_success(&output, "archive --add-file --prefix");
+    let prefixed_text = String::from_utf8_lossy(&read_bytes(&prefixed)).to_string();
+    assert!(
+        prefixed_text.contains("proj/EXTRA.txt"),
+        "added file must sit under the prefix at its basename"
+    );
+
+    // A missing --add-file path is a hard error, not a silent skip.
+    let missing = run_libra_command(
+        &[
+            "archive",
+            "-o",
+            out.to_str().unwrap(),
+            "--add-file=nope.txt",
+            "HEAD",
+        ],
+        p,
+    );
+    assert!(
+        !missing.status.success(),
+        "a non-existent --add-file path must fail"
+    );
+}
+
+#[test]
 fn archive_supports_compressed_and_zip_formats() {
     let repo = create_archive_test_repo();
 
@@ -614,5 +682,203 @@ fn test_archive_verbose_lists_paths_on_stderr() {
     assert!(
         stderr.contains("app/README.md"),
         "verbose should list the prefixed path on stderr: {stderr}"
+    );
+}
+
+/// `--compression-level <0-9>` is threaded into the gzip/bzip2/zip encoders:
+/// for highly compressible data, level 9 produces a smaller archive than level
+/// 0, and an out-of-range level is rejected by the parser.
+#[test]
+fn archive_compression_level_affects_output() {
+    let repo = create_archive_test_repo();
+    let p = repo.path();
+    // A large, highly compressible committed file so the level is observable.
+    fs::write(p.join("big.txt"), "a".repeat(20_000)).unwrap();
+    assert_cli_success(&run_libra_command(&["add", "big.txt"], p), "add big.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "big", "--no-verify"], p),
+        "commit big.txt",
+    );
+
+    let out0 = p.join("l0.tar.gz");
+    let out9 = p.join("l9.tar.gz");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "archive",
+                "--format=tar.gz",
+                "--compression-level=0",
+                "-o",
+                out0.to_str().unwrap(),
+                "HEAD",
+            ],
+            p,
+        ),
+        "archive level 0",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "archive",
+                "--format=tar.gz",
+                "--compression-level=9",
+                "-o",
+                out9.to_str().unwrap(),
+                "HEAD",
+            ],
+            p,
+        ),
+        "archive level 9",
+    );
+    let s0 = read_bytes(&out0);
+    let s9 = read_bytes(&out9);
+    assert!(
+        is_gzip(&s0) && is_gzip(&s9),
+        "both levels produce gzip output"
+    );
+    assert!(
+        s9.len() < s0.len(),
+        "level 9 ({}) must be smaller than level 0 ({}) for compressible data",
+        s9.len(),
+        s0.len()
+    );
+
+    // An out-of-range level is rejected by the parser.
+    assert!(
+        !run_libra_command(
+            &[
+                "archive",
+                "--format=tar.gz",
+                "--compression-level=10",
+                "HEAD"
+            ],
+            p
+        )
+        .status
+        .success(),
+        "--compression-level=10 must be rejected"
+    );
+
+    // zip also honors the level and stays a valid zip.
+    let z = run_libra_command(&["archive", "--format=zip", "--compression-level=9"], p);
+    assert_cli_success(&z, "zip with --compression-level");
+    assert!(is_zip(&z.stdout), "zip output is valid");
+}
+
+/// Parse the modification time (octal) from the first tar header in `data`.
+/// The ustar/gnu `mtime` field is 12 bytes at offset 136.
+fn first_tar_entry_mtime(data: &[u8]) -> u64 {
+    assert!(data.len() >= 148, "tar data too small for a header");
+    let field = &data[136..148];
+    let digits: String = field
+        .iter()
+        .take_while(|&&b| b != 0 && b != b' ')
+        .map(|&b| b as char)
+        .collect();
+    u64::from_str_radix(digits.trim(), 8).expect("tar mtime is octal")
+}
+
+/// Decode `(year, month, day)` from the first zip local file header's MS-DOS
+/// mod-date (little-endian u16 at offset 12: bits 0-4 day, 5-8 month, 9-15
+/// year-since-1980).
+fn first_zip_entry_date(data: &[u8]) -> (u16, u16, u16) {
+    assert_eq!(
+        &data[0..4],
+        b"PK\x03\x04",
+        "zip local file header signature"
+    );
+    let dos_date = u16::from_le_bytes([data[12], data[13]]);
+    let day = dos_date & 0x1f;
+    let month = (dos_date >> 5) & 0xf;
+    let year = ((dos_date >> 9) & 0x7f) + 1980;
+    (year, month, day)
+}
+
+/// Read the committer Unix timestamp of `HEAD` via `cat-file -p`.
+fn head_committer_time(repo: &Path) -> u64 {
+    let out = run_libra_command(&["cat-file", "-p", "HEAD"], repo);
+    assert_cli_success(&out, "cat-file -p HEAD");
+    let text = String::from_utf8_lossy(&out.stdout);
+    let committer = text
+        .lines()
+        .find(|l| l.starts_with("committer "))
+        .expect("commit has a committer line");
+    // "committer Name <email> <unixts> <tz>"
+    let fields: Vec<&str> = committer.split_whitespace().collect();
+    fields[fields.len() - 2]
+        .parse()
+        .expect("committer timestamp is numeric")
+}
+
+#[test]
+fn archive_default_mtime_uses_commit_committer_time() {
+    // Previously the mtime was hard-coded to epoch 0; it must now be exactly the
+    // archived commit's committer time, matching Git.
+    let repo = create_archive_test_repo();
+    let out = run_libra_command(&["archive", "--format=tar", "HEAD"], repo.path());
+    assert_cli_success(&out, "archive HEAD");
+    assert!(is_tar(&out.stdout), "tar output");
+    assert_eq!(
+        first_tar_entry_mtime(&out.stdout),
+        head_committer_time(repo.path()),
+        "default mtime equals the commit's committer time (not epoch 0)"
+    );
+}
+
+#[test]
+fn archive_zip_mtime_flag_sets_entry_date() {
+    // `--mtime` also drives the zip entry's MS-DOS mod-date.
+    let repo = create_archive_test_repo();
+    let out = run_libra_command(
+        &[
+            "archive",
+            "--format=zip",
+            "--mtime=2020-01-02 03:04:05 +0000",
+            "HEAD",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&out, "zip --mtime");
+    assert!(is_zip(&out.stdout), "zip output");
+    assert_eq!(
+        first_zip_entry_date(&out.stdout),
+        (2020, 1, 2),
+        "--mtime sets the zip entry's mod-date"
+    );
+}
+
+#[test]
+fn archive_mtime_flag_overrides_entry_time() {
+    // `--mtime` sets every entry's modification time. 2020-01-02 03:04:05 UTC.
+    let repo = create_archive_test_repo();
+    let out = run_libra_command(
+        &[
+            "archive",
+            "--format=tar",
+            "--mtime=2020-01-02 03:04:05 +0000",
+            "HEAD",
+        ],
+        repo.path(),
+    );
+    assert_cli_success(&out, "archive --mtime");
+    assert_eq!(
+        first_tar_entry_mtime(&out.stdout),
+        1_577_934_245,
+        "--mtime sets the tar entry time"
+    );
+}
+
+#[test]
+fn archive_mtime_rejects_invalid_value() {
+    let repo = create_archive_test_repo();
+    let out = run_libra_command(
+        &["archive", "--format=tar", "--mtime=not-a-date", "HEAD"],
+        repo.path(),
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "an unparseable --mtime is a usage error: {}",
+        String::from_utf8_lossy(&out.stderr)
     );
 }

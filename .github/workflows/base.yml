@@ -57,7 +57,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       - name: Run cargo clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
@@ -83,7 +83,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       # The Rust crate's `build.rs` skips the web build whenever
       # `LIBRA_SKIP_WEB_BUILD=1` (set on every other job for speed). This
@@ -166,7 +166,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       - name: Ensure ripgrep is available
         shell: bash
@@ -242,6 +242,22 @@ jobs:
             --test code_ui_remote_sse_matrix \
             -- --test-threads=1
 
+      # lore.md 1.7: the OTLP wire test needs the feature compiled in
+      # (required-features excludes it from the default `cargo test --all`).
+      - name: Run OTLP telemetry wire test (--features otlp)
+        env:
+          LIBRA_SKIP_WEB_BUILD: "1"
+        run: |
+          cargo test --features otlp --test otlp_telemetry -- --test-threads=1
+
+      # lore.md 2.7: keyring-backend plumbing over the in-process mock store
+      # (debug builds only honor the mock env; headless-safe).
+      - name: Run keyring auth backend test (--features keyring)
+        env:
+          LIBRA_SKIP_WEB_BUILD: "1"
+        run: |
+          cargo test --features keyring --test auth_keyring_backend -- --test-threads=1
+
       - name: Upload TUI scenario artifacts on failure
         if: failure()
         uses: actions/upload-artifact@v4
@@ -276,7 +292,7 @@ jobs:
       - name: Enable pnpm
         run: |
           corepack enable
-          corepack prepare pnpm@11.1.0 --activate
+          corepack prepare pnpm@11.10.0 --activate
 
       # Network-only test layer (`test-network` feature gate). Tests requiring outbound
       # network but no secrets are surfaced through this job; tests requiring real

@@ -37,11 +37,11 @@ libra maintenance run [--task <task>] [--dry-run] [--quiet]
 
 | Task | Description |
 |---|---|
-| `gc` | Remove unreachable loose objects |
+| `gc` | Remove unreachable loose objects after recursively tracing SQLite refs/reflogs (including annotated-tag targets), every index stage, every file-backed stash reflog entry, and held merge/rebase autostash sidecars; malformed/unreadable roots or reachable objects fail closed before deletion |
 | `loose-objects` | Pack old loose objects into a new pack file |
 | `pack-refs` | Collapse individual ref files into `packed-refs` |
 | `incremental-repack` | Repack existing pack files |
-| `commit-graph` | Update commit-graph (not yet supported; skipped) |
+| `commit-graph` | Write a Git-compatible v1 commit-graph file (incl. octopus merges via the EDGE chunk, and SHA-256 repositories with 32-byte OIDs + a SHA-256 trailer) |
 | `prefetch` | Prefetch remote refs (requires remote config; skipped) |
 
 ### `register`

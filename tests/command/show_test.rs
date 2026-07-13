@@ -151,6 +151,69 @@ fn test_show_cli_badref_returns_cli_exit_code() {
 }
 
 #[test]
+fn test_show_patch_with_stat_emits_stat_then_patch() {
+    // `--patch-with-stat` (Git's `-p --stat`) emits the diffstat summary line AND
+    // the full patch body, with the stat appearing before the patch.
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("tracked.txt"), "first\nsecond\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "tracked.txt"], p), "stage edit");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "edit tracked", "--no-verify"], p),
+        "commit edit",
+    );
+
+    let output = run_libra_command(&["show", "--patch-with-stat", "HEAD"], p);
+    assert_cli_success(&output, "show --patch-with-stat HEAD");
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+
+    let stat_pos = stdout
+        .find("file changed")
+        .expect("diffstat summary line is present");
+    let patch_pos = stdout.find("@@ ").expect("patch hunk header is present");
+    assert!(
+        stdout.contains("diff --git"),
+        "the full patch is emitted: {stdout}"
+    );
+    assert!(
+        stat_pos < patch_pos,
+        "the diffstat appears before the patch: {stdout}"
+    );
+
+    // The stat block matches `show --stat` (the flag reuses the same diffstat).
+    let stat_only = run_libra_command(&["show", "--stat", "HEAD"], p);
+    let stat_only_out = String::from_utf8_lossy(&stat_only.stdout);
+    let summary_line = stat_only_out
+        .lines()
+        .find(|l| l.contains("file changed"))
+        .expect("show --stat summary line");
+    assert!(
+        stdout.contains(summary_line),
+        "--patch-with-stat reuses the --stat summary line ({summary_line:?}): {stdout}"
+    );
+}
+
+#[test]
+fn test_show_summary_reports_created_files() {
+    // The initial commit creates `tracked.txt`, so `show --summary` on the root
+    // commit (diffed against the empty tree) must list it as a create-mode entry
+    // and must not emit the full patch body.
+    let repo = create_committed_repo_via_cli();
+
+    let output = run_libra_command(&["show", "--summary", "HEAD"], repo.path());
+    assert_cli_success(&output, "show --summary HEAD");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("create mode") && stdout.contains("tracked.txt"),
+        "show --summary should list the created file: {stdout}"
+    );
+    assert!(
+        !stdout.contains("\n+") && !stdout.contains("@@ "),
+        "show --summary should not print the patch body: {stdout}"
+    );
+}
+
+#[test]
 fn test_show_pretty_custom_format() {
     let repo = create_committed_repo_via_cli();
 
@@ -245,15 +308,24 @@ async fn test_show_non_quiet_uses_forced_pager() {
     let _pager = ScopedEnvVar::set(LIBRA_PAGER_ENV, "always");
 
     let args = ShowArgs {
+        no_abbrev_commit: false,
+        no_show_signature: false,
+        no_expand_tabs: false,
+        no_notes: false,
+        no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: true,
         oneline: false,
         pretty: None,
         format: None,
+        date: None,
         abbrev_commit: false,
         name_only: false,
         name_status: false,
+        raw: false,
         stat: false,
+        patch_with_stat: false,
+        summary: false,
         pathspec: vec![],
     };
 
@@ -296,15 +368,24 @@ async fn test_show_quiet_still_validates_patch_generation() {
 
     let _guard = ChangeDirGuard::new(repo.path());
     let args = ShowArgs {
+        no_abbrev_commit: false,
+        no_show_signature: false,
+        no_expand_tabs: false,
+        no_notes: false,
+        no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
         oneline: false,
         pretty: None,
         format: None,
+        date: None,
         abbrev_commit: false,
         name_only: false,
         name_status: false,
+        raw: false,
         stat: false,
+        patch_with_stat: false,
+        summary: false,
         pathspec: vec![],
     };
     let output = OutputConfig {
@@ -348,15 +429,24 @@ async fn test_show_quiet_stat_succeeds_with_missing_blob_like_human_path() {
 
     let _guard = ChangeDirGuard::new(repo.path());
     let args = ShowArgs {
+        no_abbrev_commit: false,
+        no_show_signature: false,
+        no_expand_tabs: false,
+        no_notes: false,
+        no_mailmap: false,
         object: Some("HEAD".to_string()),
         no_patch: false,
         oneline: false,
         pretty: None,
         format: None,
+        date: None,
         abbrev_commit: false,
         name_only: false,
         name_status: false,
+        raw: false,
         stat: true,
+        patch_with_stat: false,
+        summary: false,
         pathspec: vec![],
     };
     let output = OutputConfig {
@@ -809,15 +899,24 @@ async fn test_show_execute_safe_bad_ref_returns_cli_error() {
     let _guard = ChangeDirGuard::new(temp.path());
 
     let args = ShowArgs {
+        no_abbrev_commit: false,
+        no_show_signature: false,
+        no_expand_tabs: false,
+        no_notes: false,
+        no_mailmap: false,
         object: Some("nonexistent_ref_abc123".to_string()),
         no_patch: false,
         oneline: false,
         pretty: None,
         format: None,
+        date: None,
         abbrev_commit: false,
         name_only: false,
         name_status: false,
+        raw: false,
         stat: false,
+        patch_with_stat: false,
+        summary: false,
         pathspec: vec![],
     };
     let result = execute_safe(args, &OutputConfig::default()).await;
@@ -852,15 +951,24 @@ async fn test_show_execute_safe_bad_rev_path_returns_cli_error() {
     let _guard = ChangeDirGuard::new(temp.path());
 
     let args = ShowArgs {
+        no_abbrev_commit: false,
+        no_show_signature: false,
+        no_expand_tabs: false,
+        no_notes: false,
+        no_mailmap: false,
         object: Some("HEAD:nonexistent_file.txt".to_string()),
         no_patch: false,
         oneline: false,
         pretty: None,
         format: None,
+        date: None,
         abbrev_commit: false,
         name_only: false,
         name_status: false,
+        raw: false,
         stat: false,
+        patch_with_stat: false,
+        summary: false,
         pathspec: vec![],
     };
     let result = execute_safe(args, &OutputConfig::default()).await;
@@ -1043,5 +1151,151 @@ fn show_format_aliases_pretty_and_abbrev_commit_shortens_hash() {
     assert!(
         !abbrev_s.contains(&full_hash),
         "full 40-char hash must not appear: {abbrev_s:?}"
+    );
+
+    // `--no-abbrev-commit` shows the full hash (the default); `--abbrev-commit
+    // --no-abbrev-commit` (last wins) countermands `--abbrev-commit`, so the
+    // full 40-char hash appears.
+    let full = run_libra_command(&["show", "--no-patch", "--no-abbrev-commit", "HEAD"], p);
+    assert_cli_success(&full, "show --no-abbrev-commit");
+    assert!(
+        String::from_utf8_lossy(&full.stdout).contains(&format!("commit {full_hash}")),
+        "full hash header present with --no-abbrev-commit"
+    );
+    let override_full = run_libra_command(
+        &[
+            "show",
+            "--no-patch",
+            "--abbrev-commit",
+            "--no-abbrev-commit",
+            "HEAD",
+        ],
+        p,
+    );
+    assert_cli_success(&override_full, "show --abbrev-commit --no-abbrev-commit");
+    assert!(
+        String::from_utf8_lossy(&override_full.stdout).contains(&format!("commit {full_hash}")),
+        "--no-abbrev-commit countermands --abbrev-commit (full hash)"
+    );
+}
+
+#[test]
+fn show_log_display_no_op_flags_are_accepted() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let plain = run_libra_command(&["show"], p);
+    assert_cli_success(&plain, "show");
+    let plain_hdr = String::from_utf8_lossy(&plain.stdout)
+        .lines()
+        .next()
+        .unwrap_or("")
+        .to_string();
+    assert!(
+        plain_hdr.starts_with("commit "),
+        "show prints a commit header"
+    );
+
+    // `--no-expand-tabs`/`--no-notes`/`--no-mailmap`/`--no-show-signature`
+    // (Git's log/show display options) are accepted no-ops: Libra's show expands
+    // no tabs, displays no notes inline, applies no mailmap, and never displays
+    // commit signatures inline. They are parsed-but-unread, so each still
+    // produces the same commit header. (The per-file diff ordering of `show`
+    // itself is not stable across invocations, so only the header is compared.)
+    for flag in [
+        "--no-expand-tabs",
+        "--no-notes",
+        "--no-mailmap",
+        "--no-show-signature",
+    ] {
+        let out = run_libra_command(&["show", flag], p);
+        assert_cli_success(&out, &format!("show {flag}"));
+        let hdr = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string();
+        assert_eq!(hdr, plain_hdr, "show {flag} prints the same commit header");
+    }
+}
+
+/// `show --raw` renders the raw diff format (`:<old-mode> <new-mode> <old-sha>
+/// <new-sha> <status>\t<path>`) instead of a patch, matching `git show --raw`.
+#[test]
+fn test_show_raw_diff_format() {
+    use std::{fs, os::unix::fs::PermissionsExt};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // First commit: a regular file `f` and a file `d` to be deleted later.
+    fs::write(p.join("f"), "one\n").expect("write f");
+    fs::write(p.join("d"), "old\n").expect("write d");
+    assert_cli_success(&run_libra_command(&["add", "f", "d"], p), "add f d");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c1", "--no-verify"], p),
+        "commit c1",
+    );
+
+    // Second commit: modify `f`, add an executable `g`, delete `d`.
+    fs::write(p.join("f"), "two\n").expect("modify f");
+    fs::write(p.join("g"), "new\n").expect("write g");
+    fs::set_permissions(p.join("g"), fs::Permissions::from_mode(0o755)).expect("chmod g");
+    fs::remove_file(p.join("d")).expect("rm d");
+    assert_cli_success(
+        &run_libra_command(&["add", "f", "g", "d"], p),
+        "stage changes",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+
+    let out = run_libra_command(&["show", "--raw", "HEAD"], p);
+    assert_cli_success(&out, "show --raw");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let raw: Vec<&str> = stdout.lines().filter(|l| l.starts_with(':')).collect();
+
+    // Modified regular file: both modes 100644, both ids present, status M.
+    let modified = raw
+        .iter()
+        .find(|l| l.ends_with("M\tf"))
+        .unwrap_or_else(|| panic!("modified line for f: {stdout}"));
+    assert!(
+        modified.starts_with(":100644 100644 "),
+        "modified f modes: {modified}"
+    );
+
+    // Added executable: old side zeroed, new mode 100755, status A.
+    let added = raw
+        .iter()
+        .find(|l| l.ends_with("A\tg"))
+        .unwrap_or_else(|| panic!("added line for g: {stdout}"));
+    assert!(
+        added.starts_with(":000000 100755 0000000 "),
+        "added g modes/old-zero: {added}"
+    );
+
+    // Deleted file: old mode 100644, new side zeroed, status D.
+    let deleted = raw
+        .iter()
+        .find(|l| l.ends_with("D\td"))
+        .unwrap_or_else(|| panic!("deleted line for d: {stdout}"));
+    assert!(
+        deleted.starts_with(":100644 000000 "),
+        "deleted d modes: {deleted}"
+    );
+    assert!(
+        deleted.contains(" 0000000 D\td"),
+        "deleted d new-id zeroed: {deleted}"
+    );
+
+    // The commit header/message still precede the raw lines (no patch body).
+    assert!(
+        stdout.contains("commit "),
+        "raw still shows the commit header"
+    );
+    assert!(
+        !stdout.contains("diff --git"),
+        "--raw replaces the patch: {stdout}"
     );
 }

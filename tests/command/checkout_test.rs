@@ -219,6 +219,9 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         },
         &OutputConfig::default(),
     )
@@ -250,6 +253,13 @@ async fn checkout_restore_rejects_sha1_hash_in_sha256_repo() {
     // try to restore using a SHA-1 length hash in a SHA-256 repo; should no-op
     let _ = restore::execute_safe(
         RestoreArgs {
+            overlay: false,
+            no_overlay: false,
+            ours: false,
+            theirs: false,
+            ignore_unmerged: false,
+            merge: false,
+            conflict: None,
             worktree: true,
             staged: true,
             source: Some("4b825dc642cb6eb9a060e54bf8d69288fbee4904".into()),
@@ -307,6 +317,9 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         },
         &OutputConfig::default(),
     )
@@ -346,6 +359,9 @@ async fn test_checkout_new_branch_with_dirty_worktree_returns_error() {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         },
         &OutputConfig::default(),
     )
@@ -409,6 +425,9 @@ async fn test_checkout_current_branch_with_dirty_worktree_succeeds() {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         },
         &OutputConfig::default(),
     )
@@ -495,6 +514,9 @@ async fn test_checkout_existing_branch_with_unstaged_dirty_worktree_returns_erro
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         },
         &OutputConfig::default(),
     )
@@ -1124,5 +1146,28 @@ fn test_checkout_no_progress_is_accepted_noop() {
     assert!(
         String::from_utf8_lossy(&current.stdout).contains("feature"),
         "checkout switched to feature"
+    );
+}
+
+#[test]
+fn test_checkout_no_overlay_is_accepted_noop() {
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["branch", "feature"], p),
+        "create feature",
+    );
+
+    // `--no-overlay` is accepted and a no-op: Libra's checkout is never in
+    // overlay mode (it already matches `--no-overlay`, the Git default), so the
+    // checkout proceeds normally.
+    let output = run_libra_command(&["checkout", "--no-overlay", "feature"], p);
+    assert_cli_success(&output, "checkout --no-overlay feature");
+    let current = run_libra_command(&["branch", "--show-current"], p);
+    assert!(
+        String::from_utf8_lossy(&current.stdout).contains("feature"),
+        "checkout --no-overlay switched to feature"
     );
 }

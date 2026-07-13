@@ -29,6 +29,9 @@ async fn add_and_commit(message: &str, pathspec: Vec<String>) {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         },
         &OutputConfig::default(),
     )
@@ -94,6 +97,143 @@ async fn test_grep_working_tree_searches_only_tracked_files() {
 
 #[tokio::test]
 #[serial]
+async fn test_grep_untracked_searches_untracked_non_ignored_files() {
+    let repo = tempdir().expect("failed to create repo dir");
+    test::setup_with_new_libra_in(repo.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo.path());
+
+    fs::write("tracked.txt", "needle in tracked file\n").expect("write tracked");
+    add_and_commit("add tracked file", vec!["tracked.txt".to_string()]).await;
+    fs::write("untracked.txt", "needle in untracked file\n").expect("write untracked");
+    fs::write(".libraignore", "ignored.txt\n").expect("write ignore");
+    fs::write("ignored.txt", "needle in ignored file\n").expect("write ignored");
+
+    let output = run_libra_command(
+        &["--json=compact", "grep", "--untracked", "needle"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "grep --untracked should succeed");
+    let json = parse_json_stdout(&output);
+    let paths: Vec<String> = json["data"]["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path").to_string())
+        .collect();
+
+    // Tracked AND untracked (non-ignored) are searched; the ignored file is not.
+    assert!(
+        paths.contains(&"tracked.txt".to_string()),
+        "tracked searched: {paths:?}"
+    );
+    assert!(
+        paths.contains(&"untracked.txt".to_string()),
+        "untracked non-ignored searched: {paths:?}"
+    );
+    assert!(
+        !paths.contains(&"ignored.txt".to_string()),
+        "ignored file is not searched: {paths:?}"
+    );
+
+    // --untracked conflicts with --cached (clap, exit 129).
+    let conflict = run_libra_command(&["grep", "--untracked", "--cached", "needle"], repo.path());
+    assert_eq!(conflict.status.code(), Some(129));
+
+    // --untracked with a --tree revision is a command-level grep error.
+    let with_tree = run_libra_command(
+        &["grep", "--untracked", "--tree", "HEAD", "needle"],
+        repo.path(),
+    );
+    assert_eq!(with_tree.status.code(), Some(2));
+    let (_stderr, report) = parse_cli_error_stderr(&with_tree.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+}
+
+#[test]
+#[serial]
+fn test_grep_no_index_searches_filesystem_without_repository() {
+    // `--no-index` works with no `.libra` present and greps the filesystem recursively.
+    let dir = tempdir().expect("failed to create temp dir");
+    let p = dir.path();
+    fs::write(p.join("a.txt"), "needle x\n").expect("write a");
+    fs::create_dir(p.join("d")).expect("mkdir d");
+    fs::write(p.join("d").join("b.txt"), "needle y\n").expect("write b");
+
+    let output = run_libra_command(&["--json=compact", "grep", "--no-index", "needle"], p);
+    assert_cli_success(&output, "grep --no-index without a repository");
+    let json = parse_json_stdout(&output);
+    let paths: Vec<String> = json["data"]["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path").to_string())
+        .collect();
+    assert!(
+        paths.iter().any(|path| path == "a.txt"),
+        "a.txt searched: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path == "d/b.txt"),
+        "nested d/b.txt searched recursively: {paths:?}"
+    );
+
+    // A path argument restricts the walk to that subtree.
+    let scoped = run_libra_command(&["--json=compact", "grep", "--no-index", "needle", "d"], p);
+    assert_cli_success(&scoped, "grep --no-index d");
+    let scoped_paths: Vec<String> = parse_json_stdout(&scoped)["data"]["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path").to_string())
+        .collect();
+    assert_eq!(
+        scoped_paths,
+        vec!["d/b.txt".to_string()],
+        "scoped to d/: {scoped_paths:?}"
+    );
+
+    // --no-index conflicts with --cached (clap, exit 129).
+    let conflict = run_libra_command(&["grep", "--no-index", "--cached", "needle"], p);
+    assert_eq!(conflict.status.code(), Some(129));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_grep_no_index_searches_ignored_files_inside_repo() {
+    // Inside a repository, `--no-index` searches every file, including ignored ones
+    // (it does not honor ignore rules), unlike a normal grep.
+    let repo = tempdir().expect("failed to create repo dir");
+    test::setup_with_new_libra_in(repo.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo.path());
+
+    fs::write("tracked.txt", "needle tracked\n").expect("write tracked");
+    add_and_commit("add tracked", vec!["tracked.txt".to_string()]).await;
+    fs::write(".libraignore", "ignored.txt\n").expect("write ignore");
+    fs::write("ignored.txt", "needle ignored\n").expect("write ignored");
+
+    let output = run_libra_command(
+        &["--json=compact", "grep", "--no-index", "needle"],
+        repo.path(),
+    );
+    assert_cli_success(&output, "grep --no-index inside repo");
+    let paths: Vec<String> = parse_json_stdout(&output)["data"]["matches"]
+        .as_array()
+        .expect("matches array")
+        .iter()
+        .map(|entry| entry["path"].as_str().expect("path").to_string())
+        .collect();
+    assert!(
+        paths.iter().any(|path| path == "tracked.txt"),
+        "tracked searched: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|path| path == "ignored.txt"),
+        "ignored file IS searched under --no-index: {paths:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_grep_after_context_marks_context_lines() {
     let repo = tempdir().expect("failed to create repo dir");
     test::setup_with_new_libra_in(repo.path()).await;
@@ -136,7 +276,7 @@ async fn test_grep_perl_regexp_is_rejected() {
     add_and_commit("add f", vec!["f.txt".to_string()]).await;
 
     let output = run_libra_command(&["grep", "-P", "needle"], repo.path());
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(2));
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
         stderr.contains("perl-regexp is not supported"),
@@ -191,6 +331,9 @@ async fn test_grep_tree_accepts_branch_revisions() {
 
     branch::execute_safe(
         BranchArgs {
+            subcommand: None,
+            format: None,
+            no_column: false,
             new_branch: Some("feature/grep-tree".to_string()),
             commit_hash: None,
             list: false,
@@ -198,6 +341,7 @@ async fn test_grep_tree_accepts_branch_revisions() {
             delete_safe: None,
             set_upstream_to: None,
             unset_upstream: None,
+            edit_description: None,
             show_current: false,
             rename: Vec::new(),
             copy: Vec::new(),
@@ -332,7 +476,7 @@ async fn test_grep_tree_skips_large_blob_files() {
         &["--json=compact", "grep", "--tree", "HEAD", "needle"],
         repo.path(),
     );
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(1));
     let json = parse_json_stdout(&output);
     assert_eq!(json["data"]["total_matches"], Value::from(0));
     assert_eq!(json["data"]["total_files"], Value::from(0));
@@ -514,7 +658,7 @@ async fn test_grep_tree_large_blob_emits_warning_in_json() {
         &["--json=compact", "grep", "--tree", "HEAD", "needle"],
         repo.path(),
     );
-    assert_eq!(output.status.code(), Some(129));
+    assert_eq!(output.status.code(), Some(1));
 
     let json = parse_json_stdout(&output);
     let warnings = json["data"]["warnings"]
@@ -565,9 +709,12 @@ async fn test_grep_returns_nonzero_when_no_matches_found() {
     add_and_commit("add no-match file", vec!["nomatch.txt".to_string()]).await;
 
     let output = run_libra_command(&["grep", "needle"], repo.path());
-    assert_eq!(output.status.code(), Some(129));
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(stderr.contains("error: no matches found"));
+    assert_eq!(output.status.code(), Some(1));
+    assert!(
+        output.stderr.is_empty(),
+        "no-match grep should be a silent status signal: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 #[tokio::test]
@@ -973,4 +1120,113 @@ async fn test_grep_max_count_and_only_matching() {
         obm[2]["byte_offset"], 4,
         "line2 match offset 4 (not 8): {obm:?}"
     );
+}
+
+/// `--max-depth` limits how many directory levels below each pathspec (or below
+/// the search root when no pathspec is given) `grep` descends, matching Git: a
+/// file directly inside the pathspec directory is depth 0.
+#[tokio::test]
+#[serial]
+async fn test_grep_max_depth_limits_directory_descent() {
+    let repo = tempdir().expect("failed to create repo dir");
+    test::setup_with_new_libra_in(repo.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo.path());
+
+    fs::create_dir_all("a/b/c").expect("failed to create nested dirs");
+    fs::write("top.txt", "match\n").expect("write top");
+    fs::write("a/m1.txt", "match\n").expect("write a/m1");
+    fs::write("a/b/m2.txt", "match\n").expect("write a/b/m2");
+    fs::write("a/b/c/m3.txt", "match\n").expect("write a/b/c/m3");
+    add_and_commit(
+        "add nested files",
+        vec![
+            "top.txt".to_string(),
+            "a/m1.txt".to_string(),
+            "a/b/m2.txt".to_string(),
+            "a/b/c/m3.txt".to_string(),
+        ],
+    )
+    .await;
+
+    // Names with matches, sorted, for the given args.
+    let names = |args: &[&str]| -> Vec<String> {
+        let mut full = vec!["grep", "-l", "match"];
+        full.extend_from_slice(args);
+        let out = run_libra_command(&full, repo.path());
+        assert_cli_success(&out, "grep -l --max-depth");
+        let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .map(|l| l.to_string())
+            .collect();
+        paths.sort();
+        paths
+    };
+
+    // No pathspec: depth 0 is top-level files only; depth 1 adds files one
+    // directory down; a high depth (or negative) reaches everything.
+    assert_eq!(names(&["--max-depth", "0"]), vec!["top.txt"]);
+    assert_eq!(names(&["--max-depth", "1"]), vec!["a/m1.txt", "top.txt"]);
+    assert_eq!(
+        names(&["--max-depth", "2"]),
+        vec!["a/b/m2.txt", "a/m1.txt", "top.txt"]
+    );
+    assert_eq!(
+        names(&["--max-depth", "-1"]),
+        vec!["a/b/c/m3.txt", "a/b/m2.txt", "a/m1.txt", "top.txt"]
+    );
+
+    // With a pathspec, depth is measured relative to that directory: depth 0
+    // keeps only the files directly inside it.
+    assert_eq!(names(&["--max-depth", "0", "a"]), vec!["a/m1.txt"]);
+    assert_eq!(names(&["--max-depth", "0", "a/b"]), vec!["a/b/m2.txt"]);
+    assert_eq!(
+        names(&["--max-depth", "1", "a"]),
+        vec!["a/b/m2.txt", "a/m1.txt"]
+    );
+
+    // A pathspec naming a file exactly is always within depth 0 (no directory
+    // descent), and multiple pathspecs union their in-depth matches.
+    assert_eq!(
+        names(&["--max-depth", "0", "a/b/c/m3.txt"]),
+        vec!["a/b/c/m3.txt"]
+    );
+    assert_eq!(
+        names(&["--max-depth", "0", "a", "a/b"]),
+        vec!["a/b/m2.txt", "a/m1.txt"]
+    );
+
+    // A `.` / `./` pathspec is the search root (depth 0 = top-level files),
+    // matching Git — the `CurDir` component must not be counted toward depth.
+    assert_eq!(names(&["--max-depth", "0", "."]), vec!["top.txt"]);
+    assert_eq!(names(&["--max-depth", "0", "./"]), vec!["top.txt"]);
+
+    // Run from a subdirectory. `libra grep` searches the whole worktree with
+    // worktree-relative paths regardless of cwd, so with NO pathspec depth is
+    // measured from the worktree root (a deliberate Libra/Git difference: Git
+    // would scope to the current directory). With a pathspec, depth is measured
+    // relative to that pathspec — matching Git's file selection.
+    {
+        let subdir = repo.path().join("a");
+        let _guard = test::ChangeDirGuard::new(&subdir);
+        let names_from_sub = |args: &[&str]| -> Vec<String> {
+            let mut full = vec!["grep", "-l", "match"];
+            full.extend_from_slice(args);
+            let out = run_libra_command(&full, &subdir);
+            assert_cli_success(&out, "grep -l --max-depth from subdir");
+            let mut paths: Vec<String> = String::from_utf8_lossy(&out.stdout)
+                .lines()
+                .map(|l| l.to_string())
+                .collect();
+            paths.sort();
+            paths
+        };
+        // No pathspec: worktree-root-relative depth (top.txt is depth 0).
+        assert_eq!(names_from_sub(&["--max-depth", "0"]), vec!["top.txt"]);
+        // Pathspec `b` (relative to cwd `a/`): depth 0 keeps `a/b/m2.txt`,
+        // exactly the file Git would select (Git shows it as `b/m2.txt`).
+        assert_eq!(
+            names_from_sub(&["--max-depth", "0", "b"]),
+            vec!["a/b/m2.txt"]
+        );
+    }
 }

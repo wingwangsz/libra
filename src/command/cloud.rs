@@ -1009,8 +1009,41 @@ pub(crate) async fn run_cloud_sync(
 
     // Process in batches.
     for batch in unsynced_objects.chunks(ctx.batch_size) {
-        for obj in batch {
-            let result = sync_single_object(obj, &local_storage, &r2_storage, &d1_client).await;
+        // Parse the batch's hashes once, then run ONE bounded-concurrency dedup
+        // pre-check (`exist_batch`, lore.md §0.6) instead of a HEAD per object, so
+        // objects already in R2 are skipped without a serial round-trip each.
+        let parsed: Vec<CloudResult<ObjectHash>> =
+            batch.iter().map(parse_object_index_hash).collect();
+        let probe_hashes: Vec<ObjectHash> = parsed
+            .iter()
+            .filter_map(|r| r.as_ref().ok().copied())
+            .collect();
+        let already_in_remote: std::collections::HashSet<ObjectHash> = {
+            let flags = r2_storage.exist_batch(&probe_hashes).await;
+            probe_hashes
+                .iter()
+                .copied()
+                .zip(flags)
+                .filter_map(|(hash, exists)| exists.then_some(hash))
+                .collect()
+        };
+
+        for (obj, hash_result) in batch.iter().zip(parsed) {
+            let result = match hash_result {
+                Ok(hash) => {
+                    let remote_has = already_in_remote.contains(&hash);
+                    sync_single_object(
+                        obj,
+                        &local_storage,
+                        &r2_storage,
+                        &d1_client,
+                        hash,
+                        remote_has,
+                    )
+                    .await
+                }
+                Err(err) => Err(err),
+            };
 
             match result {
                 Ok(_) => {
@@ -1072,28 +1105,35 @@ pub(crate) async fn run_cloud_sync(
     })
 }
 
-/// Sync a single object: R2 first (idempotent), then D1
+/// Parse an `object_index` model's hex `o_id` into an `ObjectHash`.
+fn parse_object_index_hash(obj: &object_index::Model) -> CloudResult<ObjectHash> {
+    let bytes =
+        hex::decode(&obj.o_id).map_err(|e| CloudError::Generic(format!("Invalid hash: {}", e)))?;
+    ObjectHash::from_bytes(&bytes)
+        .map_err(|e| CloudError::Generic(format!("Invalid object hash: {}", e)))
+}
+
+/// Sync a single object: R2 first (idempotent), then D1.
+///
+/// `remote_has` is the result of the batch dedup pre-check (`exist_batch`,
+/// lore.md §0.6), so this no longer issues a per-object HEAD — the whole batch's
+/// existence is probed up front in one bounded-concurrency call.
 async fn sync_single_object(
     obj: &object_index::Model,
     local_storage: &LocalStorage,
     r2_storage: &RemoteStorage,
     d1_client: &D1Client,
+    hash: ObjectHash,
+    remote_has: bool,
 ) -> CloudResult<()> {
-    let hash = ObjectHash::from_bytes(
-        &hex::decode(&obj.o_id).map_err(|e| CloudError::Generic(format!("Invalid hash: {}", e)))?,
-    )
-    .map_err(|e| CloudError::Generic(format!("Invalid object hash: {}", e)))?;
-
-    // Phase 1: Upload to R2 (idempotent - same hash will just overwrite)
-    // Check if already exists in R2 to avoid unnecessary upload
-    if !r2_storage.exist(&hash).await {
-        // Read from local storage
+    // Phase 1: Upload to R2 only if the dedup pre-check says it is absent
+    // (idempotent - same hash would just overwrite).
+    if !remote_has {
         let (data, obj_type) = local_storage
             .get(&hash)
             .await
             .map_err(|e| CloudError::Generic(format!("Failed to read local object: {}", e)))?;
 
-        // Upload to R2
         r2_storage
             .put(&hash, &data, obj_type)
             .await
@@ -1145,6 +1185,26 @@ pub(crate) async fn restore_indexed_objects_from_remote(
         if local_storage.exist(&hash).await {
             report.skipped += 1;
             continue;
+        }
+
+        // lore.md 2.5: never RESTORE an intentionally-obliterated object from
+        // the durable tier (拒绝重建). Fail CLOSED (Codex P1): if the tombstone
+        // table cannot be read, do NOT restore (an unreadable table must not
+        // let an obliterated payload resurrect) — skip with a warning.
+        match crate::internal::obliteration::ObliterationStore::lookup(&hash).await {
+            Ok(Some(_)) => {
+                report.skipped += 1;
+                continue;
+            }
+            Ok(None) => {}
+            Err(e) => {
+                report.warnings.push(format!(
+                    "warning: cannot verify obliteration tombstone for {}; not restoring: {e}",
+                    idx.o_id
+                ));
+                report.skipped += 1;
+                continue;
+            }
         }
 
         match r2_storage.get(&hash).await {
@@ -1532,6 +1592,13 @@ async fn execute_restore(args: RestoreArgs) -> CloudResult<()> {
 
 async fn restore_worktree_to_head(render_human: bool) -> CloudResult<()> {
     let restore_args = RestoreWorktreeArgs {
+        overlay: false,
+        no_overlay: false,
+        ours: false,
+        theirs: false,
+        ignore_unmerged: false,
+        merge: false,
+        conflict: None,
         pathspec: vec![".".to_string()], // restore everything
         source: Some("HEAD".to_string()),
         worktree: true,
@@ -2437,6 +2504,22 @@ mod tests {
         }
     }
 
+    async fn enter_isolated_libra_repo() -> (
+        tempfile::TempDir,
+        tempfile::TempDir,
+        ScopedEnvVar,
+        ScopedEnvVar,
+        ChangeDirGuard,
+    ) {
+        let repo = tempdir().unwrap();
+        let home = tempdir().unwrap();
+        let home_env = ScopedEnvVar::set("HOME", home.path());
+        let test_home_env = ScopedEnvVar::set("LIBRA_TEST_HOME", home.path());
+        setup_with_new_libra_in(repo.path()).await;
+        let cwd = ChangeDirGuard::new(repo.path());
+        (repo, home, home_env, test_home_env, cwd)
+    }
+
     struct ClearedEnvVarGuard {
         key: String,
         previous: Option<OsString>,
@@ -2710,6 +2793,7 @@ mod tests {
                     kind: reference::ConfigKind::Head,
                     commit: None,
                     remote: None,
+                    worktree_id: None,
                 },
                 reference::Model {
                     id: 0,
@@ -2717,6 +2801,7 @@ mod tests {
                     kind: reference::ConfigKind::Branch,
                     commit: Some(restored_commit.clone()),
                     remote: None,
+                    worktree_id: None,
                 },
             ];
             let remote = RemoteStorage::new(Arc::new(InMemory::new()));
@@ -2795,6 +2880,7 @@ mod tests {
                 kind: reference::ConfigKind::Branch,
                 commit: Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string()),
                 remote: None,
+                worktree_id: None,
             }];
             let metadata = serde_json::to_vec(&refs).expect("metadata should serialize");
             remote.put_metadata(&metadata).await.unwrap();
@@ -2812,7 +2898,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn cloud_restore_indexed_objects_downloads_skips_and_verifies_hash() {
+        let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
         let local_dir = tempdir().unwrap();
         let local = LocalStorage::new(local_dir.path().to_path_buf());
@@ -2847,7 +2935,9 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial]
     async fn cloud_restore_indexed_objects_reports_hash_mismatch() {
+        let _repo = enter_isolated_libra_repo().await;
         let remote = RemoteStorage::new(Arc::new(InMemory::new()));
         let local_dir = tempdir().unwrap();
         let local = LocalStorage::new(local_dir.path().to_path_buf());

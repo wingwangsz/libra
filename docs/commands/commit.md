@@ -11,6 +11,8 @@ libra commit [OPTIONS] -m <MESSAGE>
 libra commit [OPTIONS] -F <FILE>
 libra commit [OPTIONS] -C <COMMIT>
 libra commit [OPTIONS] -c <COMMIT>
+libra commit [OPTIONS] -t <FILE>
+libra commit [OPTIONS] --date <DATE> -m <MESSAGE>
 libra commit [OPTIONS] --fixup <COMMIT>
 libra commit [OPTIONS] --squash <COMMIT>
 libra commit --amend [--no-edit]
@@ -27,6 +29,17 @@ hierarchy matching the staged content, creates a commit object with the provided
 author/committer metadata, and advances the current branch ref. When vault signing is enabled,
 the commit is automatically GPG-signed. Pre-commit and commit-msg hooks are executed unless
 bypassed with `--no-verify`.
+
+Before computing staged changes or writing tree/commit objects, `commit` validates stage-0
+index entries for missing or mistyped blob/tree objects. A corrupt index entry fails closed
+with `LBR-REPO-002` and leaves `HEAD` unchanged.
+
+Author identity comes from `--author`, then `GIT_AUTHOR_NAME`/`GIT_AUTHOR_EMAIL`, then
+configured `user.name`/`user.email`; committer identity comes from
+`GIT_COMMITTER_NAME`/`GIT_COMMITTER_EMAIL`, then config. Git environment variables
+take priority over config unless `user.useConfigOnly=true`, in which case environment
+identity is ignored. `LIBRA_COMMITTER_NAME`/`LIBRA_COMMITTER_EMAIL` remain as
+lower-priority fallbacks for older automation.
 
 ## Options
 
@@ -48,13 +61,33 @@ message is the initial buffer). Conflicts with `--no-edit`.
 libra commit -e -m "Draft message"
 ```
 
+### `-t, --template <FILE>`
+
+Use the contents of `FILE` as the initial commit message. With the editor open (the default
+when no other message source is given), `FILE` seeds the editor buffer; with `--no-edit` it is
+used directly. When the `-t` flag is unset, the `commit.template` config (a file path, with a
+leading `~/` expanded to `$HOME`) is consulted. The template is **ignored** when a message
+source (`-m`/`-F`/`-C`/`-c`/`--fixup`/`--squash`) is given — that source wins and the template
+file is not even read. As in Git, if the editor leaves the template unchanged the commit is
+aborted ("you did not edit the message"); `--no-edit` bypasses that check.
+
+```bash
+libra commit -t .libra/commit-template.txt
+```
+
 ### `-v, --verbose`
 
 Show the staged diff in the editor template (below a scissors line, stripped on save) or, when
 no editor is opened, on stderr. The diff never enters the commit message.
 
+Setting the `commit.verbose` config to true makes `-v` the default (an explicit `-v` on the
+command line still forces it on). The value is a Git `bool-or-int`, so `commit.verbose=2` is
+accepted and enables verbose — but Libra's `-v` is on/off only: there is no `-vv` verbosity
+level (no unstaged-diff rendering) and no `--no-verbose` to force it off for a single commit.
+
 ```bash
 libra commit -v
+libra config commit.verbose true   # make -v the default
 ```
 
 ### `--no-edit`
@@ -80,6 +113,9 @@ libra commit -F message.txt
 
 Replace the tip of the current branch by creating a new commit. The new commit has the same
 parent(s) as the replaced commit. Cannot amend merge commits (commits with multiple parents).
+When the index tree and message are unchanged, `--amend --no-edit` still rewrites the commit
+and refreshes committer metadata; it never reports a successful amend while leaving `HEAD`
+unchanged.
 
 ```bash
 libra commit --amend
@@ -89,7 +125,8 @@ libra commit --amend -m "Updated message"
 ### `--no-edit`
 
 When used with `--amend`, reuse the message from the original commit without prompting for
-changes. Conflicts with `-m` and `-F`.
+changes. A clean amend still creates a replacement commit with a refreshed committer date.
+Conflicts with `-m` and `-F`.
 
 ```bash
 libra commit --amend --no-edit
@@ -158,19 +195,51 @@ Override the commit author. Must use the standard `A U Thor <author@example.com>
 libra commit --author "Jane Doe <jane@example.com>" -m "Patch"
 ```
 
+### `--date <DATE>`
+
+Set the author date for the new commit. The committer date still uses the
+current time unless `GIT_COMMITTER_DATE` is set. Accepted formats include Git
+raw dates (`<unix> <+HHMM|-HHMM>`), RFC 3339, `YYYY-MM-DD HH:MM:SS +HHMM`,
+`YYYY-MM-DD`, relative dates such as `2 days ago`, and Unix timestamps.
+`--date` takes precedence over `GIT_AUTHOR_DATE`.
+
+```bash
+libra commit --date "1700000000 +0000" -m "Backdated author timestamp"
+```
+
+### Identity And Date Environment
+
+`GIT_AUTHOR_NAME`, `GIT_AUTHOR_EMAIL`, and `GIT_AUTHOR_DATE` set the author
+identity/date. `GIT_COMMITTER_NAME`, `GIT_COMMITTER_EMAIL`, and
+`GIT_COMMITTER_DATE` set the committer identity/date. If a Git committer
+identity field is absent, Libra falls back through the matching author field,
+`EMAIL` for the email, then `LIBRA_COMMITTER_*`; config is used after those
+environment fallbacks. `user.useConfigOnly=true` disables all identity
+environment fallbacks, but explicit `--author` still applies.
+
 ### `--cleanup <MODE>`
 
 Clean up the commit message before committing. Accepted values: `strip` (default, removes
 commentary lines and trims whitespace), `whitespace` (only trims whitespace), `verbatim` (no
-cleanup), `scissors` (stops at scissors line), `default`.
+cleanup), `scissors` (whitespace cleanup plus truncation at the scissors line — the truncation
+only applies when the message is edited; on a non-editor `-m`/`-F` commit it behaves like
+`whitespace`, with no truncation), `default` (strip when the message is edited, otherwise
+whitespace).
+
+When `--cleanup` is not given, the `commit.cleanup` config value is used as the default (config
+cascade: local repo, then global); the CLI flag always takes precedence.
 
 ```bash
 libra commit --cleanup=strip -m "feat: add login"
+libra config commit.cleanup whitespace   # default cleanup when --cleanup is omitted
 ```
 
 ### `--dry-run`
 
 Do not actually create the commit. Show the commit summary that would be produced.
+The preview does not run the pre-commit hook or open the commit-message editor, so
+no message is required and subprocesses cannot observe or mutate a live index while
+`-a` is being previewed. `-v` still prints the staged preview diff directly.
 
 ```bash
 libra commit --dry-run -m "Draft commit"
@@ -188,6 +257,109 @@ untouched, even with `-a`, which is auto-staged only for the preview). Inert und
 
 ```bash
 libra commit --porcelain
+```
+
+### `--status` / `--no-status`
+
+The commit-message editor template includes the working-tree status as
+`#`-commented lines by default. `commit.status=false` disables it; `--status`
+and `--no-status` explicitly override that config (last flag wins). Because the
+lines are comments, the message
+cleanup strips them — they are informational only and never enter the final
+commit message. This has no effect when no editor is opened (e.g. with `-m`).
+The status is also omitted under cleanup modes that keep comment lines
+(`--cleanup=verbatim`, `--cleanup=whitespace`, and `--cleanup=scissors` — explicit
+scissors keeps `#` lines above the marker), so it can never leak into the message;
+it is seeded only when an editor opens and the effective cleanup strips comments
+(`strip`/`default`). `-v` only truncates the appended diff — it does not force a
+strip — so the status stays omitted under those modes even with `-v`.
+
+`commit.status` uses the strict local -> global -> system cascade and accepts a
+Git boolean (including numeric forms such as `0k` and `2`). When an editor status
+template can actually be generated, an invalid value fails with `LBR-CLI-002`,
+and an unreadable local/global config store fails with `LBR-IO-001`, before `-a`,
+hooks, object writes, or history updates. `-m`, dry-run/porcelain, JSON, and
+non-comment-stripping cleanup bypass the key because no template can exist. An explicit
+`--status` or `--no-status` bypasses the matching config read. When the status
+section is enabled, failures from its `status.*` config, collection, or rendering
+also preserve their stable error code and abort before the pre-commit hook,
+editor, commit/tree object write, or ref update; `--no-status` bypasses that
+template path. Consequently, `--status` with an unreadable shared config store
+reports the first required `status.*` key rather than `commit.status`, proving
+the explicit toggle skipped the latter read. For `--dry-run -a`, the entire preview uses a task-local isolated
+temporary index; the live index is never replaced, and temporary auto-stage
+blobs, LFS backups, and tree objects are not persisted. Non-verbose previews
+hash regular files in a 64 KiB stream and retain no payload. Auto-stage detects
+tracked symlinks without following them (including dangling links and paths
+matched by an LFS attribute), hashes/stores the link-target bytes, and preserves
+mode `120000` in real commits and previews. Verbose previews
+reserve every unique blob on the changed HEAD, already-staged, and newly auto-staged sides before it
+is loaded, with limits of 32 MiB per blob, 64 MiB aggregate charged scratch, and
+4,096 objects. The complete changed-object count is rejected before any storage
+size batch, loose decode, or pack-index scan. Auto-stage reserves a provisional byte/count slot before reading
+the worktree payload, then reconciles it by object ID, so neither staging nor
+hash deduplication can bypass those limits. Scratch lives under the common
+repository storage at `.libra/tmp/commit-preview` (shared by linked worktrees),
+is capped at 256 MiB across concurrent runs,
+and scavenges at most 32 inactive runs older than 24 hours per bounded startup
+scan. A run with missing or unreadable reservation metadata fails closed instead
+of being charged as zero bytes, including while its run lock is still active.
+Limit failures preserve the live index/object store and advise rerunning
+without verbose output. A changed blob is likewise refused before loading when
+its backend cannot perform a bounded local preflight (for example, a remote-only
+blob or a packed blob whose index is missing); the preview never rebuilds pack
+indexes. Actual preview reads use an explicit local-only bounded-load API rather
+than relying on task-local state inside the storage runtime; this path reads
+existing pack indexes only and never rebuilds unrelated missing indexes. Loose and non-delta
+packed objects reject an over-limit declared length before decoding the payload;
+loose objects otherwise stream to the declared boundary and reject size
+mismatches or bytes after the zlib stream. An oversized delta instruction declaration
+is rejected before its base chain is visited; accepted packed deltas validate and charge the
+complete base/instruction/result chain with bounded depth and fail closed on
+malformed instructions; a batch enumerates packs once and opens each existing
+index once. The batch receives the remaining aggregate budget, uses the same
+4 KiB minimum per-object charge as the cache, and stops probing later pack
+payloads immediately after the budget is crossed. The subsequent bounded pack
+read uses an uncached delta decoder and moves its final payload, avoiding the
+process-wide 200 MiB pack cache and extra full-payload clones. Rerun without
+verbose output to avoid an unbounded preview load.
+Dry-run and porcelain previews also skip hooks, editors,
+rerere updates, and `post_commit` automation because no commit occurred.
+When `status.showStash=true`, an unreadable/non-file stash ref (including a
+symlink) or an unreadable/corrupt stash log aborts status template collection with `LBR-IO-001` before hooks, the
+editor, or ref writes. The same fail-closed behavior applies to fresh
+`status --cached` output.
+Auto-stage file/LFS reads fail as
+`LBR-IO-001`; preview, LFS-backup, and object writes fail as `LBR-IO-002`
+instead of panicking. For a real `-a`, blob/LFS
+materialization uses a streamed temporary snapshot, derives the pointer from
+those exact bytes, and atomically replaces any stale or truncated backup. With
+`--sync-data`, newly created shard ancestors, the temporary payload, and both
+the staging and destination directories are synced around that atomic
+replacement; Windows uses a write-through atomic replace because it has no
+portable directory-fsync equivalent. The
+objects and staged index intentionally remain if later status
+collection aborts, matching the existing auto-stage-on-abort behavior.
+
+```bash
+libra commit                   # editor template includes commented status
+libra config commit.status false
+libra commit --status          # override commit.status=false for this commit
+libra commit --no-status       # omit status for this commit
+```
+
+### `--no-gpg-sign`
+
+Force an unsigned commit: skip Libra's vault GPG signing for this commit,
+matching `git commit --no-gpg-sign`. Vault signing runs when `vault.signing=true`
+(the `libra init` default) and a vault unseal key is available. The Git-compatible
+`commit.gpgSign=true|false` default overrides `vault.signing`: `true` force-signs
+with the repository vault key and `false` disables signing. `--no-gpg-sign` has
+highest precedence and suppresses either configuration. Git's positive
+`-S`/`--gpg-sign` is not exposed.
+
+```bash
+libra commit --no-gpg-sign -m "message"
 ```
 
 ### `--fixup <COMMIT>`
@@ -208,7 +380,9 @@ libra commit --squash abc1234
 
 ### `-C <COMMIT>`, `--reuse-message <COMMIT>`
 
-Reuse the commit message from the specified commit.
+Reuse the commit message and author metadata (name, email, author date, and
+timezone) from the specified commit. The new commit still receives the current
+committer identity/date, or `GIT_COMMITTER_*` overrides when set.
 
 ```bash
 libra commit -C HEAD~1
@@ -216,8 +390,9 @@ libra commit -C HEAD~1
 
 ### `-c <COMMIT>`, `--reedit-message <COMMIT>`
 
-Reuse the commit message from the specified commit. In Git this opens an editor; Libra
-reuses the message directly when no editor is available.
+Reuse the commit message and author metadata from the specified commit, then
+open the editor to edit the message. If no editor is configured, the command
+uses the reused message unchanged.
 
 ```bash
 libra commit -c HEAD~1
@@ -233,8 +408,10 @@ libra commit -m "Add feature" --trailer "Reviewed-by: Jane Doe"
 
 ### `--reset-author`
 
-Reset the author of the commit to the current user identity. This is the default for new
-commits; the flag is accepted for Git compatibility.
+When amending, reset the author to the current author identity and date instead
+of preserving the amended commit's original author. Current author identity/date
+honors `GIT_AUTHOR_*` and `--date` as described above. For new non-amend commits
+this is already the default.
 
 ```bash
 libra commit --amend --reset-author --no-edit
@@ -249,6 +426,7 @@ libra commit --amend
 libra commit --amend --no-edit
 libra commit -a -m "Fix typo"
 libra commit -F message.txt
+libra commit --date "2026-07-09 10:00:00 +0800" -m "Backdated author date"
 libra commit -s -m "Add feature"
 libra commit --allow-empty -m "Trigger CI"
 libra commit --dry-run -m "Draft commit"
@@ -391,11 +569,12 @@ teams that use different commit message conventions.
 ### Vault signing by default instead of manual GPG setup
 
 In Git, commit signing requires configuring `user.signingkey`, `gpg.program`, and
-`commit.gpgsign` -- a multi-step process that most developers skip. Libra's vault
+`commit.gpgSign` -- a multi-step process that most developers skip. Libra's vault
 automatically generates and manages a PGP signing key at repository initialization, so
 commits are signed by default with zero configuration. This makes signed commits the norm
 rather than the exception, improving supply-chain security for the entire ecosystem. Users
-who do not want signing can disable it with `libra config vault.signing false`.
+can use `commit.gpgSign` for a Git-compatible scoped default; when it is unset,
+`vault.signing` remains the Libra default.
 
 ### `--disable-pre` flag
 
@@ -427,13 +606,16 @@ switching from Git do not need to learn a new flag name.
 | Signoff trailer | `git commit -s` / `--signoff` | N/A | `libra commit -s` / `--signoff` |
 | GPG sign commit | `git commit -S` (manual GPG) | N/A (no signing) | Automatic (vault-backed) |
 | Override author | `git commit --author="..."` | N/A | `libra commit --author="..."` |
+| Author date | `git commit --date=<date>` | N/A | `libra commit --date <date>` |
 | Conventional check | External tool (commitlint) | N/A | `libra commit --conventional` |
 | Skip pre-commit only | N/A | N/A | `libra commit --disable-pre` |
 | Skip all hooks | `git commit --no-verify` | N/A | `libra commit --no-verify` |
 | Fixup commit | `git commit --fixup=<commit>` | N/A | `libra commit --fixup=<commit>` |
 | Squash commit | `git commit --squash=<commit>` | `jj squash` | `libra commit --squash=<commit>` |
+| Reuse message + author | `git commit -C/-c <commit>` | N/A | `libra commit -C/-c <commit>` |
 | Interactive message | `git commit` (opens editor) | `jj commit` (opens editor) | `libra commit` / `libra commit -e` (opens editor) |
 | Verbose diff in editor | `git commit -v` | N/A | `libra commit -v` |
+| Status in editor template | default on; `commit.status` / `--[no-]status` | N/A | default on; `commit.status` / `--[no-]status` |
 | Reset author date | `git commit --reset-author` | N/A | `libra commit --reset-author` |
 | Cleanup mode | `git commit --cleanup=<mode>` | N/A | `libra commit --cleanup=<mode>` |
 | Trailer | `git commit --trailer="..."` | N/A | `libra commit --trailer="..."` |
@@ -447,6 +629,7 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Scenario | Error Code | Exit | Hint |
 |----------|-----------|------|------|
 | Index corrupted | `LBR-REPO-002` | 128 | "the index file may be corrupted; try 'libra status' to verify" |
+| Index object missing or wrong type | `LBR-REPO-002` | 128 | "run 'libra fsck' to inspect missing or mistyped objects" |
 | Failed to save index | `LBR-IO-002` | 128 | -- |
 | Nothing to commit (clean) | `LBR-REPO-003` | 128 | "use 'libra add' to stage changes" |
 | Nothing to commit (no tracked) | `LBR-REPO-003` | 128 | "create/copy files and use 'libra add' to track" |
@@ -454,6 +637,9 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | No commit to amend | `LBR-REPO-003` | 128 | "create a commit before using --amend" |
 | Amend merge commit | `LBR-REPO-003` | 128 | "create a new commit instead of amending a merge commit" |
 | Invalid author format | `LBR-CLI-002` | 129 | "expected format: 'Name <email>'" |
+| Invalid author/committer date | `LBR-CLI-002` | 129 | Supported date formats |
+| Invalid `commit.status` | `LBR-CLI-002` | 129 | Fix the offending config value |
+| `commit.status` config unreadable | `LBR-IO-001` | 128 | Repair the local/global config store |
 | Message file unreadable | `LBR-IO-001` | 128 | -- |
 | Empty commit message | `LBR-REPO-003` | 128 | "use -m to provide a commit message" |
 | Tree creation failed | `LBR-INTERNAL-001` | 128 | Issues URL |
@@ -463,7 +649,8 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 | Pre-commit hook failed | `LBR-REPO-003` | 128 | "use --no-verify to bypass the hook" |
 | Conventional commit invalid | `LBR-CLI-002` | 129 | "see https://www.conventionalcommits.org for format rules" |
 | Vault signing failed | `LBR-AUTH-001` | 128 | "check vault configuration with 'libra config --list'" |
-| Auto-stage failed | `LBR-IO-001` | 128 | -- |
+| Auto-stage source read/hash failed | `LBR-IO-001` | 128 | Check the named working-tree file |
+| Auto-stage preview/object/LFS write failed | `LBR-IO-002` | 128 | Check space and permissions for the named target |
 | Staged changes computation | `LBR-REPO-002` | 128 | "failed to compute staged changes" |
 
 ## Compatibility Notes
@@ -472,4 +659,4 @@ Every `CommitError` variant maps to an explicit `StableErrorCode`.
 - `-v`/`--verbose` appends the staged diff to the editor template (below a `# ----- >8 -----` scissors line); the diff is stripped on save and never enters the commit message. When no editor is opened, `-v` prints the staged diff to stderr.
 - jj does not have a traditional `commit` command with staging; `jj commit` finalizes the working copy commit
 - `--fixup` and `--squash` are supported (autosquash markers); `--cleanup=<mode>` controls comment/scissors stripping
-- Vault signing replaces Git's `commit.gpgsign` and `user.signingkey` configuration
+- Vault signing replaces the external keyring; `commit.gpgSign` is honored while `user.signingkey` remains vault-managed

@@ -21,6 +21,11 @@ from an interactive shell so binary archive bytes are written to a file instead
 of the terminal. When `PATH` arguments are provided after `TREEISH`, only
 matching files or directories inside that committed tree are archived.
 
+Entries whose path is matched by the `export-ignore` attribute in the archived
+tree's `.gitattributes` or `.libra_attributes` files are omitted from the
+archive. Uncommitted working-tree attribute changes do not affect an archive of
+an existing `TREEISH`. `export-subst` is not implemented.
+
 ## Options
 
 | Flag | Short | Description | Default |
@@ -32,6 +37,9 @@ matching files or directories inside that committed tree are archived.
 | `--output <FILE>` | `-o` | Write archive bytes to a file instead of stdout | stdout |
 | `--prefix <PREFIX>` | | Prepend a relative directory prefix to each archived path | none |
 | `--verbose` | `-v` | Report each archived path (prefix applied) to stderr as progress | false |
+| `--add-file=<file>` | | Add an untracked working-tree file to the archive at its basename (under `--prefix`). Repeatable; not subject to the `[PATH]...` filter. Must appear before `[TREEISH]`. | none |
+| `--compression-level <0-9>` | | Compression level for `tar.gz`/`tar.bz2`/`zip` (ignored for plain `tar`). This is Git's `-0`..`-9`, which clap can't model as bare numeric flags. bzip2 has no level 0, so 0 is treated as 1. | format default |
+| `--mtime <time>` | | Set the modification time of all archive entries (same date formats as `--since`/`--until`: `YYYY-MM-DD`, RFC 3339, relative, or a Unix timestamp). | the archived commit's committer time |
 
 `--prefix <PREFIX>` must be relative. Absolute prefixes and prefixes containing
 `..` path components are rejected to prevent archive path traversal.
@@ -60,6 +68,9 @@ libra archive --list
 
 # Archive only files under src/ from HEAD.
 libra archive -o src.tar HEAD src/
+
+# Include an untracked file (e.g. release notes) alongside the tree.
+libra archive --add-file=RELEASE_NOTES.txt -o release.tar HEAD
 ```
 
 ## Output
@@ -80,6 +91,8 @@ requested destination.
 | `PATH` does not match any archived file | `LBR-CLI-003` |
 | Unknown `--format <FMT>` value | `LBR-CLI-002` |
 | Unsafe `--prefix <PREFIX>` | `LBR-CLI-002` |
+| `--add-file=<file>` path is missing or unreadable | `LBR-IO-001` |
+| `--add-file=<file>` is not a regular file (e.g. a directory) | `LBR-CLI-002` |
 | Unsafe `PATH` pathspec | `LBR-CLI-002` |
 | Referenced repository object cannot be read | `LBR-REPO-002` |
 | Blob content cannot be read | `LBR-IO-001` |

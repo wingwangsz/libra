@@ -73,6 +73,27 @@ impl ConfigKvEntry {
     }
 }
 
+fn remote_namespace_variable<'a>(key: &'a str, remote: &str) -> Option<&'a str> {
+    let (name, variable) = key.strip_prefix("remote.")?.rsplit_once('.')?;
+    (name == remote).then_some(variable)
+}
+
+fn ssh_remote_namespace_variable<'a>(key: &'a str, remote: &str) -> Option<&'a str> {
+    let (name, variable) = key.strip_prefix("vault.ssh.")?.rsplit_once('.')?;
+    (name == remote).then_some(variable)
+}
+
+fn rewrite_fetch_refspec_destination(value: &str, old: &str, new: &str) -> String {
+    let Some((source, destination)) = value.split_once(':') else {
+        return value.to_string();
+    };
+    let old_prefix = format!("refs/remotes/{old}/");
+    let Some(suffix) = destination.strip_prefix(&old_prefix) else {
+        return value.to_string();
+    };
+    format!("{source}:refs/remotes/{new}/{suffix}")
+}
+
 /// Flat key/value configuration access backed by the `config_kv` table.
 ///
 /// Marker struct; all methods are associated functions. Calling a method
@@ -120,6 +141,32 @@ impl ConfigKv {
             .await
             .context("failed to query config_kv")?;
         Ok(rows.iter().map(ConfigKvEntry::from_model).collect())
+    }
+
+    /// Get every value for a config variable while matching only the variable
+    /// name case-insensitively. The section/subsection prefix remains
+    /// case-sensitive, matching Git's config rules, and insertion order is
+    /// preserved for multi-valued variables such as `remote.<name>.fetch`.
+    pub async fn get_var_all_case_insensitive_with_conn<C: ConnectionTrait>(
+        db: &C,
+        prefix: &str,
+        variable: &str,
+    ) -> Result<Vec<ConfigKvEntry>> {
+        let rows = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.starts_with(prefix))
+            .order_by_asc(config_kv::Column::Id)
+            .all(db)
+            .await
+            .context("failed to query case-insensitive multi-value config variable")?;
+        Ok(rows
+            .iter()
+            .filter(|row| {
+                row.key
+                    .strip_prefix(prefix)
+                    .is_some_and(|name| name.eq_ignore_ascii_case(variable))
+            })
+            .map(ConfigKvEntry::from_model)
+            .collect())
     }
 
     /// Count values for a key.
@@ -317,10 +364,56 @@ impl ConfigKv {
         let rows = config_kv::Entity::find()
             .filter(config_kv::Column::Key.starts_with(prefix))
             .order_by_asc(config_kv::Column::Key)
+            // Stable tie-breaker so multi-value keys keep insertion order — e.g.
+            // `--rename-section` must preserve the order of duplicate values.
+            .order_by_asc(config_kv::Column::Id)
             .all(db)
             .await
             .context("failed to query config_kv by prefix")?;
         Ok(rows.iter().map(ConfigKvEntry::from_model).collect())
+    }
+
+    /// Resolve a config variable whose **name** is matched case-insensitively,
+    /// matching Git semantics (config variable names are case-insensitive; the
+    /// subsection between dots is *not*). `prefix` is the case-sensitive
+    /// `section[.subsection].` part (including the trailing dot) and `variable`
+    /// is the variable name in any case; among rows whose key equals
+    /// `<prefix><variable>` (variable compared ASCII-case-insensitively) the
+    /// highest-`id` (most recently inserted) match is returned.
+    ///
+    /// In normal use a logical variable has exactly **one** row — `set` updates
+    /// it in place — so the case folding is what matters: a value written under
+    /// either the camelCase spelling (`pushRemote`) or the lowercase form
+    /// emitted by `git config --list` / imports (`pushremote`) resolves to that
+    /// single value. The only case the `id` ordering disambiguates is the config
+    /// *anomaly* where two distinct case-variant rows coexist (Libra stores keys
+    /// case-sensitively, so this is possible when a variable is written under two
+    /// different spellings, but never when one spelling is used consistently or
+    /// via Git imports); there the result is deterministic (most recently inserted
+    /// spelling) but not a true cross-spelling last-write, which the `config_kv`
+    /// schema (no write-order column) cannot represent.
+    pub async fn get_var_case_insensitive_with_conn<C: ConnectionTrait>(
+        db: &C,
+        prefix: &str,
+        variable: &str,
+    ) -> Result<Option<ConfigKvEntry>> {
+        let rows = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.starts_with(prefix))
+            // Newest first so the first case-insensitive match is the most
+            // recently inserted variant (see doc note on the anomaly case).
+            .order_by_desc(config_kv::Column::Id)
+            .all(db)
+            .await
+            .context("failed to query config_kv for case-insensitive variable")?;
+        Ok(rows
+            .iter()
+            .find(|row| {
+                row.key
+                    .strip_prefix(prefix)
+                    .map(|var| var.eq_ignore_ascii_case(variable))
+                    .unwrap_or(false)
+            })
+            .map(ConfigKvEntry::from_model))
     }
 
     /// Get all entries whose key matches a regex pattern.
@@ -392,6 +485,16 @@ impl ConfigKv {
         Self::get_all_with_conn(&db, key).await
     }
 
+    /// Pool-acquiring counterpart of
+    /// [`Self::get_var_all_case_insensitive_with_conn`].
+    pub async fn get_var_all_case_insensitive(
+        prefix: &str,
+        variable: &str,
+    ) -> Result<Vec<ConfigKvEntry>> {
+        let db = get_db_conn_instance().await;
+        Self::get_var_all_case_insensitive_with_conn(&db, prefix, variable).await
+    }
+
     /// Pool-acquiring counterpart of [`Self::set_with_conn`].
     pub async fn set(key: &str, value: &str, encrypted: bool) -> Result<()> {
         let db = get_db_conn_instance().await;
@@ -426,6 +529,15 @@ impl ConfigKv {
     pub async fn get_by_prefix(prefix: &str) -> Result<Vec<ConfigKvEntry>> {
         let db = get_db_conn_instance().await;
         Self::get_by_prefix_with_conn(&db, prefix).await
+    }
+
+    /// Pool-acquiring counterpart of [`Self::get_var_case_insensitive_with_conn`].
+    pub async fn get_var_case_insensitive(
+        prefix: &str,
+        variable: &str,
+    ) -> Result<Option<ConfigKvEntry>> {
+        let db = get_db_conn_instance().await;
+        Self::get_var_case_insensitive_with_conn(&db, prefix, variable).await
     }
 
     // ── Type helpers ─────────────────────────────────────────────────────
@@ -726,6 +838,8 @@ impl ConfigKv {
     ///
     /// Performs three cascading rewrites:
     /// 1. `remote.<old>.*` keys are renamed to `remote.<new>.*`.
+    ///    Fetch refspec destinations under `refs/remotes/<old>/` are rewritten
+    ///    to the new tracking namespace at the same time.
     /// 2. Any `branch.*.remote = <old>` value is updated to `<new>`.
     /// 3. `vault.ssh.<old>.*` SSH key namespace is renamed to
     ///    `vault.ssh.<new>.*` so credentials follow the rename.
@@ -741,11 +855,31 @@ impl ConfigKv {
         old: &str,
         new: &str,
     ) -> Result<()> {
-        // Validate source exists and target doesn't
-        if Self::remote_config_with_conn(db, old).await?.is_none() {
+        // Validate the complete namespaces, not only `.url`: a push-only
+        // remote is still renameable, and any target-side key must block the
+        // rename instead of being silently merged into the new section.
+        let old_prefix = format!("remote.{old}.");
+        let new_prefix = format!("remote.{new}.");
+        let entries = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.starts_with(&old_prefix))
+            .all(db)
+            .await
+            .context("failed to query source remote entries for rename")?
+            .into_iter()
+            .filter(|entry| remote_namespace_variable(&entry.key, old).is_some())
+            .collect::<Vec<_>>();
+        if entries.is_empty() {
             return Err(anyhow!("fatal: No such remote: {old}"));
         }
-        if Self::remote_config_with_conn(db, new).await?.is_some() {
+        let target_entries = config_kv::Entity::find()
+            .filter(config_kv::Column::Key.starts_with(&new_prefix))
+            .all(db)
+            .await
+            .context("failed to query target remote entries for rename")?
+            .into_iter()
+            .filter(|entry| remote_namespace_variable(&entry.key, new).is_some())
+            .collect::<Vec<_>>();
+        if !target_entries.is_empty() {
             return Err(anyhow!("fatal: remote {new} already exists."));
         }
         let ssh_old_prefix = format!("vault.ssh.{old}.");
@@ -754,7 +888,10 @@ impl ConfigKv {
             .filter(config_kv::Column::Key.starts_with(&ssh_new_prefix))
             .all(db)
             .await
-            .context("failed to query target SSH key entries for rename")?;
+            .context("failed to query target SSH key entries for rename")?
+            .into_iter()
+            .filter(|entry| ssh_remote_namespace_variable(&entry.key, new).is_some())
+            .collect::<Vec<_>>();
         if !existing_target_ssh_entries.is_empty() {
             return Err(anyhow!(
                 "fatal: SSH key namespace for remote '{new}' already exists"
@@ -762,17 +899,18 @@ impl ConfigKv {
         }
 
         // Rename remote.old.* → remote.new.*
-        let old_prefix = format!("remote.{old}.");
-        let new_prefix = format!("remote.{new}.");
-        let entries = config_kv::Entity::find()
-            .filter(config_kv::Column::Key.starts_with(&old_prefix))
-            .all(db)
-            .await
-            .context("failed to query remote entries for rename")?;
         for entry in entries {
             let new_key = entry.key.replacen(&old_prefix, &new_prefix, 1);
+            let new_value = if remote_namespace_variable(&entry.key, old)
+                .is_some_and(|variable| variable.eq_ignore_ascii_case("fetch"))
+            {
+                rewrite_fetch_refspec_destination(&entry.value, old, new)
+            } else {
+                entry.value.clone()
+            };
             let mut active: config_kv::ActiveModel = entry.into();
             active.key = Set(new_key);
+            active.value = Set(new_value);
             active
                 .update(db)
                 .await
@@ -805,7 +943,10 @@ impl ConfigKv {
             .filter(config_kv::Column::Key.starts_with(&ssh_old_prefix))
             .all(db)
             .await
-            .context("failed to query SSH key entries for rename")?;
+            .context("failed to query SSH key entries for rename")?
+            .into_iter()
+            .filter(|entry| ssh_remote_namespace_variable(&entry.key, old).is_some())
+            .collect::<Vec<_>>();
         for entry in ssh_entries {
             let new_key = entry.key.replacen(&ssh_old_prefix, &ssh_new_prefix, 1);
             let mut active: config_kv::ActiveModel = entry.into();
@@ -1014,6 +1155,13 @@ fn global_config_path() -> Option<std::path::PathBuf> {
     dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
 }
 
+fn system_config_path() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("LIBRA_CONFIG_SYSTEM_DB") {
+        return Some(std::path::PathBuf::from(path));
+    }
+    Some(std::path::PathBuf::from("/etc/libra/config.db"))
+}
+
 /// Identity sources resolved for commands that need name/email defaults.
 ///
 /// `config_*` contains the cascaded local/global result for each field, while
@@ -1074,6 +1222,121 @@ pub async fn read_cascaded_config_value(
         return Ok(Some(value));
     }
     global_config_value(key).await
+}
+
+/// Parse a Git-compatible boolean config value (`git_config_bool` semantics):
+/// `true`/`yes`/`on` (case-insensitive) and any non-zero integer — with an
+/// optional `k`/`m`/`g` unit suffix, as Git's int parser accepts — are true;
+/// `false`/`no`/`off` and `0` (or `0k` …) are false. Returns `None` for
+/// anything else, INCLUDING the empty string: the strict-cascade config
+/// family (plan-20260708 P1-05) deliberately rejects present-but-empty
+/// values instead of adopting Git's implicit-bool reading of them.
+pub fn parse_git_config_bool(value: &str) -> Option<bool> {
+    let normalized = value.trim().to_ascii_lowercase();
+    match normalized.as_str() {
+        "true" | "yes" | "on" => return Some(true),
+        "false" | "no" | "off" => return Some(false),
+        _ => {}
+    }
+    parse_git_config_int(&normalized).map(|number| number != 0)
+}
+
+/// Parse a Git-compatible integer config value: an optional sign, digits, and
+/// an optional `k`/`m`/`g` unit suffix (×1024 steps). `None` on anything else
+/// or on overflow. Expects pre-trimmed, pre-lowercased input.
+pub(crate) fn parse_git_config_int(value: &str) -> Option<i64> {
+    let (digits, multiplier) = match value.as_bytes().last()? {
+        b'k' => (&value[..value.len() - 1], 1024i64),
+        b'm' => (&value[..value.len() - 1], 1024i64 * 1024),
+        b'g' => (&value[..value.len() - 1], 1024i64 * 1024 * 1024),
+        _ => (value, 1),
+    };
+    digits.parse::<i64>().ok()?.checked_mul(multiplier)
+}
+
+/// Read a Git-compatible default value across all config scopes.
+///
+/// Unlike [`read_cascaded_config_value`], this helper preserves a present empty
+/// value so callers can reject it as invalid, decrypts encrypted local/global
+/// values, includes the system scope, matches section and variable names
+/// case-insensitively (while preserving subsection case), and falls back to the
+/// legacy `config` table. System-scope read failures are intentionally skipped,
+/// matching the system-config contract documented by `libra config`.
+pub async fn read_cascaded_config_value_strict(
+    local_target: LocalIdentityTarget<'_>,
+    key: &str,
+) -> Result<Option<String>> {
+    if let Some(entry) = local_config_entry_for_target_case_insensitive(local_target, key).await? {
+        return Ok(Some(
+            decrypt_strict_config_entry(entry, StrictConfigScope::Local(local_target)).await?,
+        ));
+    }
+
+    if let Some(path) = global_config_path()
+        && let Some(entry) = read_config_entry_from_db_path_case_insensitive(&path, key).await?
+    {
+        return Ok(Some(
+            decrypt_strict_config_entry(entry, StrictConfigScope::Global).await?,
+        ));
+    }
+
+    if let Some(path) = system_config_path() {
+        match read_config_entry_from_db_path_case_insensitive(&path, key).await {
+            Ok(Some(entry)) => {
+                match decrypt_strict_config_entry(entry, StrictConfigScope::System).await {
+                    Ok(value) => return Ok(Some(value)),
+                    Err(error) => {
+                        tracing::debug!(
+                            key,
+                            path = %path.display(),
+                            error = %format!("{error:#}"),
+                            "skipping unsupported system config default"
+                        );
+                    }
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracing::debug!(
+                    key,
+                    path = %path.display(),
+                    error = %format!("{error:#}"),
+                    "skipping unreadable system config scope"
+                );
+            }
+        }
+    }
+
+    Ok(None)
+}
+
+enum StrictConfigScope<'a> {
+    Local(LocalIdentityTarget<'a>),
+    Global,
+    System,
+}
+
+async fn decrypt_strict_config_entry(
+    entry: ConfigKvEntry,
+    scope: StrictConfigScope<'_>,
+) -> Result<String> {
+    if !entry.encrypted {
+        return Ok(entry.value);
+    }
+
+    match scope {
+        StrictConfigScope::Local(local_target) => {
+            decrypt_value_for_local_target(&entry.value, local_target)
+                .await
+                .context("failed to decrypt encrypted local config default")
+        }
+        StrictConfigScope::Global => decrypt_value(&entry.value, "global")
+            .await
+            .context("failed to decrypt encrypted global config default"),
+        StrictConfigScope::System => {
+            Err(anyhow!("encrypted system config defaults are unsupported"))
+        }
+    }
 }
 
 /// Read a config value for the given target using local-first, then global, and
@@ -1236,6 +1499,29 @@ async fn local_config_entry_for_target(
     }
 }
 
+async fn local_config_entry_for_target_case_insensitive(
+    local_target: LocalIdentityTarget<'_>,
+    key: &str,
+) -> Result<Option<ConfigKvEntry>> {
+    match local_target {
+        LocalIdentityTarget::CurrentRepo => {
+            let storage = match crate::utils::util::try_get_storage_path(None) {
+                Ok(storage) => storage,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(error) => {
+                    return Err(error).context("failed to resolve current repository storage");
+                }
+            };
+            let db_path = storage.join(crate::utils::util::DATABASE);
+            read_config_entry_from_db_path_case_insensitive(&db_path, key).await
+        }
+        LocalIdentityTarget::ExplicitDb(db_path) => {
+            read_config_entry_from_db_path_case_insensitive(db_path, key).await
+        }
+        LocalIdentityTarget::None => Ok(None),
+    }
+}
+
 /// Look up a `vault.env.<name>` value from the global config DB.
 ///
 /// Returns `Ok(None)` if the global DB does not exist (user has never
@@ -1340,6 +1626,93 @@ async fn read_config_entry_from_db_path(
     })
 }
 
+async fn read_config_entry_from_db_path_case_insensitive(
+    db_path: &Path,
+    key: &str,
+) -> Result<Option<ConfigKvEntry>> {
+    let exists = db_path
+        .try_exists()
+        .with_context(|| format!("failed to inspect config database '{}'", db_path.display()))?;
+    if !exists {
+        return Ok(None);
+    }
+
+    let Some((section, subsection, variable)) = split_git_config_key(key) else {
+        return Ok(None);
+    };
+    let conn = get_db_conn_instance_for_path(db_path)
+        .await
+        .with_context(|| format!("failed to open config database '{}'", db_path.display()))?;
+
+    let entries = config_kv::Entity::find()
+        .order_by_desc(config_kv::Column::Id)
+        .all(&conn)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query '{key}' from config database '{}'",
+                db_path.display()
+            )
+        })?;
+    if let Some(entry) = entries
+        .iter()
+        .find(|entry| git_config_key_matches(&entry.key, key))
+    {
+        return Ok(Some(ConfigKvEntry::from_model(entry)));
+    }
+
+    let legacy_entries = config::Entity::find()
+        .order_by_desc(config::Column::Id)
+        .all(&conn)
+        .await
+        .with_context(|| {
+            format!(
+                "failed to query legacy config for '{key}' from database '{}'",
+                db_path.display()
+            )
+        })?;
+    Ok(legacy_entries
+        .iter()
+        .find(|entry| {
+            entry.configuration.eq_ignore_ascii_case(section)
+                && entry.name.as_deref() == subsection
+                && entry.key.eq_ignore_ascii_case(variable)
+        })
+        .map(|entry| ConfigKvEntry {
+            key: key.to_string(),
+            value: entry.value.clone(),
+            encrypted: false,
+        }))
+}
+
+/// Split a Git-style dotted config key into section, optional subsection, and
+/// variable. The final dot separates the variable so branch names containing
+/// dots remain intact.
+fn split_git_config_key(key: &str) -> Option<(&str, Option<&str>, &str)> {
+    let (section, remainder) = key.split_once('.')?;
+    if let Some((subsection, variable)) = remainder.rsplit_once('.') {
+        Some((section, Some(subsection), variable))
+    } else {
+        Some((section, None, remainder))
+    }
+}
+
+fn git_config_key_matches(stored: &str, requested: &str) -> bool {
+    let Some((requested_section, requested_subsection, requested_variable)) =
+        split_git_config_key(requested)
+    else {
+        return false;
+    };
+    let Some((stored_section, stored_subsection, stored_variable)) = split_git_config_key(stored)
+    else {
+        return false;
+    };
+
+    stored_section.eq_ignore_ascii_case(requested_section)
+        && stored_subsection == requested_subsection
+        && stored_variable.eq_ignore_ascii_case(requested_variable)
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // Sensitive key detection
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1361,6 +1734,11 @@ pub fn is_sensitive_key(key: &str) -> bool {
 
     // Exact-match vault internals
     if lower.starts_with("vault.env.") {
+        return true;
+    }
+    // Host-token records (lore.md 1.6): owned exclusively by `libra auth` —
+    // config get/set/list/unset must neither dump nor forge nor delete them.
+    if lower.starts_with("auth.token.") {
         return true;
     }
     if lower.ends_with(".privkey") {
@@ -1408,6 +1786,9 @@ pub fn is_vault_internal_key(key: &str) -> bool {
         || lower == "vault.unsealkey"
         || lower == "vault.roottoken"
         || lower == "vault.roottoken_enc"
+        // `libra auth` token records: unset via config would be an unaudited
+        // logout outside the owner API.
+        || lower.starts_with("auth.token.")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

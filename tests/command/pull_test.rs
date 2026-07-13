@@ -127,7 +127,44 @@ fn test_pull_cli_without_tracking_returns_repo_exit_code() {
 
     assert_eq!(output.status.code(), Some(128));
     assert_eq!(report.error_code, "LBR-REPO-003");
-    assert!(stderr.contains("there is no tracking information for the current branch"));
+    assert!(
+        stderr.starts_with(concat!(
+            "There is no tracking information for the current branch.\n",
+            "Please specify which branch you want to merge with.\n",
+            "See git-pull(1) for details.\n\n",
+            "    libra pull <remote> <branch>\n\n",
+            "If you wish to set tracking information for this branch you can do so with:\n\n",
+            "    libra branch --set-upstream-to=<remote>/<branch> main",
+        )),
+        "pull without tracking should match git-style advice: {stderr}"
+    );
+    assert!(
+        !stderr.starts_with("error:"),
+        "git-style pull advice is unprefixed: {stderr}"
+    );
+}
+
+#[test]
+#[serial]
+fn test_pull_cli_without_tracking_uses_single_remote_in_advice() {
+    let repo = create_committed_repo_via_cli();
+    let remote = tempdir().expect("failed to create remote root");
+
+    let remote_output = run_libra_command(
+        &["remote", "add", "origin", remote.path().to_str().unwrap()],
+        repo.path(),
+    );
+    assert_cli_success(&remote_output, "remote add");
+
+    let output = run_libra_command(&["pull"], repo.path());
+    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+
+    assert_eq!(output.status.code(), Some(128));
+    assert_eq!(report.error_code, "LBR-REPO-003");
+    assert!(
+        stderr.contains("    libra branch --set-upstream-to=origin/<branch> main"),
+        "single remote should appear in git-style set-upstream advice: {stderr}"
+    );
 }
 
 #[test]
@@ -157,6 +194,30 @@ fn test_pull_ff_only_conflicts_with_rebase_at_parse_time() {
             && stderr.contains("--ff-only")
             && stderr.contains("--rebase"),
         "pull should reject conflicting integration modes before repo preflight: {stderr}"
+    );
+}
+
+#[test]
+fn test_pull_no_rebase_countermands_rebase_at_parse_time() {
+    let repo = tempdir().expect("failed to create local repo");
+
+    // `--rebase --no-rebase` (last wins) is NOT a clap conflict: `--no-rebase`
+    // countermands `--rebase` via the symmetric override, so it parses and
+    // fails later at remote/tracking resolution, not at clap.
+    let output = run_libra_command(&["pull", "--rebase", "--no-rebase"], repo.path());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !stderr.contains("cannot be used with") && !stderr.contains("unexpected argument"),
+        "pull --rebase --no-rebase parses (override, no conflict): {stderr}"
+    );
+
+    // `--no-rebase` is compatible with merge options like `--no-ff` (unlike
+    // `--rebase`, which conflicts with them).
+    let merge_opts = run_libra_command(&["pull", "--no-ff", "--no-rebase"], repo.path());
+    let merge_stderr = String::from_utf8_lossy(&merge_opts.stderr);
+    assert!(
+        !merge_stderr.contains("cannot be used with"),
+        "pull --no-ff --no-rebase parses (merge path): {merge_stderr}"
     );
 }
 
@@ -216,6 +277,60 @@ async fn test_pull_ff_only_fast_forward_updates_head_from_tracking_remote() {
     assert!(
         local_repo.path().join("remote.txt").exists(),
         "pull --ff-only should restore the fetched worktree"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_pull_fast_forward_skips_untracked_artifacts_during_restore() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let (_temp_root, remote_dir, work_dir, branch) = create_remote_fixture();
+
+    let local_repo = tempdir().expect("failed to create local repo");
+    init_repo_via_cli(local_repo.path());
+    configure_identity_via_cli(local_repo.path());
+    configure_pull_tracking(local_repo.path(), &remote_dir, &branch);
+
+    let first_pull = run_libra_command(&["pull"], local_repo.path());
+    assert_cli_success(&first_pull, "initial pull");
+
+    fs::write(local_repo.path().join(".libraignore"), "target/\n")
+        .expect("failed to write ignore file");
+    let artifact_dir = local_repo.path().join("target/deep");
+    fs::create_dir_all(&artifact_dir).expect("failed to create artifact dir");
+    fs::write(artifact_dir.join("artifact.bin"), b"untracked build output")
+        .expect("failed to write artifact");
+    fs::set_permissions(&artifact_dir, fs::Permissions::from_mode(0o000))
+        .expect("failed to lock artifact dir");
+
+    let new_head = push_remote_commit(
+        &work_dir,
+        &branch,
+        "remote.txt",
+        "remote change\n",
+        "remote update",
+    );
+    let output = run_libra_command(&["pull", "--ff-only"], local_repo.path());
+
+    fs::set_permissions(&artifact_dir, fs::Permissions::from_mode(0o700))
+        .expect("failed to unlock artifact dir");
+
+    assert_cli_success(&output, "pull should not scan untracked build artifacts");
+
+    let _guard = ChangeDirGuard::new(local_repo.path());
+    let head = Head::current_commit()
+        .await
+        .expect("pull should update HEAD to the fetched commit");
+    assert_eq!(head.to_string(), new_head);
+    assert!(
+        local_repo.path().join("remote.txt").exists(),
+        "pull should restore tracked files from the fetched commit"
+    );
+    assert!(
+        artifact_dir.join("artifact.bin").exists(),
+        "pull should leave untracked artifacts alone"
     );
 }
 

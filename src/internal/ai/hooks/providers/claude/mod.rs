@@ -57,6 +57,10 @@ impl HookProvider for ClaudeProvider {
         parser::parse_claude_hook_event(hook_event_name, envelope)
     }
 
+    fn recognizes_event(&self, hook_event_name: &str) -> bool {
+        parser::CLAUDE_HOOK_EVENT_NAMES.contains(&hook_event_name)
+    }
+
     fn dedup_identity_keys(&self) -> &'static [&'static str] {
         CANONICAL_DEDUP_IDENTITY_KEYS
     }

@@ -17,6 +17,13 @@ libra push [OPTIONS] [<repository> [<refspec>...]]
 
 LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lfs push`。
 
+## 全局配置 Schema 保护
+
+`libra push` 在信任远端 / tiered 对象存储设置前，会读取全局存储配置（`~/.libra/config.db`，或 `LIBRA_CONFIG_GLOBAL_DB` 指定的路径）。如果该数据库的 schema 版本比当前二进制支持的版本更新，push 会以 `LBR-CONFIG-001` fail-closed，而不是静默忽略全局存储配置并回退到本地对象。诊断会包含二进制路径和版本、配置 DB 路径、schema 版本，以及升级命令：
+`curl --proto '=https' --tlsv1.2 -sSf https://download.libra.tools/install.sh | sh`。
+
+只有在明确希望本地对象访问时，才使用 `libra --offline push ...` 或 `LIBRA_READ_POLICY=offline|local libra push ...`。Libra 会告警一次，并在本次运行中忽略全局存储配置。
+
 ## 选项
 
 | 标志 / 参数 | 说明 | 示例 |
@@ -30,6 +37,7 @@ LFS 跟踪文件会在 HTTP 推送期间透明上传，不需要单独执行 `lf
 | `--tags` | 推送所有本地 `refs/tags/*` refs。已存在且相同的远程标签会跳过。 | `libra push --tags origin` |
 | `--mirror` | 将本地 `refs/heads/*` 和 `refs/tags/*` 镜像到远程，删除远程独有分支/标签 refs。配合 `--dry-run` 预览。 | `libra push --mirror --dry-run origin` |
 | `--no-verify` | 绕过 `pre-push` hook。为兼容而接受的 **no-op**：Libra 的 push 不运行客户端 `pre-push` hook，故无可绕过。 | `libra push --no-verify origin main` |
+| `--no-progress` | 在 stderr 抑制进度条（“Compressing objects” / “Writing objects” reporters），对齐 `git push --no-progress`。 | `libra push --no-progress origin main` |
 | `--json` | 向 stdout 输出结构化 JSON 信封（全局标志）。 | `libra push --json` |
 | `--machine` | 紧凑单行 JSON；抑制进度（全局标志）。 | `libra push --machine` |
 | `--quiet` | 抑制 stdout 摘要；警告仍写入 stderr。 | `libra push --quiet` |

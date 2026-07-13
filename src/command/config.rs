@@ -7,7 +7,7 @@ use std::{io::IsTerminal, path::PathBuf, process::Command};
 
 use clap::{Parser, Subcommand};
 use once_cell::sync::Lazy;
-use sea_orm::DatabaseConnection;
+use sea_orm::{DatabaseConnection, TransactionTrait};
 use serde::Serialize;
 use tokio::sync::Mutex;
 
@@ -33,12 +33,18 @@ use crate::{
 static GLOBAL_CONFIG_CONN: Lazy<Mutex<Option<(PathBuf, DatabaseConnection)>>> =
     Lazy::new(|| Mutex::new(None));
 
+/// Cached database connection for System scope, paired with the resolved DB path.
+static SYSTEM_CONFIG_CONN: Lazy<Mutex<Option<(PathBuf, DatabaseConnection)>>> =
+    Lazy::new(|| Mutex::new(None));
+
 const EXAMPLES: &str = r#"EXAMPLES:
     libra config set user.name "John Doe"              Set local config value
     libra config get user.name                         Get value (cascade lookup)
+    libra config --type int core.editorTimeout 30       Validate/canonicalize a typed value on set
     libra config list                                  List all local entries
     libra config list --show-origin                    List with scope labels
     libra config set --global user.email "j@x.com"     Set global config
+    libra config set --system core.editor vim           Set system-wide config (needs privileges)
     libra config unset user.signingkey                 Remove a key
     libra config import --global                       Import from Git global config
     libra config set vault.env.GEMINI_API_KEY          Store API key (interactive)
@@ -57,11 +63,17 @@ pub enum ConfigScope {
     Local,
     /// User-level (`~/.libra/config.db`).
     Global,
+    /// System-wide (`/etc/libra/config.db`, overridable via
+    /// `LIBRA_CONFIG_SYSTEM_DB`). Lowest precedence; writing it usually needs
+    /// elevated privileges, like Git's `/etc/gitconfig`.
+    System,
 }
 
 impl ConfigScope {
-    /// Cascade order for reads (highest to lowest precedence).
-    pub const CASCADE_ORDER: [ConfigScope; 2] = [ConfigScope::Local, ConfigScope::Global];
+    /// Cascade order for reads (highest to lowest precedence): local overrides
+    /// global, which overrides system — matching Git.
+    pub const CASCADE_ORDER: [ConfigScope; 3] =
+        [ConfigScope::Local, ConfigScope::Global, ConfigScope::System];
 
     /// Get the config database path for this scope.
     pub fn get_config_path(&self) -> Option<PathBuf> {
@@ -73,33 +85,47 @@ impl ConfigScope {
                 }
                 dirs::home_dir().map(|home| home.join(".libra").join("config.db"))
             }
+            ConfigScope::System => {
+                if let Some(p) = std::env::var_os("LIBRA_CONFIG_SYSTEM_DB") {
+                    return Some(PathBuf::from(p));
+                }
+                Some(PathBuf::from("/etc/libra/config.db"))
+            }
         }
     }
 
     pub async fn ensure_config_exists(&self) -> Result<(), String> {
         match self {
             ConfigScope::Local => Ok(()),
-            ConfigScope::Global => {
+            ConfigScope::Global | ConfigScope::System => {
+                let label = scope_name(*self);
                 if let Some(config_path) = self.get_config_path() {
                     if let Some(parent_dir) = config_path.parent()
                         && !parent_dir.exists()
                     {
                         std::fs::create_dir_all(parent_dir).map_err(|e| {
-                            format!("Failed to create global config directory: {e}")
+                            format!(
+                                "Failed to create {label} config directory '{}': {e}{}",
+                                parent_dir.display(),
+                                if matches!(self, ConfigScope::System) {
+                                    " (writing system config usually requires elevated privileges)"
+                                } else {
+                                    ""
+                                }
+                            )
                         })?;
                     }
                     if !config_path.exists() {
                         let config_path_str = config_path.to_string_lossy();
-                        create_database(&config_path_str)
-                            .await
-                            .map_err(|e| format!("Failed to create global config database: {e}"))?;
+                        create_database(&config_path_str).await.map_err(|e| {
+                            format!("Failed to create {label} config database: {e}")
+                        })?;
                     }
                     Ok(())
                 } else {
-                    Err(
-                        "Could not determine global config path: home directory not available"
-                            .to_string(),
-                    )
+                    Err(format!(
+                        "Could not determine {label} config path: home directory not available"
+                    ))
                 }
             }
         }
@@ -129,6 +155,9 @@ impl ScopedConfig {
             }
             ConfigScope::Global => {
                 Self::get_or_create_cached_connection(&GLOBAL_CONFIG_CONN, scope, "global").await
+            }
+            ConfigScope::System => {
+                Self::get_or_create_cached_connection(&SYSTEM_CONFIG_CONN, scope, "system").await
             }
         }
     }
@@ -282,6 +311,34 @@ pub struct ConfigArgs {
     /// Show which scope each value comes from
     #[clap(long("show-origin"), hide = true)]
     pub show_origin: bool,
+    /// Remove an entire section (`<name>`) and all of its keys
+    #[clap(long("remove-section"), hide = true)]
+    pub remove_section: bool,
+    /// Rename a section: `--rename-section <old> <new>`
+    #[clap(long("rename-section"), hide = true)]
+    pub rename_section: bool,
+    /// NUL-terminate output records (`git config -z`): values for get/get-all,
+    /// and `key\nvalue\0` for `--get-regexp` / `--list`.
+    #[clap(short = 'z', long = "null", global = true)]
+    pub null: bool,
+    /// Canonicalize the value to a type when reading (`git config --type=<t>`:
+    /// `bool`, `int`, or `path`). Mutually exclusive with the shortcut flags.
+    #[clap(
+        long = "type",
+        value_name = "TYPE",
+        hide = true,
+        group = "config_type_sel"
+    )]
+    pub value_type: Option<String>,
+    /// Shortcut for `--type=bool`.
+    #[clap(long = "bool", hide = true, group = "config_type_sel")]
+    pub type_bool: bool,
+    /// Shortcut for `--type=int`.
+    #[clap(long = "int", hide = true, group = "config_type_sel")]
+    pub type_int: bool,
+    /// Shortcut for `--type=path`.
+    #[clap(long = "path", hide = true, group = "config_type_sel")]
+    pub type_path: bool,
 
     // ── Scope flags ──────────────────────────────────────────────────
     /// Use repository config (default)
@@ -290,7 +347,10 @@ pub struct ConfigArgs {
     /// Use global user config
     #[clap(long, global = true, group("scope"))]
     pub global: bool,
-    /// System scope (removed — always errors)
+    /// Use system-wide config (`/etc/libra/config.db`, overridable via
+    /// `LIBRA_CONFIG_SYSTEM_DB`). Lowest cascade precedence; writing it usually
+    /// requires elevated privileges. Vault-encrypted secrets are not supported
+    /// in this scope.
     #[clap(long, global = true, group("scope"))]
     pub system: bool,
 
@@ -460,15 +520,6 @@ pub async fn execute_safe(args: ConfigArgs, output: &OutputConfig) -> CliResult<
 // ─────────────────────────────────────────────────────────────────────────────
 
 async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()> {
-    // Reject --system early. config.md treats this as a CLI usage error
-    // (exit 2 fine / 129 coarse) — the user picked an unsupported scope at
-    // the argument level, not at runtime.
-    if args.system {
-        return Err(CliError::command_usage(
-            "--system scope is not supported\n\nhint: use --local or --global",
-        ));
-    }
-
     let scope = get_scope(&args);
     let use_cascade = !has_explicit_scope(&args);
 
@@ -483,6 +534,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             encrypt,
             plaintext,
             stdin,
+            value_type,
         } => {
             handle_set(
                 &key,
@@ -491,6 +543,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 encrypt,
                 plaintext,
                 stdin,
+                value_type,
                 scope,
                 output,
             )
@@ -502,6 +555,8 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             reveal,
             regexp,
             default,
+            null,
+            value_type,
         } => {
             handle_get(
                 &key,
@@ -511,6 +566,8 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 default.as_deref(),
                 scope,
                 use_cascade,
+                null,
+                value_type,
                 output,
             )
             .await
@@ -521,6 +578,7 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
             vault,
             ssh_keys,
             gpg_keys,
+            null,
         } => {
             handle_list(
                 name_only,
@@ -530,11 +588,18 @@ async fn execute_inner(args: ConfigArgs, output: &OutputConfig) -> CliResult<()>
                 gpg_keys,
                 scope,
                 use_cascade,
+                null,
                 output,
             )
             .await
         }
         ResolvedCommand::Unset { key, all } => handle_unset(&key, all, scope, output).await,
+        ResolvedCommand::RemoveSection { name } => {
+            handle_remove_section(&name, scope, output).await
+        }
+        ResolvedCommand::RenameSection { old, new } => {
+            handle_rename_section(&old, &new, scope, output).await
+        }
         ResolvedCommand::Import => handle_import(scope, output).await,
         ResolvedCommand::Path => handle_path(scope, output).await,
         ResolvedCommand::Edit => Err(CliError::from_legacy_string(
@@ -569,6 +634,9 @@ enum ResolvedCommand {
         encrypt: bool,
         plaintext: bool,
         stdin: bool,
+        /// Validate and canonicalize the value to this type before storing
+        /// (`--type`/`--bool`/etc. on a set, matching `git config --type`).
+        value_type: Option<ConfigValueType>,
     },
     Get {
         key: String,
@@ -576,6 +644,10 @@ enum ResolvedCommand {
         reveal: bool,
         regexp: bool,
         default: Option<String>,
+        /// NUL-terminate output records (`-z`/`--null`).
+        null: bool,
+        /// Canonicalize the read value to this type (`--type`/`--bool`/etc.).
+        value_type: Option<ConfigValueType>,
     },
     List {
         name_only: bool,
@@ -583,10 +655,21 @@ enum ResolvedCommand {
         vault: bool,
         ssh_keys: bool,
         gpg_keys: bool,
+        /// NUL-terminate output records (`-z`/`--null`).
+        null: bool,
     },
     Unset {
         key: String,
         all: bool,
+    },
+    /// Remove an entire section and every key under it.
+    RemoveSection {
+        name: String,
+    },
+    /// Rename a section, moving all of its keys from `old.*` to `new.*`.
+    RenameSection {
+        old: String,
+        new: String,
     },
     Import,
     Path,
@@ -602,6 +685,33 @@ enum ResolvedCommand {
 }
 
 fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
+    let cmd = resolve_command_typed(args)?;
+
+    // `--type`/`--bool`/`--int`/`--path` canonicalize a value when reading and
+    // validate/canonicalize it when setting, so they apply only to get and set
+    // operations; any other mode is rejected up front (Git silently ignores the
+    // flag there, but Libra prefers an explicit usage error).
+    if resolve_value_type(args)?.is_some()
+        && !matches!(
+            cmd,
+            ResolvedCommand::Get { .. } | ResolvedCommand::Set { .. }
+        )
+    {
+        return Err(CliError::command_usage(
+            "--type/--bool/--int/--path is only valid with --get/--get-all/--get-regexp or when setting a value",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+
+    Ok(cmd)
+}
+
+fn resolve_command_typed(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
+    // The type flag is threaded into get (canonicalize on read) and set
+    // (validate/canonicalize on write); applicability to the resolved command is
+    // checked by the caller.
+    let value_type = resolve_value_type(args)?;
+
     // If an explicit subcommand was provided, use it directly
     if let Some(ref cmd) = args.command {
         return Ok(match cmd {
@@ -619,6 +729,7 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 encrypt: *encrypt,
                 plaintext: *plaintext,
                 stdin: *stdin,
+                value_type,
             },
             ConfigCommand::Get {
                 key,
@@ -632,6 +743,8 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 reveal: *reveal,
                 regexp: *regexp,
                 default: default.clone(),
+                null: args.null,
+                value_type,
             },
             ConfigCommand::List {
                 name_only,
@@ -645,6 +758,7 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
                 vault: *vault,
                 ssh_keys: *ssh_keys,
                 gpg_keys: *gpg_keys,
+                null: args.null,
             },
             ConfigCommand::Unset { key, all } => ResolvedCommand::Unset {
                 key: key.clone(),
@@ -674,7 +788,46 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             vault: false,
             ssh_keys: false,
             gpg_keys: false,
+            null: args.null,
         });
+    }
+    if args.remove_section {
+        let name = args
+            .key
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                CliError::from_legacy_string("error: --remove-section requires a <name>")
+                    .with_exit_code(2)
+            })?;
+        if args.valuepattern.is_some() {
+            return Err(CliError::from_legacy_string(
+                "error: --remove-section takes exactly one <name>",
+            )
+            .with_exit_code(2));
+        }
+        return Ok(ResolvedCommand::RemoveSection {
+            name: name.to_string(),
+        });
+    }
+    if args.rename_section {
+        match (
+            args.key.as_deref().filter(|s| !s.is_empty()),
+            args.valuepattern.as_deref().filter(|s| !s.is_empty()),
+        ) {
+            (Some(old), Some(new)) => {
+                return Ok(ResolvedCommand::RenameSection {
+                    old: old.to_string(),
+                    new: new.to_string(),
+                });
+            }
+            _ => {
+                return Err(CliError::from_legacy_string(
+                    "error: --rename-section requires <old-name> <new-name>",
+                )
+                .with_exit_code(2));
+            }
+        }
     }
     if args.import || args.key.as_deref() == Some("import") {
         if args.import && args.key.is_some() {
@@ -725,6 +878,8 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             reveal: false,
             regexp: true,
             default: args.default.clone(),
+            null: args.null,
+            value_type,
         });
     }
     if args.get {
@@ -734,6 +889,8 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             reveal: false,
             regexp: false,
             default: args.default.clone(),
+            null: args.null,
+            value_type,
         });
     }
     if args.get_all {
@@ -743,6 +900,8 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             reveal: false,
             regexp: false,
             default: args.default.clone(),
+            null: args.null,
+            value_type,
         });
     }
     if args.unset {
@@ -769,6 +928,7 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
             encrypt: false,
             plaintext: false,
             stdin: false,
+            value_type,
         });
     }
 
@@ -782,6 +942,7 @@ fn resolve_command(args: &ConfigArgs) -> CliResult<ResolvedCommand> {
         encrypt: false,
         plaintext: false,
         stdin: false,
+        value_type,
     })
 }
 
@@ -797,6 +958,7 @@ async fn handle_set(
     encrypt: bool,
     plaintext: bool,
     stdin: bool,
+    value_type: Option<ConfigValueType>,
     scope: ConfigScope,
     output: &OutputConfig,
 ) -> CliResult<()> {
@@ -829,6 +991,27 @@ async fn handle_set(
         .with_stable_code(StableErrorCode::RepoStateInvalid));
     }
 
+    // System-scope vault preflight: reject any write that would touch the vault
+    // BEFORE any `ScopedConfig` access, so a rejected `--system` vault write
+    // never creates or touches `/etc/libra/config.db`. The system scope has no
+    // vault (its unseal key would be root-owned and either unreadable to users
+    // or world-readable). The post-`get_all` guard below covers the rarer
+    // encryption-inheritance edge.
+    // The entire `vault.*` namespace is vault-related (incl. non-sensitive
+    // pubkeys like `vault.signing`/`vault.ssh.*.pubkey`/`vault.gpg.pubkey` that
+    // `is_sensitive_key` does not flag), so reject the whole prefix here. Git
+    // section names are case-insensitive, so match `Vault.*` too.
+    if scope == ConfigScope::System
+        && (encrypt
+            || key.to_ascii_lowercase().starts_with("vault.")
+            || (is_sensitive_key(key) && !plaintext))
+    {
+        return Err(CliError::command_usage(
+            "vault-encrypted secrets are not supported in --system scope",
+        )
+        .with_hint("use --global or --local for vault.* keys and --encrypt values"));
+    }
+
     // Check encryption state inheritance from existing entries.
     let existing_entries = ScopedConfig::get_all(scope, key).await.map_err(|e| {
         config_read_cli_error(format!(
@@ -839,6 +1022,19 @@ async fn handle_set(
     })?;
     let has_encrypted = existing_entries.iter().any(|e| e.encrypted);
     let has_plaintext = existing_entries.iter().any(|e| !e.encrypted);
+
+    // The system scope holds no vault, so an existing encrypted row should never
+    // be there. If one is (e.g. a hand-crafted DB), refuse to write the key at
+    // all — even with `--plaintext`, since `set_with_conn` would preserve the
+    // row's `encrypted=1` flag while storing a new plaintext value. This catches
+    // the edge the encrypt-time preflight above cannot (it runs regardless of
+    // `--encrypt`/`--plaintext`).
+    if scope == ConfigScope::System && has_encrypted {
+        return Err(CliError::command_usage(
+            "vault-encrypted secrets are not supported in --system scope",
+        )
+        .with_hint("this key already has an encrypted value; use --global or --local"));
+    }
 
     // Resolve the value
     let resolved_value = if stdin {
@@ -892,6 +1088,16 @@ async fn handle_set(
         }
     };
 
+    // `--type`/`--bool`/`--int`/`--path` on a set validate and canonicalize the
+    // value before it is stored (matching `git config --type`: `yes` -> `true`,
+    // `1k` -> `1024`, `~/x` -> the expanded path), erroring on a value that is
+    // not valid for the type. Canonicalize the logical value before any
+    // encryption so the stored secret round-trips to the canonical form.
+    let resolved_value = match value_type {
+        Some(value_type) => canonicalize_typed_value(&resolved_value, value_type)?,
+        None => resolved_value,
+    };
+
     // Determine encryption
     let should_encrypt = if encrypt {
         true
@@ -912,6 +1118,15 @@ async fn handle_set(
 
     // Encrypt the value if needed
     let store_value = if should_encrypt {
+        // Vault-encrypted secrets are not supported in the system scope: its
+        // unseal key would live under a root-owned `/etc/libra` path readable by
+        // every user, defeating the encryption, and writing it needs root.
+        if scope == ConfigScope::System {
+            return Err(CliError::command_usage(
+                "vault-encrypted secrets are not supported in --system scope",
+            )
+            .with_hint("use --global or --local for vault.* keys and --encrypt values"));
+        }
         let sn = scope_name(scope);
         let unseal_key = match load_unseal_key_for_scope(sn).await {
             Some(key) => key,
@@ -1004,6 +1219,106 @@ async fn render_get_value(
     Ok(decrypted)
 }
 
+/// Value type for `--type`/`--bool`/`--int`/`--path` canonicalization on read.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConfigValueType {
+    Bool,
+    Int,
+    Path,
+}
+
+/// Resolve the requested read type from `--type=<t>` or a `--bool`/`--int`/
+/// `--path` shortcut. Returns `None` when none was requested; errors on an
+/// unknown `--type`.
+fn resolve_value_type(args: &ConfigArgs) -> CliResult<Option<ConfigValueType>> {
+    if args.type_bool {
+        return Ok(Some(ConfigValueType::Bool));
+    }
+    if args.type_int {
+        return Ok(Some(ConfigValueType::Int));
+    }
+    if args.type_path {
+        return Ok(Some(ConfigValueType::Path));
+    }
+    match args.value_type.as_deref() {
+        None => Ok(None),
+        Some("bool") => Ok(Some(ConfigValueType::Bool)),
+        Some("int") => Ok(Some(ConfigValueType::Int)),
+        Some("path") => Ok(Some(ConfigValueType::Path)),
+        Some(other) => Err(CliError::command_usage(format!(
+            "error: unsupported --type '{other}' (expected bool, int, or path)"
+        ))
+        .with_stable_code(StableErrorCode::CliInvalidArguments)),
+    }
+}
+
+/// Canonicalize a stored value to the requested type when reading, mirroring
+/// `git config --type`. Errors on values that are not valid for the type.
+fn canonicalize_typed_value(value: &str, ty: ConfigValueType) -> CliResult<String> {
+    match ty {
+        ConfigValueType::Bool => {
+            // git `git_parse_maybe_bool_text`: true/yes/on/1 → true; an explicit
+            // empty value and false/no/off/0 → false (`if (!*value) return 0`).
+            // Only a *valueless* key (NULL) is true, but Libra always stores an
+            // explicit string, so empty → false. The comparison is on the raw
+            // value (no trimming), so a padded " true " is not a valid bool →
+            // error, matching Git.
+            match value.to_ascii_lowercase().as_str() {
+                "true" | "yes" | "on" | "1" => Ok("true".to_string()),
+                "false" | "no" | "off" | "0" | "" => Ok("false".to_string()),
+                _ => Err(CliError::command_usage(format!(
+                    "error: cannot convert value '{value}' to bool"
+                ))
+                .with_stable_code(StableErrorCode::CliInvalidArguments)),
+            }
+        }
+        ConfigValueType::Int => {
+            // git: optional k/m/g (case-insensitive) 1024-based multiplier. The
+            // value is parsed without trimming, so surrounding whitespace makes
+            // it invalid (the numeric parse rejects it).
+            let v = value;
+            let (num, mult) = match v.chars().last() {
+                Some('k') | Some('K') => (&v[..v.len() - 1], 1024_i64),
+                Some('m') | Some('M') => (&v[..v.len() - 1], 1024 * 1024),
+                Some('g') | Some('G') => (&v[..v.len() - 1], 1024 * 1024 * 1024),
+                _ => (v, 1),
+            };
+            let base: i64 = num.parse().map_err(|_| {
+                CliError::command_usage(format!("error: cannot convert value '{value}' to int"))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            })?;
+            let scaled = base.checked_mul(mult).ok_or_else(|| {
+                CliError::command_usage(format!("error: integer value '{value}' overflows"))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+            })?;
+            Ok(scaled.to_string())
+        }
+        ConfigValueType::Path => {
+            // git --path: expand a leading `~`/`~/` to the home directory.
+            // `~user` expansion is not supported (returned unchanged).
+            if value == "~"
+                && let Some(home) = dirs::home_dir()
+            {
+                return Ok(home.to_string_lossy().into_owned());
+            }
+            if let Some(rest) = value.strip_prefix("~/")
+                && let Some(home) = dirs::home_dir()
+            {
+                return Ok(home.join(rest).to_string_lossy().into_owned());
+            }
+            Ok(value.to_string())
+        }
+    }
+}
+
+/// Apply an optional `--type` canonicalization to a read value.
+fn apply_value_type(value: String, ty: Option<ConfigValueType>) -> CliResult<String> {
+    match ty {
+        Some(t) => canonicalize_typed_value(&value, t),
+        None => Ok(value),
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn handle_get(
     key: &str,
@@ -1013,6 +1328,8 @@ async fn handle_get(
     default: Option<&str>,
     scope: ConfigScope,
     use_cascade: bool,
+    null: bool,
+    value_type: Option<ConfigValueType>,
     output: &OutputConfig,
 ) -> CliResult<()> {
     // Block --reveal for vault internal keys on exact-key queries
@@ -1063,7 +1380,10 @@ async fn handle_get(
         // Build display values with decryption support
         let mut display_entries = Vec::new();
         for (e, s) in &entries {
-            let val = render_get_value(e, reveal, *s, use_cascade).await?;
+            let val = apply_value_type(
+                render_get_value(e, reveal, *s, use_cascade).await?,
+                value_type,
+            )?;
             display_entries.push((e, s, val));
         }
 
@@ -1084,7 +1404,12 @@ async fn handle_get(
             )?;
         } else if !output.quiet {
             for (e, _, val) in &display_entries {
-                println!("{} = {val}", e.key);
+                if null {
+                    // `git config -z --get-regexp`: key\nvalue\0 per entry.
+                    print!("{}\n{val}\0", e.key);
+                } else {
+                    println!("{} = {val}", e.key);
+                }
             }
         }
         return Ok(());
@@ -1106,6 +1431,8 @@ async fn handle_get(
         if entries.is_empty()
             && let Some(d) = default
         {
+            // Canonicalize the default through `--type` like a stored value.
+            let d = apply_value_type(d.to_string(), value_type)?;
             if output.is_json() {
                 emit_json_data(
                     "config",
@@ -1118,7 +1445,11 @@ async fn handle_get(
                     output,
                 )?;
             } else if !output.quiet {
-                println!("{d}");
+                if null {
+                    print!("{d}\0");
+                } else {
+                    println!("{d}");
+                }
             }
             return Ok(());
         }
@@ -1126,7 +1457,10 @@ async fn handle_get(
         // Build display values with decryption support
         let mut display_entries = Vec::new();
         for (e, s) in &entries {
-            let val = render_get_value(e, reveal, *s, use_cascade).await?;
+            let val = apply_value_type(
+                render_get_value(e, reveal, *s, use_cascade).await?,
+                value_type,
+            )?;
             display_entries.push((e, s, val));
         }
 
@@ -1147,7 +1481,11 @@ async fn handle_get(
             )?;
         } else if !output.quiet {
             for (_, _, val) in &display_entries {
-                println!("{val}");
+                if null {
+                    print!("{val}\0");
+                } else {
+                    println!("{val}");
+                }
             }
         }
     } else {
@@ -1163,12 +1501,15 @@ async fn handle_get(
 
         let (display_value, default_applied, origin_scope) = match entry {
             Some((ref e, s)) => {
-                let val = render_get_value(e, reveal, s, use_cascade).await?;
+                let val = apply_value_type(
+                    render_get_value(e, reveal, s, use_cascade).await?,
+                    value_type,
+                )?;
                 (val, false, Some(s))
             }
             None => {
                 if let Some(d) = default {
-                    (d.to_string(), true, None)
+                    (apply_value_type(d.to_string(), value_type)?, true, None)
                 } else {
                     // Spell correction: find closest matching key
                     let all_keys = if use_cascade {
@@ -1235,7 +1576,11 @@ async fn handle_get(
                 output,
             )?;
         } else if !output.quiet {
-            println!("{display_value}");
+            if null {
+                print!("{display_value}\0");
+            } else {
+                println!("{display_value}");
+            }
         }
     }
     Ok(())
@@ -1250,8 +1595,20 @@ async fn handle_list(
     gpg_keys: bool,
     scope: ConfigScope,
     use_cascade: bool,
+    null: bool,
     output: &OutputConfig,
 ) -> CliResult<()> {
+    // `-z` defines NUL records for standard config key/value output only. The
+    // `--ssh-keys` / `--gpg-keys` / `--vault` views are Libra-only formatted
+    // summaries with no `key\nvalue\0` mapping, so reject the combination rather
+    // than silently ignore `-z`.
+    if null && (ssh_keys || gpg_keys || vault) {
+        return Err(CliError::command_usage(
+            "-z/--null applies to standard config output only, not --ssh-keys/--gpg-keys/--vault",
+        )
+        .with_stable_code(StableErrorCode::CliInvalidArguments));
+    }
+
     if ssh_keys {
         let entries = list_ssh_key_entries(scope).await?;
         if output.is_json() {
@@ -1432,6 +1789,12 @@ async fn handle_list(
         } else if !output.quiet {
             for e in &entries {
                 match (&e.origin, &e.value) {
+                    // `git config -z`: origin\0key\nvalue\0 (origin omitted when
+                    // not requested; value omitted with --name-only).
+                    (Some(origin), Some(val)) if null => print!("{origin}\0{}\n{val}\0", e.key),
+                    (Some(origin), None) if null => print!("{origin}\0{}\0", e.key),
+                    (None, Some(val)) if null => print!("{}\n{val}\0", e.key),
+                    (None, None) if null => print!("{}\0", e.key),
                     (Some(origin), Some(val)) => println!("  {:<8} {} = {val}", origin, e.key),
                     (Some(origin), None) => println!("  {:<8} {}", origin, e.key),
                     (None, Some(val)) => println!("{}={val}", e.key),
@@ -1482,6 +1845,9 @@ async fn handle_list(
         } else if !output.quiet {
             for e in &entries {
                 match &e.value {
+                    // `git config -z --list`: key\nvalue\0 (key\0 with --name-only).
+                    Some(val) if null => print!("{}\n{val}\0", e.key),
+                    None if null => print!("{}\0", e.key),
                     Some(val) => println!("{}={val}", e.key),
                     None => println!("{}", e.key),
                 }
@@ -1601,7 +1967,241 @@ async fn handle_unset(
     Ok(())
 }
 
+/// Map a transactional write failure to a user-facing error (exit 128).
+fn config_write_cli_error(message: impl Into<String>) -> CliError {
+    CliError::fatal(message)
+        .with_stable_code(StableErrorCode::IoWriteFailed)
+        .with_exit_code(128)
+}
+
+/// Whether `key` belongs to git section `section`, using Git's section /
+/// subsection identity rather than a raw prefix. A fully-qualified key splits
+/// as `section.[subsection.]name` (section = before the FIRST dot, name = after
+/// the LAST dot, subsection = anything between). `<section>` is likewise
+/// `section` (bare) or `section.subsection`. So `--remove-section branch`
+/// matches `branch.autosetup` but NOT `branch.feature.remote` (that key is in
+/// subsection `feature`, addressed as `branch.feature`) — matching Git, and
+/// avoiding deleting unrelated subsections.
+fn key_in_section(key: &str, section: &str) -> bool {
+    let Some((key_sec, key_rest)) = key.split_once('.') else {
+        return false;
+    };
+    let (target_sec, target_sub) = match section.split_once('.') {
+        Some((s, sub)) => (s, Some(sub)),
+        None => (section, None),
+    };
+    if key_sec != target_sec {
+        return false;
+    }
+    match key_rest.rsplit_once('.') {
+        // key = section.subsection.name → belongs only if the subsection matches.
+        Some((key_sub, _name)) => target_sub == Some(key_sub),
+        // key = section.name (no subsection) → belongs only to the bare section.
+        None => target_sub.is_none(),
+    }
+}
+
+/// Distinct keys belonging to `section`, read transactionally. Candidates are
+/// narrowed by the `<section>.` SQL prefix, then filtered to exact members with
+/// [`key_in_section`].
+async fn section_member_keys<C: sea_orm::ConnectionTrait>(
+    txn: &C,
+    section: &str,
+) -> CliResult<Vec<String>> {
+    let prefix = format!("{section}.");
+    let entries = ConfigKv::get_by_prefix_with_conn(txn, &prefix)
+        .await
+        .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?;
+    let mut keys: Vec<String> = entries
+        .into_iter()
+        .filter(|e| key_in_section(&e.key, section))
+        .map(|e| e.key)
+        .collect();
+    keys.sort();
+    keys.dedup();
+    Ok(keys)
+}
+
+/// `--remove-section <name>`: delete every key in section `<name>` (Git
+/// section semantics — see [`key_in_section`]) in one transaction. A section
+/// with no keys is "No such section" (exit 128), matching
+/// `git config --remove-section`.
+async fn handle_remove_section(
+    name: &str,
+    scope: ConfigScope,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    let conn = ScopedConfig::get_connection(scope)
+        .await
+        .map_err(config_read_cli_error)?;
+    // Begin first so the existence check and the deletes are one atomic unit.
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
+
+    let keys = section_member_keys(&txn, name).await?;
+    if keys.is_empty() {
+        return Err(
+            CliError::from_legacy_string(format!("error: No such section: {name}"))
+                .with_exit_code(128),
+        );
+    }
+
+    let mut removed = 0usize;
+    for key in &keys {
+        removed += ConfigKv::unset_all_with_conn(&txn, key)
+            .await
+            .map_err(|e| config_write_cli_error(format!("failed to remove '{key}': {e}")))?;
+    }
+    txn.commit()
+        .await
+        .map_err(|e| config_write_cli_error(format!("failed to commit config transaction: {e}")))?;
+
+    if output.is_json() {
+        emit_json_data(
+            "config",
+            &serde_json::json!({
+                "action": "remove-section",
+                "scope": scope_name(scope),
+                "section": name,
+                "removed_count": removed,
+            }),
+            output,
+        )?;
+    } else if !output.quiet {
+        println!("Removed section {}: {name}", scope_name(scope));
+    }
+    Ok(())
+}
+
+/// `--rename-section <old> <new>`: move every key in section `<old>` to the
+/// matching key in section `<new>` (value and encryption flag preserved) in one
+/// transaction. A missing source is "No such section" (exit 128). Renaming onto
+/// the same name, or onto a destination section that already has keys, is
+/// rejected — the latter avoids ambiguous merges and encrypted/plaintext
+/// flag inheritance, so every destination write lands on a fresh key.
+async fn handle_rename_section(
+    old: &str,
+    new: &str,
+    scope: ConfigScope,
+    output: &OutputConfig,
+) -> CliResult<()> {
+    if old == new {
+        return Err(CliError::from_legacy_string(format!(
+            "error: source and destination sections are identical: {old}"
+        ))
+        .with_exit_code(2));
+    }
+
+    let conn = ScopedConfig::get_connection(scope)
+        .await
+        .map_err(config_read_cli_error)?;
+    let txn = conn
+        .begin()
+        .await
+        .map_err(|e| config_write_cli_error(format!("failed to start config transaction: {e}")))?;
+
+    // Read source members transactionally (exact section semantics). Use the
+    // full entries (value + encrypted) in insertion order for the re-add.
+    let old_prefix = format!("{old}.");
+    let source: Vec<ConfigKvEntry> = ConfigKv::get_by_prefix_with_conn(&txn, &old_prefix)
+        .await
+        .map_err(|e| config_read_cli_error(format!("failed to read config: {e}")))?
+        .into_iter()
+        .filter(|e| key_in_section(&e.key, old))
+        .collect();
+    if source.is_empty() {
+        return Err(
+            CliError::from_legacy_string(format!("error: No such section: {old}"))
+                .with_exit_code(128),
+        );
+    }
+
+    // Refuse to write into a destination section that already exists, so every
+    // re-added key is fresh (preserving the source's exact value + encrypted
+    // flag, and avoiding silent multi-value merges).
+    if !section_member_keys(&txn, new).await?.is_empty() {
+        return Err(CliError::from_legacy_string(format!(
+            "error: destination section already exists: {new}"
+        ))
+        .with_exit_code(128));
+    }
+
+    // System scope holds no vault: refuse a rename that would either carry an
+    // encrypted source row into it or land a key under a vault/secret namespace
+    // (which direct `set --system` also rejects).
+    if scope == ConfigScope::System {
+        for e in &source {
+            let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+            let new_key = format!("{new}.{name}");
+            if e.encrypted
+                || new_key.to_ascii_lowercase().starts_with("vault.")
+                || is_sensitive_key(&new_key)
+            {
+                return Err(CliError::command_usage(
+                    "vault-encrypted secrets are not supported in --system scope",
+                )
+                .with_hint(
+                    "rename into a vault/secret namespace is rejected in --system; use --global or --local",
+                ));
+            }
+        }
+    }
+
+    for e in &source {
+        // Exact members all begin with `{old}.`; the remainder is the key name
+        // under the section (which itself may contain dots for nested names).
+        let name = e.key.strip_prefix(&old_prefix).unwrap_or(&e.key);
+        let new_key = format!("{new}.{name}");
+        ConfigKv::add_with_conn(&txn, &new_key, &e.value, e.encrypted)
+            .await
+            .map_err(|err| config_write_cli_error(format!("failed to write '{new_key}': {err}")))?;
+    }
+    let mut old_keys: Vec<String> = source.iter().map(|e| e.key.clone()).collect();
+    old_keys.sort();
+    old_keys.dedup();
+    for key in &old_keys {
+        ConfigKv::unset_all_with_conn(&txn, key)
+            .await
+            .map_err(|err| config_write_cli_error(format!("failed to remove '{key}': {err}")))?;
+    }
+    txn.commit()
+        .await
+        .map_err(|e| config_write_cli_error(format!("failed to commit config transaction: {e}")))?;
+
+    if output.is_json() {
+        emit_json_data(
+            "config",
+            &serde_json::json!({
+                "action": "rename-section",
+                "scope": scope_name(scope),
+                "old": old,
+                "new": new,
+                "moved_count": old_keys.len(),
+            }),
+            output,
+        )?;
+    } else if !output.quiet {
+        println!("Renamed section {}: {old} -> {new}", scope_name(scope));
+    }
+    Ok(())
+}
+
 async fn handle_import(scope: ConfigScope, output: &OutputConfig) -> CliResult<()> {
+    // Import auto-encrypts sensitive keys (`is_sensitive_key`), but the system
+    // scope does not support the vault, so importing into it could silently
+    // store a plaintext value flagged as encrypted. Reject it up front for the
+    // same reason `--encrypt`/`vault.*` writes are rejected in this scope.
+    if scope == ConfigScope::System {
+        return Err(CliError::command_usage(
+            "config import is not supported in --system scope",
+        )
+        .with_hint(
+            "import would encrypt sensitive keys, which the system scope does not support; import into --global or --local",
+        ));
+    }
+
     let summary = import_git_config(scope)
         .await
         .map_err(CliError::from_legacy_string)?;
@@ -1637,8 +2237,11 @@ async fn handle_path(scope: ConfigScope, output: &OutputConfig) -> CliResult<()>
             })?;
             storage.join(DATABASE)
         }
-        ConfigScope::Global => scope.get_config_path().ok_or_else(|| {
-            CliError::from_legacy_string("error: could not determine global config path")
+        ConfigScope::Global | ConfigScope::System => scope.get_config_path().ok_or_else(|| {
+            CliError::from_legacy_string(format!(
+                "error: could not determine {} config path",
+                scope_name(scope)
+            ))
         })?,
     };
 
@@ -1928,10 +2531,11 @@ async fn import_git_config(scope: ConfigScope) -> Result<ConfigImportSummary, St
     let git_flag = match scope {
         ConfigScope::Local => "--local",
         ConfigScope::Global => "--global",
+        ConfigScope::System => "--system",
     };
 
     let mut git_args = vec!["config", git_flag, "--list", "-z"];
-    if scope == ConfigScope::Global {
+    if matches!(scope, ConfigScope::Global | ConfigScope::System) {
         git_args.push("--no-includes");
     }
 
@@ -2135,9 +2739,15 @@ async fn get_all_cascaded(key: &str) -> Result<Vec<(ConfigKvEntry, ConfigScope)>
 
 fn should_skip_config_scope_read_error(scope: ConfigScope, error: &str) -> bool {
     // Out-of-date schemas are now upgraded automatically on connect; the only
-    // surviving incompatibility is a global config DB whose schema is newer
-    // than this binary supports — skip that scope rather than failing the read.
-    scope == ConfigScope::Global && error.contains("is newer than this Libra binary supports")
+    // surviving incompatibility is a global/system config DB whose schema is
+    // newer than this binary supports — skip that scope rather than failing the
+    // read. A system config that is present but unreadable (e.g. permissions) is
+    // also skipped so a stray `/etc/libra/config.db` cannot break every read.
+    match scope {
+        ConfigScope::Global => error.contains("is newer than this Libra binary supports"),
+        ConfigScope::System => true,
+        ConfigScope::Local => false,
+    }
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2148,11 +2758,14 @@ fn scope_name(scope: ConfigScope) -> &'static str {
     match scope {
         ConfigScope::Local => "local",
         ConfigScope::Global => "global",
+        ConfigScope::System => "system",
     }
 }
 
 fn get_scope(args: &ConfigArgs) -> ConfigScope {
-    if args.global {
+    if args.system {
+        ConfigScope::System
+    } else if args.global {
         ConfigScope::Global
     } else {
         ConfigScope::Local

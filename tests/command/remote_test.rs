@@ -35,6 +35,11 @@ async fn test_remote_add_creates_entry() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
 
@@ -56,6 +61,11 @@ async fn test_remote_add_duplicate_name_returns_error() {
             name: "origin".into(),
             url: "https://example.com/repo.git".into(),
             fetch: false,
+            track: vec![],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: false,
         },
         &OutputConfig::default(),
     )
@@ -67,6 +77,11 @@ async fn test_remote_add_duplicate_name_returns_error() {
             name: "origin".into(),
             url: "https://example.com/another.git".into(),
             fetch: false,
+            track: vec![],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: false,
         },
         &OutputConfig::default(),
     )
@@ -84,6 +99,159 @@ async fn test_remote_add_duplicate_name_returns_error() {
 
 #[tokio::test]
 #[serial]
+async fn test_remote_add_cold_config_flags() {
+    use libra::internal::{db::get_db_conn_instance, model::reference};
+    use sea_orm::{ColumnTrait, EntityTrait, QueryFilter};
+
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let p = repo_dir.path();
+
+    // -t (repeatable), --tags, and -m together.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "-t",
+                "main",
+                "-t",
+                "dev",
+                "--tags",
+                "-m",
+                "main",
+                "origin",
+                "https://example.com/r.git",
+            ],
+            p,
+        ),
+        "remote add with cold-config flags",
+    );
+
+    // -t writes one specific fetch refspec per branch (instead of a wildcard).
+    let fetch = ConfigKv::get_all("remote.origin.fetch")
+        .await
+        .expect("read fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert_eq!(
+        fetch,
+        vec![
+            "+refs/heads/main:refs/remotes/origin/main".to_string(),
+            "+refs/heads/dev:refs/remotes/origin/dev".to_string(),
+        ],
+        "-t writes a specific refspec per branch: {fetch:?}"
+    );
+
+    // --tags records the tag-fetch preference under the exact key `libra fetch`
+    // reads (`remote.<name>.tagOpt`, camelCase — config keys are case-sensitive).
+    let tagopt = ConfigKv::get("remote.origin.tagOpt")
+        .await
+        .expect("read tagOpt")
+        .map(|e| e.value);
+    assert_eq!(tagopt.as_deref(), Some("--tags"));
+
+    // -m writes the remote HEAD (a Head row keyed by the remote name), even
+    // though the tracking ref does not exist yet.
+    let db = get_db_conn_instance().await;
+    let head_row = reference::Entity::find()
+        .filter(reference::Column::Kind.eq(reference::ConfigKind::Head))
+        .filter(reference::Column::Remote.eq("origin".to_string()))
+        .one(&db)
+        .await
+        .expect("query remote HEAD");
+    assert!(head_row.is_some(), "-m writes refs/remotes/origin/HEAD");
+
+    // --no-tags records the opposite preference; with no -t, no fetch refspec
+    // is written (the default wildcard remains implicit, as for a plain add).
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "--no-tags",
+                "up",
+                "https://example.com/u.git",
+            ],
+            p,
+        ),
+        "remote add --no-tags",
+    );
+    let up_tagopt = ConfigKv::get("remote.up.tagOpt")
+        .await
+        .expect("read up tagOpt")
+        .map(|e| e.value);
+    assert_eq!(up_tagopt.as_deref(), Some("--no-tags"));
+    assert!(
+        ConfigKv::get_all("remote.up.fetch")
+            .await
+            .expect("read up fetch")
+            .is_empty(),
+        "plain add (no -t) writes no fetch refspec"
+    );
+
+    // --tags and --no-tags are mutually exclusive (clap usage error, exit 129).
+    let conflict = run_libra_command(
+        &[
+            "remote",
+            "add",
+            "--tags",
+            "--no-tags",
+            "x",
+            "https://e.com/x.git",
+        ],
+        p,
+    );
+    assert_eq!(conflict.status.code(), Some(129));
+
+    // An invalid -t branch name is rejected (usage error, exit 129) and the
+    // remote is NOT persisted (validation runs before any config write).
+    let bad_track = run_libra_command(
+        &[
+            "remote",
+            "add",
+            "-t",
+            "bad name",
+            "bt",
+            "https://e.com/bt.git",
+        ],
+        p,
+    );
+    assert_eq!(bad_track.status.code(), Some(129));
+    assert!(
+        ConfigKv::get("remote.bt.url")
+            .await
+            .expect("read bt url")
+            .is_none(),
+        "remote with an invalid -t branch must not be persisted"
+    );
+
+    // Likewise an invalid -m branch name.
+    let bad_master = run_libra_command(
+        &[
+            "remote",
+            "add",
+            "-m",
+            "refs/heads/x",
+            "bm",
+            "https://e.com/bm.git",
+        ],
+        p,
+    );
+    assert_eq!(bad_master.status.code(), Some(129));
+    assert!(
+        ConfigKv::get("remote.bm.url")
+            .await
+            .expect("read bm url")
+            .is_none(),
+        "remote with an invalid -m branch must not be persisted"
+    );
+}
+
+#[tokio::test]
+#[serial]
 async fn test_remote_remove_deletes_entry() {
     let repo_dir = tempdir().unwrap();
     test::setup_with_new_libra_in(repo_dir.path()).await;
@@ -93,6 +261,11 @@ async fn test_remote_remove_deletes_entry() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
 
@@ -117,6 +290,11 @@ async fn test_remote_remove_deletes_vault_ssh_keys() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
     ConfigKv::set("vault.ssh.origin.pubkey", "ssh-rsa origin", false)
@@ -162,6 +340,11 @@ async fn test_remote_rename_updates_branch_tracking() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
 
@@ -220,6 +403,11 @@ async fn test_remote_rename_cascades_vault_ssh_keys() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
     ConfigKv::set("vault.ssh.origin.pubkey", "ssh-rsa origin", false)
@@ -282,6 +470,11 @@ async fn test_remote_rename_refuses_existing_target_vault_ssh_namespace() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
     ConfigKv::set("vault.ssh.origin.pubkey", "ssh-rsa origin", false)
@@ -424,12 +617,22 @@ async fn test_remote_rename_conflict_returns_error() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
     remote::execute(RemoteCmds::Add {
         name: "upstream".into(),
         url: "https://example.com/upstream.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
 
@@ -450,6 +653,11 @@ async fn test_remote_set_url_add_appends_fetch_url() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
 
@@ -486,6 +694,11 @@ async fn test_remote_set_url_delete_removes_matching_url() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
     remote::execute(RemoteCmds::SetUrl {
@@ -530,6 +743,11 @@ async fn test_remote_set_url_push_and_get_pushurl_entries() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
 
@@ -578,6 +796,11 @@ async fn test_remote_set_url_all_replaces_all_fetch_urls() {
         name: "origin".into(),
         url: "https://one.example/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
     remote::execute(RemoteCmds::SetUrl {
@@ -851,7 +1074,9 @@ async fn test_remote_prune_removes_stale_branches() {
         .unwrap();
 
     // Fetch all branches to create remote-tracking branches
-    fetch::fetch_repository(
+    let quiet_output = OutputConfig::resolve(None, false, true, "auto", true, false, "none");
+
+    fetch::fetch_repository_safe(
         RemoteConfig {
             name: "origin".to_string(),
             url: remote_path.clone(),
@@ -859,8 +1084,11 @@ async fn test_remote_prune_removes_stale_branches() {
         None,
         false,
         None,
+        None,
+        &quiet_output,
     )
-    .await;
+    .await
+    .expect("initial remote update fixture fetch should succeed");
 
     // Verify all remote-tracking branches exist
     for branch_name in &branches_to_create {
@@ -1045,8 +1273,9 @@ async fn test_remote_prune_dry_run_previews_changes() {
         .await
         .unwrap();
 
-    // Fetch to create remote-tracking branch
-    fetch::fetch_repository(
+    // Fetch to create remote-tracking branch.
+    let quiet_output = OutputConfig::resolve(None, false, true, "auto", true, false, "none");
+    fetch::fetch_repository_safe(
         RemoteConfig {
             name: "origin".to_string(),
             url: remote_path.clone(),
@@ -1054,8 +1283,11 @@ async fn test_remote_prune_dry_run_previews_changes() {
         None,
         false,
         None,
+        None,
+        &quiet_output,
     )
-    .await;
+    .await
+    .expect("initial prune fixture fetch should succeed");
 
     // Verify remote-tracking branch exists
     let tracked_branch = format!("refs/remotes/origin/{}", branch_name);
@@ -1280,6 +1512,11 @@ async fn test_remote_set_url_delete_no_match_returns_error() {
             name: "origin".into(),
             url: "https://example.com/repo.git".into(),
             fetch: false,
+            track: vec![],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: false,
         },
         &OutputConfig::default(),
     )
@@ -1403,6 +1640,11 @@ async fn test_remote_remove_works_after_deleting_last_url() {
             name: "origin".into(),
             url: "https://example.com/repo.git".into(),
             fetch: false,
+            track: vec![],
+            master: None,
+            tags: false,
+            no_tags: false,
+            mirror: false,
         },
         &OutputConfig::default(),
     )
@@ -1710,6 +1952,11 @@ async fn add_origin() {
         name: "origin".into(),
         url: "https://example.com/repo.git".into(),
         fetch: false,
+        track: vec![],
+        master: None,
+        tags: false,
+        no_tags: false,
+        mirror: false,
     })
     .await;
 }
@@ -2196,4 +2443,249 @@ fn remote_add_fetch_flag_registers_then_attempts_fetch() {
     // Without `-f`, `add` registers the remote with no fetch attempt (succeeds).
     let plain = run_libra_command(&["remote", "add", "other", "https://example.com/x.git"], p);
     assert_cli_success(&plain, "`remote add` without -f registers without fetching");
+}
+
+#[test]
+#[serial]
+fn remote_update_prune_flag_is_wired() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // `-p`/`--prune` parse for `remote update`. With no remotes configured the
+    // command still succeeds with the empty notice (nothing to fetch or prune),
+    // proving the flag is accepted and threaded without a clap conflict. The
+    // prune-after-fetch path itself needs a reachable remote and is covered by
+    // the L2 network/fetch tests.
+    for variant in [["remote", "update", "-p"], ["remote", "update", "--prune"]] {
+        let out = run_libra_command(&variant, p);
+        assert_cli_success(&out, "remote update -p/--prune (no remotes)");
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("No remotes to update"),
+            "expected the empty notice for {variant:?}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+    }
+
+    // A configured but unreachable remote with `-p`: still fails at the fetch
+    // step (prune runs only after a successful fetch), proving `-p` does not
+    // alter the fetch-failure behavior.
+    let bogus = p.join("nonexistent-remote.git");
+    assert_cli_success(
+        &run_libra_command(&["remote", "add", "origin", bogus.to_str().unwrap()], p),
+        "remote add origin",
+    );
+    let attempt = run_libra_command(&["remote", "update", "-p"], p);
+    assert!(
+        !attempt.status.success(),
+        "remote update -p of an unreachable remote must still fail at the fetch step"
+    );
+}
+
+/// End-to-end regression that `remote update -p` actually prunes: it fetches a
+/// reachable local remote and then deletes the remote-tracking refs whose
+/// upstream branch is gone. Mirrors `test_remote_prune_removes_stale_branches`
+/// but drives the prune through `run_remote_update` (the `Update { prune }`
+/// path) so the test cannot pass unless `update -p` reaches the prune logic and
+/// deletes the stale refs. (The thin text/JSON renderer just iterates the same
+/// pruned entries.)
+#[tokio::test]
+#[serial]
+async fn remote_update_prune_removes_stale_tracking_branches() {
+    let temp_root = tempdir().unwrap();
+    let remote_dir = temp_root.path().join("remote.git");
+    let work_dir = temp_root.path().join("workdir");
+
+    let git = |dir: &Path, args: &[&str]| {
+        assert!(
+            Command::new("git")
+                .current_dir(dir)
+                .args(args)
+                .status()
+                .unwrap_or_else(|e| panic!("git {args:?} failed: {e}"))
+                .success(),
+            "git {args:?} should succeed"
+        );
+    };
+
+    git(
+        temp_root.path(),
+        &["init", "--bare", remote_dir.to_str().unwrap()],
+    );
+    git(temp_root.path(), &["init", work_dir.to_str().unwrap()]);
+    git(&work_dir, &["config", "user.name", "Libra Tester"]);
+    git(&work_dir, &["config", "user.email", "tester@example.com"]);
+    fs::write(work_dir.join("README.md"), "hello libra").unwrap();
+    git(&work_dir, &["add", "README.md"]);
+    git(&work_dir, &["commit", "-m", "initial commit"]);
+
+    let current_branch = String::from_utf8(
+        Command::new("git")
+            .current_dir(&work_dir)
+            .args(["rev-parse", "--abbrev-ref", "HEAD"])
+            .output()
+            .expect("read current branch")
+            .stdout,
+    )
+    .expect("branch name utf8")
+    .trim()
+    .to_string();
+
+    git(
+        &work_dir,
+        &["remote", "add", "origin", remote_dir.to_str().unwrap()],
+    );
+    git(
+        &work_dir,
+        &[
+            "push",
+            "origin",
+            &format!("HEAD:refs/heads/{current_branch}"),
+        ],
+    );
+    let branches = ["feature1", "feature2", "feature3"];
+    for b in &branches {
+        git(&work_dir, &["checkout", "-b", b]);
+        git(&work_dir, &["push", "origin", b]);
+    }
+
+    let repo_dir = temp_root.path().join("libra_repo");
+    fs::create_dir_all(&repo_dir).unwrap();
+    test::setup_with_new_libra_in(&repo_dir).await;
+    let _guard = test::ChangeDirGuard::new(&repo_dir);
+
+    let remote_path = remote_dir.to_str().unwrap().to_string();
+    ConfigKv::set("remote.origin.url", &remote_path, false)
+        .await
+        .unwrap();
+    // Default fetch refspec so `remote update` knows what to fetch.
+    ConfigKv::set(
+        "remote.origin.fetch",
+        "+refs/heads/*:refs/remotes/origin/*",
+        false,
+    )
+    .await
+    .unwrap();
+
+    let quiet_output = OutputConfig::resolve(None, false, true, "auto", true, false, "none");
+    fetch::fetch_repository_safe(
+        RemoteConfig {
+            name: "origin".to_string(),
+            url: remote_path.clone(),
+        },
+        None,
+        false,
+        None,
+        None,
+        &quiet_output,
+    )
+    .await
+    .expect("initial remote update fixture fetch should succeed");
+
+    for b in &branches {
+        assert!(
+            Branch::find_branch_result(&format!("refs/remotes/origin/{b}"), Some("origin"))
+                .await
+                .expect("query tracking branch")
+                .is_some(),
+            "remote-tracking branch origin/{b} should exist after fetch"
+        );
+    }
+
+    // Delete two branches on the remote so their tracking refs become stale.
+    for b in ["feature1", "feature3"] {
+        git(
+            &remote_dir,
+            &["update-ref", "-d", &format!("refs/heads/{b}")],
+        );
+    }
+
+    // `remote update -p`: fetch then prune. Drives the full Update { prune }
+    // path, not the standalone `prune` subcommand.
+    remote::execute_safe(
+        RemoteCmds::Update {
+            groups: vec![],
+            prune: true,
+        },
+        &quiet_output,
+    )
+    .await
+    .expect("remote update -p should fetch and prune");
+
+    for b in ["feature1", "feature3"] {
+        assert!(
+            Branch::find_branch_result(&format!("refs/remotes/origin/{b}"), Some("origin"))
+                .await
+                .expect("query tracking branch")
+                .is_none(),
+            "stale tracking branch origin/{b} should be pruned by `update -p`"
+        );
+    }
+    assert!(
+        Branch::find_branch_result("refs/remotes/origin/feature2", Some("origin"))
+            .await
+            .expect("query tracking branch")
+            .is_some(),
+        "non-stale tracking branch origin/feature2 must survive `update -p`"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_remote_add_mirror_writes_marker_and_conflicts_with_track() {
+    let repo_dir = tempdir().unwrap();
+    test::setup_with_new_libra_in(repo_dir.path()).await;
+    let _guard = test::ChangeDirGuard::new(repo_dir.path());
+    let p = repo_dir.path();
+
+    // `--mirror` records the informational marker `remote.<name>.mirror=true`.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "remote",
+                "add",
+                "--mirror",
+                "backup",
+                "https://example.com/r.git",
+            ],
+            p,
+        ),
+        "remote add --mirror",
+    );
+    let marker = ConfigKv::get("remote.backup.mirror")
+        .await
+        .expect("read mirror marker")
+        .map(|e| e.value);
+    assert_eq!(marker.as_deref(), Some("true"), "mirror marker is written");
+
+    // NARROWING: no `+refs/*:refs/*` fetch refspec is written (fetch is not
+    // mirror-aware), matching `clone --mirror`.
+    let fetch = ConfigKv::get_all("remote.backup.fetch")
+        .await
+        .expect("read fetch")
+        .into_iter()
+        .map(|e| e.value)
+        .collect::<Vec<_>>();
+    assert!(
+        fetch.is_empty(),
+        "remote add --mirror writes no fetch refspec: {fetch:?}"
+    );
+
+    // `--mirror` is incompatible with `-t`/`--track` (clap conflict → usage error).
+    let conflict = run_libra_command(
+        &[
+            "remote",
+            "add",
+            "--mirror",
+            "-t",
+            "main",
+            "m2",
+            "https://example.com/r.git",
+        ],
+        p,
+    );
+    assert!(
+        !conflict.status.success(),
+        "--mirror with -t must be rejected: {}",
+        String::from_utf8_lossy(&conflict.stderr)
+    );
 }

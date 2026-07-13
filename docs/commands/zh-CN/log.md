@@ -7,7 +7,7 @@
 ## 概要
 
 ```
-libra log [OPTIONS] [-- PATHS...]
+libra log [OPTIONS] [<revision-range>] [[--] <path>...]
 ```
 
 ## 说明
@@ -15,6 +15,8 @@ libra log [OPTIONS] [-- PATHS...]
 `libra log` 从当前 HEAD 开始显示提交历史。它支持多种输出格式，包括 oneline、自定义 pretty-print、图形可视化和结构化 JSON。提交可按作者、日期范围和文件路径过滤。Diff 输出（`--patch`、`--stat`、`--shortstat`、`--name-only`、`--name-status`）可以限制到特定路径。
 
 人类模式保留当前 `--oneline`、`--graph`、`--pretty`、`--stat`、`--patch` 和相关输出样式。`--quiet` 抑制人类输出，但仍验证请求的历史范围。
+
+当 stdout 被管道连接且下游命令提前退出时，`libra log` 会静默正常结束，不打印 panic/backtrace 或 `Broken pipe` 诊断。
 
 ## 选项
 
@@ -59,6 +61,49 @@ libra log --abbrev 8
 libra log --no-abbrev-commit
 ```
 
+### `--pretty=<format>` / `--format=<format>`
+
+选择提交显示格式。接受命名预设与 `format:`/`tformat:` 自定义模板前缀（及裸 `%` 占位符模板）。`--format` 是 `--pretty` 的 Git 别名。
+
+| 预设 | 输出 |
+|---|---|
+| `oneline` | 单行 `<hash> <subject>` |
+| `medium`（默认） | `commit` + `Author` + `Date` + 缩进消息 |
+| `short` | `commit` + `Author` + 缩进 subject（无 date/body） |
+| `full` | `commit` + `Author` + `Commit` + 缩进消息（无 date） |
+| `fuller` | `commit` + `Author`/`AuthorDate` + `Commit`/`CommitDate` + 消息 |
+| `reference` | 单行 `<abbrev> (<subject>, <short-date>)` |
+| `raw` | 提交对象的 `tree`/`parent`/`author`/`committer` 头 + 缩进消息 |
+
+预设继承 `libra log` 既有惯例（时间戳渲染为 UTC `+0000`；除默认 `medium` 外，显式 `--pretty` 使用缩写哈希；存储消息中 subject/body 间空行已折叠），故与 Git 预设**结构**一致而非逐字节相同。`libra show --pretty=<preset>` 使用相同格式。
+
+自定义模板支持 `%H` / `%h`（完整 / 缩写提交哈希）、`%P` / `%p`（完整 / 缩写父提交哈希列表）、`%s` / `%f`（主题 / 清理后的主题）、`%b` / `%B`（正文 / 原始 subject+body）、`%n`、ASCII/control `%xNN`、`%%`、`%an` / `%ae` / `%ad` / `%aI` / `%at`（作者）、`%cn` / `%ce` / `%cd` / `%cI` / `%ct`（提交者）、`%d` / `%D`（装饰）、`%m`，以及 `%Cred`、`%C(red)`、`%C(always,red)`、`%Creset` 等常见颜色占位符。未知占位符会按 Git pretty-format 规则原样保留。颜色复位遵循 Git 策略：`%C(always,...)` 即使普通颜色关闭也会强制输出 ANSI，而 `%Creset` 只在颜色输出启用时复位；强制颜色模板若也要强制复位，请使用 `%C(always,reset)`。
+
+```bash
+libra log --pretty=short
+libra log --pretty=fuller
+libra log --pretty=reference
+```
+
+未显式提供 `--oneline`、`--pretty` 或 `--format` 时，`format.pretty` 为
+`libra log` 与 `libra show` 提供默认格式。配置值须为上表预设，或使用
+`format:`、`tformat:`、`%` 占位符的非空自定义模板。空值与未知的裸预设名
+会在输出前以 `LBR-CLI-002` 失败；显式 CLI 格式会绕过对应配置键。
+
+### `--date=<format>`
+
+选择人类输出中的作者/提交者日期格式。支持 `default`、`short`、
+`iso`/`iso8601`、`iso-strict`/`iso8601-strict`、`rfc`/`rfc2822`、`unix`
+与 `raw`。`log.date` 为人类 `log`/`show` 输出提供默认值，显式 `--date`
+优先。当前 renderer 尚未实现的合法 Git 模式（`relative`、`human`、
+`local`、`format:*`、`auto:*`）在配置中会明确报错，而不是静默忽略。
+结构化 JSON 日期继续使用 schema 规定的 RFC3339 表示。
+
+```bash
+libra log --date=iso-strict
+libra log --pretty='format:%ad %s' --date=unix
+```
+
 ### `-p, --patch`
 
 显示每个提交的 diff（patch）。可与路径参数组合，将 diff 限制到特定文件。
@@ -85,6 +130,16 @@ libra log --name-status
 libra log --name-status -- src/
 ```
 
+### `-z, --null`
+
+使用 NUL 分隔 log 记录和变更路径输出。与 `--name-only` 或
+`--name-status` 组合时，格式化后的提交文本以 `NUL` 结束，路径区块按
+Git 规则分隔，每个路径/状态字段均以 NUL 终止。
+
+```bash
+libra log -z --name-status --format=%s
+```
+
 ### `--stat`
 
 显示每个提交的 diffstat（文件变更统计），展示每个文件的插入和删除。
@@ -93,9 +148,14 @@ libra log --name-status -- src/
 
 只显示 `--stat` 输出的最后一行：每个提交的 ` N files changed, M insertions(+), K deletions(-)`（插入/删除为零时省略对应子句），不含逐文件明细。
 
+### `--patch-with-stat`
+
+Git 中 `-p --stat` 的同义词：先显示 diffstat 块，再显示每个提交的完整 patch。显式的 `-p --stat` 组合等价，同样会同时显示两者。（diffstat 与 patch 块沿用 Libra 既有的 `--stat`/`-p` 渲染，故格式与 Git 略有差异。）
+
 ```bash
 libra log --stat
 libra log --shortstat
+libra log --patch-with-stat -1
 libra log --range main..feature
 libra log --all --oneline
 libra log --reverse --oneline
@@ -123,6 +183,10 @@ libra log --grep fix -i              # 大小写不敏感
 libra log --grep WIP --invert-grep   # 隐藏 WIP 提交
 ```
 
+### `--trailer <KEY[=VALUE]>` / `--only-trailers`（Libra 扩展）
+
+Git 无此二 flag（最近等价：过滤用脆弱的 `--grep='^Key: '`，展示用 `--pretty='%(trailers)'`）。`--trailer KEY` 只保留其**合格 trailer 块**（按 Git 规则解析：末段、绝非标题段；key 仅 ASCII 字母数字/连字符；混合块需含 `Signed-off-by` 等可识别 trailer 且 trailer 行 ≥25%）携带该 key 的提交（ASCII 大小写不敏感）；`KEY=VALUE` 另要求展开后的值精确相等；可重复（全部须命中，AND）。`--only-trailers` 把每个提交的消息替换为其 trailer 块（展开的 `Key: value` 行；`(cherry picked from commit …)` 原样），本身不过滤；与 `--trailer` 组合时仅展示所选 key；与 `--oneline`/`--pretty`/`--format` 互斥，并优先于 `format.pretty`/`log.date` 默认。`--json` 下每个提交带增量 `trailers` 数组（`[{key,value}]`，无合格块时为空数组）；`body` 不变。
+
 ### `--since <DATE>`
 
 显示晚于指定日期的提交。
@@ -142,11 +206,12 @@ libra log --until 2026-03-01
 
 ### `--pretty <FORMAT>`
 
-自定义 pretty-print 格式字符串。支持 `%h`（短哈希）、`%s`（主题）、`%an`（作者名）、`%ae`（作者 email）、`%ad`（作者日期）等占位符。
+自定义 pretty-print 格式字符串。支持上文列出的同一组占位符，包括 `%b`、`%B`、`%n`、ASCII/control `%xNN`、`%%`、严格 ISO 日期 `%aI` / `%cI`、原始时间戳 `%at` / `%ct`、原始装饰 `%D`、`%m` 和颜色占位符。
 
 ```bash
 libra log --pretty="%h - %s (%an)"
 libra log --pretty="format:%H %s"
+libra log --pretty=%P -1
 ```
 
 ### `--format <FORMAT>`
@@ -184,16 +249,21 @@ libra log --graph
 libra log --oneline --graph
 ```
 
-### `--range <SPEC>`
+### 修订范围（位置参数或 `--range <SPEC>`）
 
-限定提交历史到某个修订范围。支持形式：
+限定提交历史到某个修订范围。范围可**位置式**给出（Git 风格）或用显式 `--range` 标志。支持形式：
 - `A..B` — 从 `B` 可达但不可从 `A` 到达的提交。
 - `A...B` — 对称差（在 `A` 或 `B` 中但不在其合并基的提交）。
+- `^A`（排除）配合一个 include，例如 `^A B`。
 - 单个引用，例如 `main` 或 `HEAD~3`。
 
+位置式下，前导参数按解析结果作为 revision，直到第一个非 revision，其后均作 pathspec，故 `log A..B path/` 把范围限定到改动 `path/` 的提交。既是有效 revision 又是现有 path 的裸名会被判为歧义并报错——用 `--range <rev>` 选定 revision。
+
 ```bash
-libra log --range main..feature
-libra log --range HEAD~3..HEAD
+libra log main..feature            # 位置式范围
+libra log HEAD~3..HEAD src/        # 位置式范围 + pathspec
+libra log ^v1.0 HEAD               # 排除 + include
+libra log --range main..feature    # 显式标志形式
 ```
 
 ### `--all`
@@ -248,12 +318,33 @@ libra log --no-expand-tabs
 libra log --no-notes
 ```
 
-### `--follow <FILE>`
+### `--no-mailmap`
 
-Best-effort 跨重命名追踪单个文件历史。文件路径相对于当前目录解析。
+不使用 `.mailmap` 重写 author/committer 身份。为对齐 Git 而接受的 no-op：Libra 的 log 从不应用 mailmap，直接显示记录的原始身份。（Git 的反向标志 `--mailmap` 未实现。）
+
+```bash
+libra log --no-mailmap
+```
+
+### `--no-show-signature`
+
+不显示已签名提交的 GPG 签名。为对齐 Git 而接受的 no-op：Libra 的 log 从不内联显示提交签名，故已是默认行为。（Git 的反向标志 `--show-signature` 未实现。）
+
+```bash
+libra log --no-show-signature
+```
+
+### `--follow <FILE>` / `--no-follow`
+
+Best-effort 跨重命名追踪单个文件历史。路径会从当前目录规范化到仓库根。
+`log.follow=true` 时，恰好一个位置路径且它指向现存文件时会自动启用同一遍历；
+单一目录仍保持普通目录过滤。`--follow <FILE>` 与 `--no-follow` 均优先于配置。
+该配置同时影响人类输出与 JSON 的提交选择。重命名匹配采用 exact-blob best
+effort，修改内容的重命名、复杂/非线性重命名仍不在兼容承诺内。
 
 ```bash
 libra log --follow src/main.rs
+libra log --no-follow src/main.rs
 ```
 
 ### `--parents` / `--children`
@@ -363,14 +454,16 @@ Graph 格式：
 - `-n` 也适用于 JSON 模式
 - 仅在未提供 `-n` 时，`total` 反映过滤后的提交数量；使用 `-n` 时始终为 `null`
 - `--graph`、`--pretty` 和 `--oneline` 不改变 JSON schema
+- `format.pretty` 与 `log.date` 不改变 JSON schema；单个位置路径下的
+  `log.follow` 可改变被选中的提交集合
 - `--decorate` 只影响人类渲染；JSON 始终返回 `refs` 数组，辅助 ref 元数据以 best-effort 收集
 - `files` 始终是结构化变更摘要，永远不包含 patch 文本
 
 ## 设计理由
 
-### 使用 `--range` 而非位置修订语法
+### 位置式修订范围与 `--range` 备选
 
-Git 接受 `git log A..B` 这种位置修订表达式。Libra 通过 `--range A..B` 暴露相同语义，从而把位置参数保留给路径规范，并避免与现有 `-- -N` 测试模式产生歧义。
+Git 接受 `git log A..B` 这种位置修订表达式（其后可跟 pathspec）。Libra 已支持该位置形式：前导参数按解析结果分流为 revision，直到第一个非 revision，其后为 pathspec。由于 Libra 看不到 `--` 分隔符（在命令前已被消费），分流按解析进行：range 语法 token（`A..B`/`A...B`/`^A`）能解析时为 revision，不能解析但命中现有 path（如 `../file`）时为 pathspec，否则报错（把拼错的 revision 报为未知 revision/path，而非按不存在的 path 静默过滤）。裸 token 仅在能解析为提交时才是 revision；既是 revision 又是现有 path 的裸名会报歧义。显式 `--range A..B` 标志作为无歧义备选保留，也是强制把与 path 同名的名字当作 revision 的方式。
 
 ### `--all` 实现
 
@@ -390,7 +483,7 @@ Git 接受 `git log A..B` 这种位置修订表达式。Libra 通过 `--range A.
 
 ### `--follow`
 
-`--follow` 通过遍历历史并匹配被移除/新增 blob 哈希来进行 best-effort 重命名检测。它不能处理复杂目录重命名或内容相似重命名。
+`--follow` 反向遍历历史，并在重命名处切换到 exact-blob 匹配的父路径。它不能处理复杂目录重命名、内容发生变化/仅相似的重命名或所有非线性历史场景。
 
 ### `-L`
 
@@ -417,6 +510,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 显示 patch | `git log -p` | `jj diff -r <rev>`（单独命令） | `libra log -p` / `--patch` |
 | 仅名称 | `git log --name-only` | N/A | `libra log --name-only` |
 | 名称和状态 | `git log --name-status` | N/A | `libra log --name-status` |
+| NUL 路径输出 | `git log -z --name-status` | N/A | `libra log -z --name-status` |
 | Diffstat | `git log --stat` | `jj diff --stat -r <rev>` | `libra log --stat` |
 | 简短 diffstat | `git log --shortstat` | 无 | `libra log --shortstat` |
 | 按作者过滤 | `git log --author=<pat>` | `jj log --author <pat>`（revset） | `libra log --author <pat>` |
@@ -429,7 +523,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 | 所有 refs | `git log --all` | `jj log -r 'all()'` | `libra log --all` |
 | 仅分支 | `git log --branches` | `jj log -r 'branches()'` | N/A |
 | 仅远程 | `git log --remotes` | `jj log -r 'remote_branches()'` | N/A |
-| 修订范围 | `git log A..B` | `jj log -r 'A..B'` | `libra log --range A..B` |
+| 修订范围 | `git log A..B` | `jj log -r 'A..B'` | `libra log A..B`（位置式）或 `libra log --range A..B` |
 | Grep 消息 | `git log --grep=<pat>` | Revset `description()` | `libra log --grep <pat>` |
 | 大小写不敏感 grep | `git log -i --grep=<pat>` | N/A | `libra log -i --grep <pat>` |
 | 反向 grep | `git log --invert-grep --grep=<pat>` | N/A | `libra log --invert-grep --grep <pat>` |
@@ -459,7 +553,7 @@ Libra 将 `--graph` 实现为基于文本的 ASCII/Unicode 图渲染器，类似
 
 - `--branches` 和 `--remotes` 尚未实现
 - `--all` 遍历本地分支和轻量标签；远程跟踪引用和 stash 不包含在内
-- 修订范围语法通过 `--range A..B` 和 `--range A...B` 提供；Git 的位置 `git log A..B` 语法不支持
+- 修订范围语法支持位置式 `git log A..B`/`A...B`/`^A`（以及显式 `--range A..B`/`A...B`）
 - `--follow` 使用 best-effort 重命名检测，可能遗漏复杂重命名
 - `-L` 已被接受，但尚未提供 blame 级行精度
 - `--reverse` 已支持

@@ -619,6 +619,9 @@ async fn setup_repo_with_commit_with(
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
 
@@ -812,6 +815,9 @@ async fn test_force_tag() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -834,6 +840,7 @@ async fn test_force_tag() {
     tag::execute(TagArgs {
         name: Some("v1.0".into()),
         file: None,
+        edit: false,
         list: false,
         delete: false,
         message: Some("Updated".into()),
@@ -847,6 +854,8 @@ async fn test_force_tag() {
         sort: None,
         column: None,
         sign: false,
+        no_sign: false,
+        no_column: false,
         verify: false,
     })
     .await;
@@ -962,6 +971,7 @@ async fn test_delete_tag() {
     tag::execute(TagArgs {
         name: Some("to-delete".into()),
         file: None,
+        edit: false,
         list: false,
         delete: true,
         message: None,
@@ -975,6 +985,8 @@ async fn test_delete_tag() {
         sort: None,
         column: None,
         sign: false,
+        no_sign: false,
+        no_column: false,
         verify: false,
     })
     .await;
@@ -1005,6 +1017,9 @@ async fn test_annotation_lines_tag() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1027,6 +1042,7 @@ async fn test_annotation_lines_tag() {
     tag::execute(TagArgs {
         name: Some("v1.0.1".into()),
         file: None,
+        edit: false,
         list: false,
         delete: false,
         message: Some("Single line annotation message".into()),
@@ -1040,6 +1056,8 @@ async fn test_annotation_lines_tag() {
         sort: None,
         column: None,
         sign: false,
+        no_sign: false,
+        no_column: false,
         verify: false,
     })
     .await;
@@ -1057,6 +1075,9 @@ async fn test_annotation_lines_tag() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -1079,6 +1100,7 @@ async fn test_annotation_lines_tag() {
     tag::execute(TagArgs {
         name: Some("v1.0.3".into()),
         file: None,
+        edit: false,
         list: false,
         delete: false,
         message: Some("multi\nline\nannotation\ntag".into()),
@@ -1092,6 +1114,8 @@ async fn test_annotation_lines_tag() {
         sort: None,
         column: None,
         sign: false,
+        no_sign: false,
+        no_column: false,
         verify: false,
     })
     .await;
@@ -1442,13 +1466,14 @@ fn tag_column_lays_out_in_column_major_order() {
         assert_cli_success(&run_libra_command(&["tag", t], p), t);
     }
 
-    // COLUMNS=8, col_width = 2 + 2 = 4, cols = 8/4 = 2, rows = ceil(4/2) = 2.
-    // Column-major (fill down then across):
+    // COLUMNS=10, col_width = 2 + 2 = 4. The most columns whose total is strictly
+    // < 10 is 2 (2*4 = 8 < 10; 3*4 = 12 too wide). rows = ceil(4/2) = 2.
+    // Column-major (fill down then across), matching `git tag --column`:
     //   v1  v3
     //   v2  v4
     let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
         .current_dir(p)
-        .env("COLUMNS", "8")
+        .env("COLUMNS", "10")
         .args(["tag", "--column=always"])
         .output()
         .expect("run tag --column=always");
@@ -1463,6 +1488,22 @@ fn tag_column_lays_out_in_column_major_order() {
         lines,
         vec!["v1  v3", "v2  v4"],
         "column-major layout: {stdout:?}"
+    );
+
+    // `--column=row` fills left-to-right instead (same 2x2 grid):
+    //   v1  v2
+    //   v3  v4
+    let row = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(p)
+        .env("COLUMNS", "10")
+        .args(["tag", "--column=always,row"])
+        .output()
+        .expect("run tag --column=always,row");
+    let row_out = String::from_utf8_lossy(&row.stdout);
+    assert_eq!(
+        row_out.lines().collect::<Vec<_>>(),
+        vec!["v1  v2", "v3  v4"],
+        "row-major layout: {row_out:?}"
     );
 
     // `never` falls back to one tag per line.
@@ -1502,4 +1543,308 @@ fn tag_column_lays_out_in_column_major_order() {
     // --column cannot be combined with -n.
     let conflict = run_libra_command(&["tag", "--column", "-n", "1"], p);
     assert!(!conflict.status.success(), "--column conflicts with -n");
+}
+
+#[test]
+fn tag_no_sign_countermands_sign() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // `--no-sign` alone creates an unsigned tag (the default).
+    let out = run_libra_command(&["tag", "--no-sign", "v-nosign"], p);
+    assert_cli_success(&out, "tag --no-sign v-nosign");
+
+    // `-s --no-sign` (last wins) countermands `-s`: an UNSIGNED annotated tag is
+    // created, so there is no vault-signing attempt/error.
+    let out2 = run_libra_command(&["tag", "-s", "--no-sign", "-m", "msg", "v-override"], p);
+    assert_cli_success(&out2, "tag -s --no-sign -m msg v-override");
+
+    let tags = run_libra_command(&["tag"], p);
+    let listed = String::from_utf8_lossy(&tags.stdout);
+    assert!(
+        listed.contains("v-nosign") && listed.contains("v-override"),
+        "both tags created: {listed}"
+    );
+}
+
+#[test]
+fn tag_no_column_countermands_column() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    run_libra_command(&["tag", "v1aaaa"], p);
+    run_libra_command(&["tag", "v2bbbb"], p);
+
+    // `--no-column` alone lists one tag per line (the default).
+    let plain = run_libra_command(&["tag", "--no-column"], p);
+    assert_cli_success(&plain, "tag --no-column");
+    let plain_out = String::from_utf8_lossy(&plain.stdout);
+    assert!(plain_out.contains("v1aaaa\n"), "one per line: {plain_out}");
+
+    // `--column=always --no-column` (last wins) countermands `--column`, so the
+    // listing is one-per-line, NOT columnar (no two names share a line).
+    let out = run_libra_command(&["tag", "--column=always", "--no-column"], p);
+    assert_cli_success(&out, "tag --column=always --no-column");
+    let listed = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        !listed
+            .lines()
+            .any(|l| l.contains("v1aaaa") && l.contains("v2bbbb")),
+        "--no-column countermands --column (one per line): {listed}"
+    );
+}
+
+/// End-to-end `tag -e`/`--edit`: a scripted editor composes an annotated-tag
+/// message (comments stripped); with `-m` the editor is pre-filled and a no-op
+/// editor keeps that seed; a comment-only buffer aborts with "no tag message".
+#[cfg(unix)]
+#[test]
+fn tag_edit_composes_seeds_and_aborts_via_editor() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Write a scripted editor that overwrites the buffer ($1) with `body`.
+    let overwrite_editor = |name: &str, body: &str| -> String {
+        let path = p.join(name);
+        std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{body}' > \"$1\"\n")).unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+
+    // 1) `-e` alone composes an annotated tag from the editor; comments stripped.
+    let compose = overwrite_editor("compose.sh", "composed via editor\n# ignored comment\n");
+    let out = run_libra_command_with_stdin_and_env(
+        &["tag", "-e", "v-edit"],
+        p,
+        "",
+        &[("GIT_EDITOR", compose.as_str())],
+    );
+    assert_cli_success(&out, "tag -e compose");
+    let listed = run_libra_command(&["tag", "-n1", "v-edit"], p);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("composed via editor"),
+        "annotated message composed in editor: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // 2) `-e -m "seed"` pre-fills the editor; a no-op editor keeps the seed.
+    let noop_path = p.join("noop.sh");
+    std::fs::write(&noop_path, "#!/bin/sh\nexit 0\n").unwrap();
+    let mut perms = std::fs::metadata(&noop_path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&noop_path, perms).unwrap();
+    let out = run_libra_command_with_stdin_and_env(
+        &["tag", "-e", "-m", "seeded body", "v-seed"],
+        p,
+        "",
+        &[("GIT_EDITOR", noop_path.to_string_lossy().as_ref())],
+    );
+    assert_cli_success(&out, "tag -e -m seed");
+    let listed = run_libra_command(&["tag", "-n1", "v-seed"], p);
+    assert!(
+        String::from_utf8_lossy(&listed.stdout).contains("seeded body"),
+        "the -m seed survives an unedited editor buffer: {}",
+        String::from_utf8_lossy(&listed.stdout)
+    );
+
+    // 3) A comment-only buffer cleans to empty and aborts (exit 128).
+    let empty = overwrite_editor("empty.sh", "# only a comment\n");
+    let out = run_libra_command_with_stdin_and_env(
+        &["tag", "-e", "v-empty"],
+        p,
+        "",
+        &[("GIT_EDITOR", empty.as_str())],
+    );
+    assert_eq!(
+        out.status.code(),
+        Some(128),
+        "empty edited message aborts: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("no tag message given"),
+        "abort message: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// `-e`/`--edit` is a create-only mode: it requires a tag name and is rejected
+/// when combined with list/delete. These guards fire before the editor opens,
+/// so no scripted editor is needed.
+#[test]
+fn tag_edit_rejected_outside_create_mode() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // Bare `-e` with no name must not silently fall into list mode.
+    let no_name = run_libra_command(&["tag", "-e"], p);
+    assert!(!no_name.status.success(), "bare `tag -e` requires a name");
+    assert!(
+        String::from_utf8_lossy(&no_name.stderr).contains("tag name is required"),
+        "missing-name hint: {}",
+        String::from_utf8_lossy(&no_name.stderr)
+    );
+
+    // `-e` with a listing flag (and a name, so the missing-name guard passes
+    // first) is a usage error (not a silent list).
+    let with_list = run_libra_command(&["tag", "-e", "-l", "v1"], p);
+    assert!(
+        !with_list.status.success(),
+        "`tag -e -l` is rejected as a non-create mode"
+    );
+    assert!(
+        String::from_utf8_lossy(&with_list.stderr).contains("only valid when creating a tag"),
+        "create-only hint: {}",
+        String::from_utf8_lossy(&with_list.stderr)
+    );
+
+    // `-e` with delete must not silently delete while ignoring the editor.
+    let with_delete = run_libra_command(&["tag", "-e", "-d", "whatever"], p);
+    assert!(
+        !with_delete.status.success(),
+        "`tag -e -d` is rejected as a non-create mode"
+    );
+}
+
+/// Helper: run `tag -l --sort=refname --column=<spec>` at a fixed COLUMNS width
+/// and return the output lines.
+fn tag_column_lines(p: &std::path::Path, spec: &str, columns: &str) -> Vec<String> {
+    let out = std::process::Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(p)
+        .env("COLUMNS", columns)
+        .args(["tag", "-l", "--sort=refname", &format!("--column={spec}")])
+        .output()
+        .expect("run tag --column");
+    assert!(
+        out.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::to_string)
+        .collect()
+}
+
+#[test]
+fn tag_column_dense_row_and_boundaries_match_git() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Widest name is "longtag-xyz" (11) → column width 13.
+    for t in [
+        "v1.0",
+        "v1.1",
+        "v1.2",
+        "v2.0",
+        "v2.1",
+        "v10.0",
+        "alpha",
+        "beta",
+        "rc-1",
+        "longtag-xyz",
+    ] {
+        assert_cli_success(&run_libra_command(&["tag", t], p), t);
+    }
+    let entries = |lines: &[String]| -> Vec<usize> {
+        lines.iter().map(|l| l.split_whitespace().count()).collect()
+    };
+
+    // NODENSE column-major at COLUMNS=80: floor((80-1)/13)=6 columns fit, but
+    // column-major recomputes cols=ceil(10/2)=5 to drop the empty trailing slot.
+    let cols80 = tag_column_lines(p, "always", "80");
+    assert_eq!(
+        entries(&cols80),
+        vec![5, 5],
+        "column,nodense w=80 → 5 cols: {cols80:?}"
+    );
+    // First row is the heads of each (top-to-bottom) column.
+    assert_eq!(
+        cols80[0].split_whitespace().collect::<Vec<_>>(),
+        vec!["alpha", "longtag-xyz", "v1.0", "v1.2", "v2.0"],
+        "column-major fills down each column"
+    );
+
+    // NODENSE row-major at COLUMNS=80: keeps the fitted 6 columns (Git does NOT
+    // recompute for row-major), filled left-to-right.
+    let row80 = tag_column_lines(p, "always,row", "80");
+    assert_eq!(
+        entries(&row80),
+        vec![6, 4],
+        "row,nodense w=80 → 6 cols: {row80:?}"
+    );
+    assert_eq!(
+        row80[0].split_whitespace().collect::<Vec<_>>(),
+        vec!["alpha", "beta", "longtag-xyz", "rc-1", "v1.0", "v1.1"],
+        "row-major fills left-to-right"
+    );
+
+    // Strict-`<` width boundary: 6 columns need 6*13=78, which is NOT < 78, so
+    // width 78 yields 5 columns but width 79 yields 6 (row-major, no recompute).
+    assert_eq!(
+        entries(&tag_column_lines(p, "always,row", "78")),
+        vec![5, 5]
+    );
+    assert_eq!(
+        entries(&tag_column_lines(p, "always,row", "79")),
+        vec![6, 4]
+    );
+
+    // DENSE packs more columns by sizing each to its own widest entry.
+    let dense37 = tag_column_lines(p, "always,dense", "37");
+    assert_eq!(
+        entries(&dense37),
+        vec![4, 3, 3],
+        "dense w=37 → 4 cols: {dense37:?}"
+    );
+    // Exact padding (dense per-column widths 13/6/7): locks byte fidelity.
+    assert_eq!(dense37[0], "alpha        rc-1  v1.2   v2.1");
+
+    // `plain` is one entry per line regardless of width.
+    assert_eq!(tag_column_lines(p, "plain", "200").len(), 10);
+    assert_eq!(tag_column_lines(p, "always,plain", "200").len(), 10);
+
+    // Space-separated tokens parse like comma-separated.
+    assert_eq!(tag_column_lines(p, "always row", "80"), row80);
+
+    // Later token of a kind wins: `always,never` disables columns.
+    let off = tag_column_lines(p, "always,never", "80");
+    assert_eq!(off.len(), 10, "never (last) disables columns: {off:?}");
+}
+
+#[test]
+fn tag_column_unknown_option_is_usage_error() {
+    let repo = create_committed_repo_via_cli();
+    let out = run_libra_command(&["tag", "-l", "--column=always,bogus"], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "unknown column option → usage error"
+    );
+}
+
+#[test]
+fn tag_column_uses_display_width_for_cjk() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Wide CJK names: "中文" is 2 chars / display width 4; "条目目录" is 4 chars /
+    // display width 8. Column width is the widest DISPLAY width + 2 = 10.
+    for t in ["aa", "bb", "中文", "条目目录"] {
+        assert_cli_success(&run_libra_command(&["tag", t], p), t);
+    }
+
+    // COLUMNS=22: display-width sizing fits 2 columns (2*10=20 < 22). A
+    // character-count implementation would size columns at 4+2=6 and wrongly fit
+    // 3 columns, so this exact output locks display-width layout AND padding.
+    let cols = tag_column_lines(p, "always", "22");
+    assert_eq!(
+        cols,
+        vec![
+            "aa        中文".to_string(),
+            "bb        条目目录".to_string(),
+        ],
+        "CJK columns are laid out and padded by display width: {cols:?}"
+    );
+
+    // COLUMNS=20: the width-8 entry forces a single column (matching git).
+    assert_eq!(tag_column_lines(p, "always", "20").len(), 4);
 }

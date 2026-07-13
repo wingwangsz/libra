@@ -782,15 +782,17 @@ fn boundary_ref_exact_prefix() {
 // ── usage / argument errors ────────────────────────────────────────────
 
 #[test]
-fn error_add_without_message_or_file() {
+fn error_add_without_message_falls_back_to_editor_then_no_editor() {
     let repo = create_committed_repo_via_cli();
+    // No -m/-F: `notes add` now opens an editor. The test environment has no
+    // GIT_EDITOR/EDITOR and a non-terminal stdin, so it fails with a clear
+    // "no editor configured" error (exit 128) rather than the old usage error.
     let output = run_libra_command(&["notes", "add"], repo.path());
-    let (stderr, report) = parse_cli_error_stderr(&output.stderr);
+    let (stderr, _report) = parse_cli_error_stderr(&output.stderr);
 
-    assert_eq!(output.status.code(), Some(129));
-    assert_eq!(report.error_code, "LBR-CLI-002");
+    assert_eq!(output.status.code(), Some(128));
     assert!(
-        stderr.contains("provide a message"),
+        stderr.contains("no editor configured"),
         "unexpected stderr: {stderr}"
     );
 }
@@ -802,12 +804,13 @@ fn error_add_json_without_message() {
     let report: serde_json::Value =
         serde_json::from_slice(&output.stderr).expect("expected stderr JSON");
 
-    assert_eq!(output.status.code(), Some(129));
+    // No editor in the test env → the editor fallback reports a fatal error.
+    assert_eq!(output.status.code(), Some(128));
     assert!(
         output.stdout.is_empty(),
         "json error should keep stdout empty"
     );
-    assert_eq!(report["error_code"], "LBR-CLI-002");
+    assert_eq!(report["error_code"], "LBR-REPO-003");
 }
 
 #[test]
@@ -1373,4 +1376,539 @@ fn notes_edit_sets_and_replaces_note() {
         "edit replaced the note: {shown:?}"
     );
     assert!(!shown.contains("first"), "old note text is gone: {shown:?}");
+}
+
+#[test]
+fn test_notes_merge_strategies_copy_and_manual_conflict() {
+    // `notes merge <other-ref>` is a 2-way merge of the flat notes rows: copy
+    // objects annotated only in <other>, skip identical notes, and resolve a
+    // differing note per --strategy (manual aborts).
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // A second commit so we have two distinct annotatable objects (HEAD, HEAD~1).
+    std::fs::write(p.join("f.txt"), "x\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], p), "add f.txt");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+
+    // Conflicting notes on HEAD: current ref "AAA", other ref "BBB".
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "AAA", "HEAD"], p),
+        "current AAA",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "BBB",
+                "HEAD",
+            ],
+            p,
+        ),
+        "other BBB",
+    );
+    // Other ref also annotates HEAD~1 (object new to the current ref → copy).
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/other",
+                "add",
+                "-m",
+                "ONLY",
+                "HEAD~1",
+            ],
+            p,
+        ),
+        "other ONLY on HEAD~1",
+    );
+
+    // Manual (default) aborts on the HEAD conflict and changes nothing.
+    let manual = run_libra_command(&["notes", "merge", "refs/notes/other"], p);
+    assert!(
+        !manual.status.success(),
+        "manual merge must abort on conflict"
+    );
+    assert!(
+        String::from_utf8_lossy(&manual.stderr).contains("conflict"),
+        "stderr should mention the conflict: {}",
+        String::from_utf8_lossy(&manual.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&run_libra_command(&["notes", "show", "HEAD"], p).stdout)
+            .contains("AAA"),
+        "manual abort leaves the current note unchanged"
+    );
+    // The non-conflicting copy must NOT have happened either (all-or-nothing).
+    assert!(
+        !run_libra_command(&["notes", "show", "HEAD~1"], p)
+            .status
+            .success(),
+        "manual abort applies nothing, including the copy"
+    );
+
+    // --strategy=theirs: HEAD takes the other note, HEAD~1 is copied.
+    assert_cli_success(
+        &run_libra_command(
+            &["notes", "merge", "--strategy=theirs", "refs/notes/other"],
+            p,
+        ),
+        "merge theirs",
+    );
+    assert!(
+        String::from_utf8_lossy(&run_libra_command(&["notes", "show", "HEAD"], p).stdout)
+            .contains("BBB"),
+        "theirs takes the other note"
+    );
+    assert!(
+        String::from_utf8_lossy(&run_libra_command(&["notes", "show", "HEAD~1"], p).stdout)
+            .contains("ONLY"),
+        "the non-conflicting note was copied"
+    );
+
+    // --strategy=union concatenates both note contents. Re-create a conflict on
+    // HEAD (current is now BBB), then a third ref with CCC.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/third",
+                "add",
+                "-m",
+                "CCC",
+                "HEAD",
+            ],
+            p,
+        ),
+        "third CCC",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &["notes", "merge", "--strategy=union", "refs/notes/third"],
+            p,
+        ),
+        "merge union",
+    );
+    let unioned = String::from_utf8_lossy(&run_libra_command(&["notes", "show", "HEAD"], p).stdout)
+        .into_owned();
+    assert!(
+        unioned.contains("BBB") && unioned.contains("CCC"),
+        "union concatenates both notes: {unioned}"
+    );
+
+    // Unsupported strategy → usage error (exit 129).
+    let bad = run_libra_command(
+        &["notes", "merge", "--strategy=bogus", "refs/notes/other"],
+        p,
+    );
+    assert_eq!(
+        bad.status.code(),
+        Some(129),
+        "unknown strategy is a usage error"
+    );
+}
+
+#[test]
+fn test_notes_merge_ours_cat_sort_uniq_and_manual_code() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // --strategy=ours keeps the current note on conflict.
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "KEEP", "HEAD"], p),
+        "current KEEP",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/o",
+                "add",
+                "-m",
+                "DROP",
+                "HEAD",
+            ],
+            p,
+        ),
+        "other DROP",
+    );
+    assert_cli_success(
+        &run_libra_command(&["notes", "merge", "--strategy=ours", "refs/notes/o"], p),
+        "merge ours",
+    );
+    let kept = String::from_utf8_lossy(&run_libra_command(&["notes", "show", "HEAD"], p).stdout)
+        .into_owned();
+    assert!(
+        kept.contains("KEEP") && !kept.contains("DROP"),
+        "ours keeps current: {kept}"
+    );
+
+    // Manual conflict carries the stable conflict code (and a non-zero exit).
+    let manual = run_libra_command(&["notes", "merge", "refs/notes/o"], p);
+    assert!(!manual.status.success(), "manual conflict aborts");
+    let (_, report) = parse_cli_error_stderr(&manual.stderr);
+    assert_eq!(
+        report.error_code, "LBR-CONFLICT-002",
+        "manual notes conflict should carry the conflict-blocked stable code"
+    );
+
+    // --strategy=cat_sort_uniq combines, sorts, and de-duplicates the lines.
+    std::fs::write(p.join("cur.txt"), "banana\napple\n").unwrap();
+    std::fs::write(p.join("oth.txt"), "cherry\napple\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/csu_cur",
+                "add",
+                "-F",
+                "cur.txt",
+                "HEAD",
+            ],
+            p,
+        ),
+        "csu current",
+    );
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/csu_oth",
+                "add",
+                "-F",
+                "oth.txt",
+                "HEAD",
+            ],
+            p,
+        ),
+        "csu other",
+    );
+    // Merge oth into cur with cat_sort_uniq.
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "notes",
+                "--ref",
+                "refs/notes/csu_cur",
+                "merge",
+                "--strategy=cat_sort_uniq",
+                "refs/notes/csu_oth",
+            ],
+            p,
+        ),
+        "merge cat_sort_uniq",
+    );
+    let csu = String::from_utf8_lossy(
+        &run_libra_command(&["notes", "--ref", "refs/notes/csu_cur", "show", "HEAD"], p).stdout,
+    )
+    .into_owned();
+    // Sorted unique lines: apple, banana, cherry (apple de-duplicated).
+    assert_eq!(
+        csu.matches("apple").count(),
+        1,
+        "cat_sort_uniq de-duplicates 'apple': {csu}"
+    );
+    let apple = csu.find("apple");
+    let banana = csu.find("banana");
+    let cherry = csu.find("cherry");
+    assert!(
+        apple < banana && banana < cherry,
+        "cat_sort_uniq sorts the lines (apple<banana<cherry): {csu}"
+    );
+}
+
+#[test]
+fn get_ref_prints_active_notes_ref() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    let default = run_libra_command(&["notes", "get-ref"], p);
+    assert_cli_success(&default, "notes get-ref");
+    assert_eq!(
+        String::from_utf8_lossy(&default.stdout).trim(),
+        "refs/notes/commits"
+    );
+
+    let custom = run_libra_command(&["notes", "--ref", "refs/notes/review", "get-ref"], p);
+    assert_cli_success(&custom, "notes --ref get-ref");
+    assert_eq!(
+        String::from_utf8_lossy(&custom.stdout).trim(),
+        "refs/notes/review"
+    );
+}
+
+#[test]
+fn prune_removes_notes_for_missing_objects_only() {
+    use super::loose_object_path;
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // A note on HEAD (its object stays reachable) and a note on a second commit
+    // whose object we then delete, making that note stale.
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "keep"], p),
+        "note on HEAD",
+    );
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    std::fs::write(p.join("f2.txt"), "2\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f2.txt"], p), "add f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "c2", "--no-verify"], p),
+        "commit c2",
+    );
+    let c2 = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "stale"], p),
+        "note on c2",
+    );
+
+    // Move HEAD off c2 and delete c2's object so its note is now orphaned.
+    assert_cli_success(&run_libra_command(&["reset", "--hard", &head], p), "reset");
+    std::fs::remove_file(loose_object_path(p, &c2)).expect("remove c2 object");
+
+    // `--dry-run -v` reports the stale object without deleting it.
+    let dry = run_libra_command(&["notes", "prune", "--dry-run", "-v"], p);
+    assert_cli_success(&dry, "notes prune --dry-run");
+    assert!(
+        String::from_utf8_lossy(&dry.stdout).trim() == c2,
+        "dry-run lists the stale object: {}",
+        String::from_utf8_lossy(&dry.stdout)
+    );
+
+    // The real prune removes the stale note; the HEAD note survives.
+    let pruned = run_libra_command(&["notes", "prune", "-v"], p);
+    assert_cli_success(&pruned, "notes prune");
+    assert_eq!(String::from_utf8_lossy(&pruned.stdout).trim(), c2);
+
+    let list = run_libra_command(&["notes", "list"], p);
+    assert_cli_success(&list, "notes list");
+    let listed = String::from_utf8_lossy(&list.stdout);
+    assert!(
+        listed.contains(&head[..7]) && !listed.contains(&c2[..7]),
+        "the HEAD note survives and the stale note is gone: {listed}"
+    );
+}
+
+#[test]
+fn prune_aborts_on_unreadable_object_and_keeps_note() {
+    use super::loose_object_path;
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "keep"], p),
+        "note on HEAD",
+    );
+    let head = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], p).stdout)
+        .trim()
+        .to_string();
+
+    // Corrupt (not remove) HEAD's loose object: the file still exists, so the
+    // object-store read fails with a NON-ObjectNotFound error. Prune must abort
+    // rather than treat the read failure as "object missing".
+    std::fs::write(loose_object_path(p, &head), b"corrupt not-an-object").expect("corrupt object");
+
+    let out = run_libra_command(&["notes", "prune"], p);
+    assert!(
+        !out.status.success(),
+        "prune must abort on an unreadable (corrupt) object, not prune it: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+
+    // The note must survive — `notes list` reads DB rows (not the corrupt
+    // object), so it still reports the note.
+    let list = run_libra_command(&["notes", "list"], p);
+    assert_cli_success(&list, "notes list after aborted prune");
+    assert!(
+        String::from_utf8_lossy(&list.stdout).contains(&head[..7]),
+        "the note survives the aborted prune: {}",
+        String::from_utf8_lossy(&list.stdout)
+    );
+}
+
+// ── editor fallback (no -m/-F) ──────────────────────────────────────────
+
+/// Write an executable scripted editor that overwrites the buffer ($1) with
+/// `body`, returning its path.
+#[cfg(unix)]
+fn write_note_editor(dir: &std::path::Path, name: &str, body: &str) -> String {
+    use std::os::unix::fs::PermissionsExt;
+    let path = dir.join(name);
+    std::fs::write(&path, format!("#!/bin/sh\nprintf '%s' '{body}' > \"$1\"\n")).unwrap();
+    let mut perms = std::fs::metadata(&path).unwrap().permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).unwrap();
+    path.to_string_lossy().into_owned()
+}
+
+/// `notes add` with no -m/-F opens an editor; the composed text becomes the
+/// note. A note may contain `#` lines (they are NOT stripped as comments).
+#[cfg(unix)]
+#[test]
+fn add_without_message_composes_via_editor() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let editor = write_note_editor(p, "compose.sh", "from editor\n# kept hash line\n");
+    let out = run_libra_command_with_stdin_and_env(
+        &["notes", "add"],
+        p,
+        "",
+        &[("GIT_EDITOR", editor.as_str())],
+    );
+    assert_cli_success(&out, "notes add via editor");
+    let show = run_libra_command(&["notes", "show"], p);
+    let shown = String::from_utf8_lossy(&show.stdout);
+    assert!(shown.contains("from editor"), "composed note: {shown}");
+    assert!(
+        shown.contains("# kept hash line"),
+        "notes preserve # lines: {shown}"
+    );
+}
+
+/// `notes edit` with no -m/-F pre-fills the editor with the existing note.
+#[cfg(unix)]
+#[test]
+fn edit_without_message_prefills_existing_note_in_editor() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "original note"], p),
+        "seed note",
+    );
+
+    // A no-op editor (exit 0) leaves the pre-filled buffer untouched, so the
+    // existing note survives the edit — proving it was loaded into the editor.
+    let noop = {
+        use std::os::unix::fs::PermissionsExt;
+        let path = p.join("noop.sh");
+        std::fs::write(&path, "#!/bin/sh\nexit 0\n").unwrap();
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_mode(0o755);
+        std::fs::set_permissions(&path, perms).unwrap();
+        path.to_string_lossy().into_owned()
+    };
+    let out = run_libra_command_with_stdin_and_env(
+        &["notes", "edit"],
+        p,
+        "",
+        &[("GIT_EDITOR", noop.as_str())],
+    );
+    assert_cli_success(&out, "notes edit via editor");
+    let show = run_libra_command(&["notes", "show"], p);
+    assert!(
+        String::from_utf8_lossy(&show.stdout).contains("original note"),
+        "edit pre-fills and keeps the existing note: {}",
+        String::from_utf8_lossy(&show.stdout)
+    );
+}
+
+/// `notes append` with no -m/-F composes the appended text in an editor and
+/// concatenates it after the existing note (separated by a blank line).
+#[cfg(unix)]
+#[test]
+fn append_without_message_composes_via_editor() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "first line"], p),
+        "seed note",
+    );
+    let editor = write_note_editor(p, "append.sh", "appended line\n");
+    let out = run_libra_command_with_stdin_and_env(
+        &["notes", "append"],
+        p,
+        "",
+        &[("GIT_EDITOR", editor.as_str())],
+    );
+    assert_cli_success(&out, "notes append via editor");
+    let show = run_libra_command(&["notes", "show"], p);
+    let shown = String::from_utf8_lossy(&show.stdout);
+    assert!(shown.contains("first line"), "keeps original: {shown}");
+    assert!(shown.contains("appended line"), "appends new: {shown}");
+}
+
+/// Interactive `notes add` on an object that already has a note pre-fills the
+/// editor with that note (with -f) rather than opening an empty buffer.
+#[cfg(unix)]
+#[test]
+fn add_force_without_message_prefills_existing_note() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["notes", "add", "-m", "preexisting"], p),
+        "seed note",
+    );
+    // A no-op editor keeps the pre-filled buffer; with -f the note is upserted,
+    // so the pre-existing text survives — proving it was loaded.
+    let noop = write_note_editor(p, "noop_add.sh", "");
+    // (overwrite the script to be a true no-op rather than emptying the buffer)
+    std::fs::write(&noop, "#!/bin/sh\nexit 0\n").unwrap();
+    let out = run_libra_command_with_stdin_and_env(
+        &["notes", "add", "-f"],
+        p,
+        "",
+        &[("GIT_EDITOR", noop.as_str())],
+    );
+    assert_cli_success(&out, "notes add -f via editor");
+    assert!(
+        String::from_utf8_lossy(&run_libra_command(&["notes", "show"], p).stdout)
+            .contains("preexisting"),
+        "add -f pre-fills and keeps the existing note"
+    );
+
+    // Without -f, interactive add on an existing note aborts early.
+    let out2 = run_libra_command_with_stdin_and_env(
+        &["notes", "add"],
+        p,
+        "",
+        &[("GIT_EDITOR", noop.as_str())],
+    );
+    assert!(
+        !out2.status.success(),
+        "interactive add without -f aborts on an existing note"
+    );
+    assert!(
+        String::from_utf8_lossy(&out2.stderr).contains("already exists"),
+        "abort message: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+}
+
+/// An editor that produces only blank/whitespace content aborts the note.
+#[cfg(unix)]
+#[test]
+fn add_with_empty_editor_buffer_aborts() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let blank = write_note_editor(p, "blank.sh", "   \n\n");
+    let out = run_libra_command_with_stdin_and_env(
+        &["notes", "add"],
+        p,
+        "",
+        &[("GIT_EDITOR", blank.as_str())],
+    );
+    assert!(!out.status.success(), "empty editor buffer aborts");
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("empty note content"),
+        "abort message: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

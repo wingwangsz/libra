@@ -85,6 +85,51 @@ fn test_shortlog_json_output_has_author_summary() {
     assert_eq!(json["data"]["authors"][0]["count"], 1);
 }
 
+#[test]
+fn test_shortlog_format_renders_custom_per_commit_line() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    fs::write(p.join("second.txt"), "second\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "second.txt"], p), "add second");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "second commit", "--no-verify"], p),
+        "commit second",
+    );
+
+    // `--format` replaces the subject line with the rendered template, indented
+    // by the standard 6 spaces, while keeping the author header.
+    let output = run_libra_command(&["shortlog", "--format=* %s (%an)"], p);
+    assert_cli_success(&output, "shortlog --format");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains("      * second commit (Test User)"),
+        "rendered template line present: {stdout}"
+    );
+    assert!(
+        stdout.contains("Test User"),
+        "author header present: {stdout}"
+    );
+    // The bare subject must not leak through (it is wrapped in the template).
+    assert!(
+        !stdout.lines().any(|line| line.trim() == "second commit"),
+        "bare subject must not appear under --format: {stdout}"
+    );
+
+    // `%h` renders an abbreviated hex hash (7+ chars), indented.
+    let hashes = run_libra_command(&["shortlog", "--format=%h"], p);
+    assert_cli_success(&hashes, "shortlog --format=%h");
+    let htext = String::from_utf8_lossy(&hashes.stdout);
+    assert!(
+        htext.lines().any(|line| {
+            line.starts_with("      ") && {
+                let h = line.trim();
+                h.len() >= 7 && h.chars().all(|c| c.is_ascii_hexdigit())
+            }
+        }),
+        "an abbreviated hash line is present: {htext}"
+    );
+}
+
 #[tokio::test]
 #[serial]
 async fn test_shortlog_revision_argument_limits_history() {
@@ -965,5 +1010,97 @@ fn test_shortlog_merges_and_no_merges() {
     assert!(
         nm.contains("main-c2"),
         "--no-merges keeps a non-merge: {nm:?}"
+    );
+}
+
+/// `git log | libra shortlog` (no revision, piped stdin) summarises the piped
+/// `git log`/`libra log` output instead of walking the repository. Mirrors
+/// `git shortlog`'s stdin mode; the repository (here, the helper's own commit)
+/// is ignored once stdin carries data.
+#[test]
+fn test_shortlog_reads_piped_log_input() {
+    use super::{assert_cli_success, create_committed_repo_via_cli, run_libra_command_with_stdin};
+
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    // Medium-format `git log` output: Alice authored two commits, Bob one.
+    let log = "\
+commit cccccccccccccccccccccccccccccccccccccccc
+Author: Alice <a@b>
+Date:   Fri Jun 26 10:00:03 2026 +0000
+
+    third commit
+
+commit bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+Author: Bob <bob@b>
+Date:   Fri Jun 26 10:00:02 2026 +0000
+
+    second commit subject
+
+commit aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa
+Author: Alice <a@b>
+Date:   Fri Jun 26 10:00:01 2026 +0000
+
+    first commit
+";
+
+    let out = run_libra_command_with_stdin(&["shortlog"], p, log);
+    assert_cli_success(&out, "shortlog from stdin");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    // Aggregated from stdin (Alice 2, Bob 1), NOT from the repo's single commit.
+    assert!(stdout.contains("2  Alice"), "Alice has 2 commits: {stdout}");
+    assert!(stdout.contains("1  Bob"), "Bob has 1 commit: {stdout}");
+    assert!(
+        stdout.contains("third commit") && stdout.contains("first commit"),
+        "Alice's subjects are listed: {stdout}"
+    );
+    assert!(
+        stdout.contains("second commit subject"),
+        "Bob's subject is listed: {stdout}"
+    );
+
+    // `-s` (summary) suppresses subjects.
+    let summary = run_libra_command_with_stdin(&["shortlog", "-s"], p, log);
+    assert_cli_success(&summary, "shortlog -s from stdin");
+    let summary_out = String::from_utf8_lossy(&summary.stdout);
+    assert!(summary_out.contains("2  Alice") && summary_out.contains("1  Bob"));
+    assert!(
+        !summary_out.contains("third commit"),
+        "summary omits subjects: {summary_out}"
+    );
+
+    // `-n` (numbered) orders the higher-count author first.
+    let numbered = run_libra_command_with_stdin(&["shortlog", "-n", "-s"], p, log);
+    assert_cli_success(&numbered, "shortlog -n -s from stdin");
+    let numbered_out = String::from_utf8_lossy(&numbered.stdout);
+    let alice_pos = numbered_out.find("Alice").expect("Alice present");
+    let bob_pos = numbered_out.find("Bob").expect("Bob present");
+    assert!(
+        alice_pos < bob_pos,
+        "Alice (2) sorts before Bob (1) with -n: {numbered_out}"
+    );
+
+    // `--author` filters the piped commits by author identity.
+    let filtered = run_libra_command_with_stdin(&["shortlog", "-s", "--author=Bob"], p, log);
+    assert_cli_success(&filtered, "shortlog --author from stdin");
+    let filtered_out = String::from_utf8_lossy(&filtered.stdout);
+    assert!(
+        filtered_out.contains("Bob") && !filtered_out.contains("Alice"),
+        "--author=Bob keeps only Bob: {filtered_out}"
+    );
+
+    // `--json` in stdin mode reflects the `--author` filter in `total_commits`
+    // (consistent with the repo-walk path, which filters before counting).
+    let json_out = run_libra_command_with_stdin(&["shortlog", "--json", "--author=Bob"], p, log);
+    assert_cli_success(&json_out, "shortlog --json --author from stdin");
+    let json = super::parse_json_stdout(&json_out);
+    assert_eq!(json["command"], "shortlog");
+    assert_eq!(
+        json["data"]["total_commits"], 1,
+        "total_commits counts only the filtered (Bob) commit: {json}"
+    );
+    assert_eq!(
+        json["data"]["total_authors"], 1,
+        "only Bob remains after --author=Bob: {json}"
     );
 }

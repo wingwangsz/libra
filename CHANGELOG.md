@@ -83,6 +83,51 @@
 - **Stale src/ file-count claim refreshed (v0.17.843)**: bumped
   410 → 427 in `docs/development/commands/_general.md`'s
   `compat_all_production_unwrap_guard` description.
+- **`libra code` Code-phase closeout (C1–C8)**: synced
+  `docs/development/tracing/code.md`, `docs/commands/code.md`,
+  `docs/commands/zh-CN/code.md`, `COMPATIBILITY.md`, and
+  `tests/INDEX.md` to the shipped mode/provider/Web/MCP/session/
+  approval behavior. The `run_libra_vcs` allowlist docs now list all
+  ten commands (`status`, `diff`, `branch`, `log`, `show`, `show-ref`,
+  `ls-files`, `add`, `commit`, `switch`) and recommend `ls-files
+  --others --exclude-standard` for untracked-path inspection, matching
+  the tool's own guidance.
+- **Agent Gate 8 closeout docs (v0.18.21)**: re-audited the Agent
+  tracing plan against the shipped code and updated
+  `docs/development/tracing/agent.md` / `plan.md` to reflect the
+  implemented first-batch roster, hook providers, lifecycle events,
+  checkpoint/export/doctor/retention/audit behavior, and intentionally
+  deferred parity items. `compat_agent_docs_contract` now also pins the
+  schema/retention/raw-export wording and the current internal runtime
+  source-of-truth link.
+- **Mutating fix bridge deferred (no agent↔code write collaboration
+  yet)**: the internal AgentRuntime serialized fix bridge is not
+  enabled. `libra review --fix` and `libra investigate fix` stay
+  read-only and fail closed with `LBR-AGENT-010`
+  (`ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`, exit 128); `libra agent`
+  review/investigate produce findings only and never mutate the
+  working tree through `libra code`. Because the bridge is unbuilt,
+  there is no `libra agent` ↔ `libra code` mutating collaboration
+  boundary to describe — findings-to-fix hand-off remains a documented
+  deferral until the bridge lands with approval/sandbox/tool-ACL
+  coverage.
+- **External agent discovery is preview / opt-in (default off)**:
+  `libra agent rpc list/trust/invoke` over external `libra-agent-*`
+  binaries is disabled by default behind the `agent.external_agents.enabled`
+  setting; unknown binaries are quarantined (never registered as
+  callable) and built-in slug impersonation is skip-and-logged. This is
+  a preview surface — enable it deliberately per repo, it is not on by
+  default.
+- **D1/R2 deletion propagation for agent-capture data is deferred**: a
+  best-effort cloud mirror already exists via `libra cloud sync` — agent
+  checkpoint blobs/trees/commits reach R2 through `object_index`, and
+  `agent_session` / `agent_checkpoint` rows are mirrored to D1. Local
+  erasure (`libra agent clean --gc` and session erasure) rewrites
+  `refs/libra/traces` and drops the local DB / `object_index` rows, but
+  it does NOT push a tombstone/delete to D1/R2, so a later
+  `cloud sync` / restore from another machine could resurrect erased
+  agent-capture data. Tombstone/deletion propagation to D1/R2 is
+  explicitly deferred until it lands.
 
 ## [0.1.6]
 

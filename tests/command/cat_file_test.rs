@@ -635,6 +635,75 @@ async fn test_cat_file_exist_check() {
     );
 }
 
+/// Scenario: `cat-file -e --json`/`--machine` emits a `{ exists: bool }`
+/// envelope for agents while preserving the status-only exit contract — a
+/// present object exits 0, a well-formed but absent object exits 1 (with the
+/// JSON still written to stdout).
+#[tokio::test]
+async fn test_cat_file_exist_check_json() {
+    let temp_dir = init_temp_repo();
+    let temp_path = temp_dir.path();
+
+    configure_user_identity(temp_path);
+    create_commit(temp_path, "f.txt", "data", "commit");
+
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_libra"))
+            .current_dir(temp_path)
+            .env(
+                "LIBRA_CONFIG_GLOBAL_DB",
+                temp_path.join(".libra-test-global-config.db"),
+            )
+            .args(args)
+            .output()
+            .expect("Failed to execute cat-file")
+    };
+
+    // Present object → exists:true, exit 0.
+    let out = run(&["cat-file", "-e", "HEAD", "--json"]);
+    assert!(
+        out.status.success(),
+        "cat-file -e HEAD --json should exit 0"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"exists\"") && stdout.contains("true"),
+        "expected exists:true JSON: {stdout}"
+    );
+
+    // Well-formed but absent object → exists:false, exit 1, JSON still emitted.
+    let out = run(&[
+        "cat-file",
+        "-e",
+        "0000000000000000000000000000000000000000",
+        "--json",
+    ]);
+    assert_eq!(
+        out.status.code(),
+        Some(1),
+        "absent object exits 1 even with --json"
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\"exists\"") && stdout.contains("false"),
+        "expected exists:false JSON: {stdout}"
+    );
+
+    // A malformed/unresolvable name is a hard error (LBR-CLI-003 / exit 129,
+    // the same as the non-JSON path) and emits no `exists` envelope.
+    let out = run(&["cat-file", "-e", "not a valid ref!!", "--json"]);
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "malformed name should exit 129 (LBR-CLI-003)"
+    );
+    assert!(
+        !String::from_utf8_lossy(&out.stdout).contains("\"exists\""),
+        "malformed name must not emit an exists envelope: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+}
+
 /// Scenario: `-t -s` together must be rejected — clap's mutual-exclusion
 /// guards prevent ambiguous output. Confirms the CLI grammar.
 #[tokio::test]
@@ -1023,13 +1092,105 @@ fn test_cat_file_batch_command_dispatches_info_and_contents() {
     );
     assert!(s.contains("not-a-real-ref missing"), "missing line: {s}");
 
-    // `flush` is rejected without --buffer (Libra does not expose --buffer).
+    // `flush` is rejected without --buffer.
     let flush = run_bc("flush\n".to_string());
     assert!(!flush.status.success(), "flush must error without --buffer");
 
     // An unknown command is a usage error.
     let unknown = run_bc("bogus deadbeef\n".to_string());
     assert!(!unknown.status.success(), "unknown command must error");
+}
+
+#[test]
+fn test_cat_file_buffer_enables_flush_and_requires_batch_mode() {
+    use std::process::Stdio;
+
+    let temp_dir = init_temp_repo();
+    let temp_path = temp_dir.path();
+    configure_user_identity(temp_path);
+    create_commit(temp_path, "hello.txt", "hello world\n", "first commit");
+
+    let head = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(temp_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("Failed to resolve HEAD");
+    let head_hash = String::from_utf8_lossy(&head.stdout).trim().to_string();
+
+    let run = |args: &[&str], stdin_body: String| {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_libra"))
+            .current_dir(temp_path)
+            .args(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("Failed to spawn cat-file");
+        child
+            .stdin
+            .take()
+            .expect("child stdin")
+            .write_all(stdin_body.as_bytes())
+            .expect("Failed to write input");
+        child
+            .wait_with_output()
+            .expect("Failed to wait on cat-file")
+    };
+
+    // Under --buffer the `flush` command is valid and both `info` outputs are
+    // produced (one before flush, one after).
+    let buffered = run(
+        &["cat-file", "--batch-command", "--buffer"],
+        format!("info {head_hash}\nflush\ninfo {head_hash}\n"),
+    );
+    assert!(
+        buffered.status.success(),
+        "flush is valid under --buffer: {}",
+        String::from_utf8_lossy(&buffered.stderr)
+    );
+    let buffered_out = String::from_utf8_lossy(&buffered.stdout);
+    assert_eq!(
+        buffered_out
+            .matches(&format!("{head_hash} commit "))
+            .count(),
+        2,
+        "both info outputs are present: {buffered_out}"
+    );
+
+    // Buffering does not change the output bytes vs the unbuffered run of the
+    // same info commands.
+    let unbuffered = run(
+        &["cat-file", "--batch-command"],
+        format!("info {head_hash}\ninfo {head_hash}\n"),
+    );
+    assert_eq!(
+        buffered.stdout, unbuffered.stdout,
+        "buffering must not change the emitted bytes"
+    );
+
+    // A `flush` with a stray argument is a usage error even under --buffer.
+    let bad_flush = run(
+        &["cat-file", "--batch-command", "--buffer"],
+        "flush extra\n".to_string(),
+    );
+    assert!(
+        !bad_flush.status.success(),
+        "flush takes no argument: {}",
+        String::from_utf8_lossy(&bad_flush.stdout)
+    );
+
+    // --buffer without a batch mode is a usage error (exit 129).
+    let bad = Command::new(env!("CARGO_BIN_EXE_libra"))
+        .current_dir(temp_path)
+        .args(["cat-file", "--buffer", &head_hash])
+        .output()
+        .expect("Failed to run cat-file --buffer");
+    assert_eq!(
+        bad.status.code(),
+        Some(129),
+        "--buffer requires a batch mode: {}",
+        String::from_utf8_lossy(&bad.stderr)
+    );
 }
 
 #[test]

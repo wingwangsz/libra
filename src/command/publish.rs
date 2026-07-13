@@ -229,7 +229,7 @@ const PUBLISH_REDACTION_RULES_VERSION: &str = "2026.05.13-1";
 /// output, but the explicit hint keeps the contract callsite-stable —
 /// mirrors push.rs / tag.rs / commit.rs / stash.rs / index_pack.rs's
 /// hint pattern per Cross-Cutting G.
-const ISSUE_URL: &str = "https://github.com/web3infra-foundation/libra/issues";
+const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 const PUBLISH_AI_PROJECTION_OBJECT_TYPES: &[&str] = &[
     "Thread",
     "Scheduler",
@@ -3449,6 +3449,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_sync_materializes_revision_file_inputs_from_commit_tree() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3501,6 +3502,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_sync_non_dry_run_all_refs_persists_revision_rows_and_site_index() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3581,6 +3583,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_sync_non_dry_run_targeted_ref_does_not_advance_full_refs_generation() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3626,6 +3629,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_sync_non_dry_run_latest_uses_default_ref_revision() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3669,6 +3673,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_sync_non_dry_run_persists_ai_artifacts_and_counts() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3720,6 +3725,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_sync_non_dry_run_default_planner_exports_history_ai_objects() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;
@@ -3811,6 +3817,7 @@ mod tests {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn publish_sync_non_dry_run_fails_when_ai_projection_cannot_rebuild() {
         let temp = tempfile::tempdir().expect("temp dir must be created");
         test::setup_with_new_libra_in(temp.path()).await;

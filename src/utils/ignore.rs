@@ -242,9 +242,26 @@ fn should_ignore_with_workdir(
     path: &Path,
     policy: IgnorePolicy,
     index: &Index,
-    workdir: &PathBuf,
+    workdir: &Path,
 ) -> bool {
     let is_tracked = path_is_tracked_or_unknown_encoding(path, index);
+
+    // lore.md 2.4: a materialized layer-overlay path is UN-NEGATABLY excluded
+    // (highest precedence, above tracked/.libraignore/`!` negations) so a
+    // purely-local overlay can never be swept into `status`/`add .`. This is
+    // consulted for EVERY policy except IncludeIgnored (force-add), where the
+    // `add` staging guard is the airtight backstop instead. Empty snapshot
+    // (no layers) → no-op.
+    if !matches!(policy, IgnorePolicy::IncludeIgnored)
+        && let Some(key) = crate::internal::layer::normalize_key(path)
+        && crate::internal::layer::is_layer_owned(&key)
+    {
+        // Respect: the layer path is excluded from `status`/`add .` (un-negatable).
+        // OnlyIgnored (the `clean -x` candidate scan): NOT a candidate — protect
+        // the active local overlay from being deleted by `clean -x` (only a
+        // re-apply could restore it).
+        return matches!(policy, IgnorePolicy::Respect);
+    }
 
     match policy {
         IgnorePolicy::Respect => {
@@ -272,7 +289,15 @@ fn path_is_tracked_or_unknown_encoding(path: &Path, index: &Index) -> bool {
     }
 }
 
-fn is_path_ignored(path: &Path, workdir: &PathBuf) -> bool {
+/// Whether `path` matches an active ignore pattern, regardless of whether it is
+/// tracked. Unlike `IgnorePolicy::OnlyIgnored` (which treats every tracked entry as
+/// "ignored"), this reports the raw pattern match — used by `ls-files -i` so a
+/// tracked file that matches an exclude pattern (`-i -c`) is surfaced correctly.
+pub fn path_matches_ignore_pattern(path: &Path, workdir: &Path) -> bool {
+    is_path_ignored(path, workdir)
+}
+
+fn is_path_ignored(path: &Path, workdir: &Path) -> bool {
     let absolute = if path.is_absolute() {
         path.to_path_buf()
     } else {
@@ -419,6 +444,9 @@ mod tests {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         })
         .await;
 
@@ -494,6 +522,9 @@ mod tests {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         })
         .await;
 
@@ -531,6 +562,9 @@ mod tests {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         })
         .await;
 
@@ -615,6 +649,9 @@ mod tests {
             ignore_errors: false,
             pathspec_from_file: None,
             pathspec_file_nul: false,
+            chmod: None,
+            renormalize: false,
+            ignore_missing: false,
         })
         .await;
 

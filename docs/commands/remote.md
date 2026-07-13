@@ -8,13 +8,13 @@ Manage configured remotes: list, add, remove, rename, inspect and mutate URLs, a
 libra remote <subcommand> [OPTIONS] [ARGS]
 libra remote show
 libra remote -v
-libra remote add [-f | --fetch] <name> <url>
+libra remote add [-f | --fetch] [-t | --track <branch>]... [-m | --master <branch>] [--tags | --no-tags] [--mirror] <name> <url>
 libra remote remove <name>
 libra remote rename <old> <new>
 libra remote get-url [--push] [--all] <name>
 libra remote set-url [--add | --delete] [--push] [--all] <name> <value>
 libra remote prune [--dry-run] <name>
-libra remote update [<group> | <remote>...]
+libra remote update [-p | --prune] [<group> | <remote>...]
 ```
 
 ## Description
@@ -70,6 +70,13 @@ Register a new remote.
 |----------|-------------|---------|
 | `<name>` | Logical name for the remote | `origin` |
 | `<url>` | Fetch URL for the remote | `https://example.com/repo.git` |
+| `-f`, `--fetch` | Fetch from the new remote immediately after adding it | |
+| `-t`, `--track <branch>` | Track only the given branch — writes a specific `remote.<name>.fetch` refspec instead of the default wildcard. Repeatable. | `-t main -t dev` |
+| `-m`, `--master <branch>` | Point the remote's HEAD (`refs/remotes/<name>/HEAD`) at `<branch>` (written even before the tracking ref exists, like Git) | `-m main` |
+| `--tags` / `--no-tags` | Set `remote.<name>.tagOpt` to fetch all / no tags (mutually exclusive) | |
+| `--mirror` | Mark the remote as a mirror — writes the `remote.<name>.mirror=true` marker (like Git's `remote add --mirror=fetch`). Incompatible with `-t`/`--track`. | `--mirror` |
+
+The `--mirror` marker is informational: Libra does **not** write a `+refs/*:refs/*` fetch refspec because `libra fetch` is not yet mirror-aware (matching `libra clone --mirror`).
 
 ### Subcommand: `remove`
 
@@ -81,7 +88,12 @@ Delete a remote and all its configuration keys.
 
 ### Subcommand: `rename`
 
-Rename an existing remote.
+Rename an existing remote. The operation atomically migrates `remote.<old>.*`
+configuration (including fetch-refspec destinations), `branch.*.remote` values,
+the SSH key namespace, every `refs/remotes/<old>/*` tracking ref, the remote HEAD,
+and matching tracking-ref reflogs. A conflicting target namespace fails without
+leaving a partial rename. Remote and SSH subsections are matched by exact remote
+name, so renaming `corp` cannot capture a separate `corp.prod` remote.
 
 | Argument | Description | Example |
 |----------|-------------|---------|
@@ -113,7 +125,9 @@ Add, replace, or delete URLs for a remote.
 
 ### Subcommand: `prune`
 
-Delete local remote-tracking branches that no longer exist on the remote.
+Delete local remote-tracking branches that are no longer live destinations of
+the remote's effective `remote.<name>.fetch` mappings. Custom destination
+namespaces are therefore retained while their mapped source refs still exist.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
@@ -122,21 +136,27 @@ Delete local remote-tracking branches that no longer exist on the remote.
 
 ### Subcommand: `update`
 
-Fetch from one or more remotes. With no arguments, every configured remote is
-fetched; otherwise each argument is a remote name, or a `remotes.<group>`
-config entry that expands to that group's member remotes.
+Fetch from one or more remotes. With no arguments, members listed by
+`remotes.default` are fetched when that config is non-empty; otherwise every
+configured remote is fetched. Each explicit argument is a remote name, or a
+`remotes.<group>` config entry that expands to that group's member remotes.
+Every resolved remote honors its `remote.<name>.fetch` mappings.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
-| `[<group> \| <remote>...]` | Remotes or remote groups to fetch (default: all) | `libra remote update origin upstream` |
+| `-p`, `--prune` | After fetching, prune remote-tracking branches that no longer exist on the remote (Git's `remote update -p`) | `libra remote update -p` |
+| `[<group> \| <remote>...]` | Remotes or remote groups to fetch (default: `remotes.default`, then all) | `libra remote update origin upstream` |
 
-> `remote update -p` / `--prune` (pruning stale tracking refs after the fetch)
-> is not yet exposed; run `libra remote prune <name>` separately.
+> `-p` / `--prune` runs the same prune logic as `libra remote prune <name>`, but
+> only after every resolved remote has fetched successfully (a two-pass
+> fetch-all-then-prune, so a later fetch failure never strands an earlier
+> prune), reporting any removed refs as `* [pruned] <name>/<branch>`.
 
 ### Subcommand: `set-branches`
 
 Set the branches tracked by a remote by rewriting its `remote.<name>.fetch`
-refspecs. Each branch becomes `+refs/heads/<branch>:refs/remotes/<name>/<branch>`.
+refspecs. Each branch becomes `+refs/heads/<branch>:refs/remotes/<name>/<branch>`;
+subsequent `fetch` and `remote update` operations update only those mapped branches.
 
 | Flag / Argument | Description | Example |
 |-----------------|-------------|---------|
@@ -159,9 +179,9 @@ Set or delete a remote's default branch pointer (`refs/remotes/<name>/HEAD`).
 > Both `set-head <branch>` and `--auto` require the resolved branch's tracking
 > ref `refs/remotes/<name>/<branch>` to already exist (fetch it first); `--auto`
 > additionally contacts the remote to discover its default branch. `remote
-> update [<group>|<remote>...]` fetches all configured remotes (or the named
-> ones, expanding any `remotes.<group>` config); its `-p`/`--prune` flag is not
-> yet exposed (see `COMPATIBILITY.md`).
+> update [-p|--prune] [<group>|<remote>...]` fetches all configured remotes (or
+> the named ones, expanding any `remotes.<group>` config); `-p`/`--prune` then
+> prunes stale remote-tracking branches after every fetch succeeds.
 
 ## Common Commands
 
@@ -243,6 +263,7 @@ Would prune 2 stale remote-tracking branch(es).
 - `urls`: `name`, `push`, `all`, `urls[]`
 - `set-url`: `name`, `role`, `mode`, `urls[]`, `removed`
 - `prune`: `name`, `dry_run`, `stale_branches[]`
+- `update`: `remotes[]` (names fetched), `pruned[]` (each `{remote_ref, branch}`; present only with `-p`/`--prune` and omitted entirely when nothing was pruned)
 - `show`: `name`, `fetch_urls[]`, `push_urls[]`, `head_branch`, `remote_branches[]` (each `{branch, status, local_oid, remote_oid}`; `status` is `tracked`/`new`/`stale` online or `cached` with `--no-query`), `pull_config[]`, `push_config[]`, `queried` (`true` when the remote was contacted, `false` with `--no-query`)
 - `set-branches`: `name`, `added`, `fetch_refspecs[]`
 - `set-head`: `name`, `mode` (`set`/`delete`), `target`
@@ -333,6 +354,7 @@ for both fetch and push, matching Git's behavior.
 | List with URLs | `libra remote -v` | `git remote -v` | `jj git remote list` (always verbose) |
 | Add remote | `libra remote add <n> <u>` | `git remote add <n> <u>` | `jj git remote add <n> <u>` |
 | Add remote + fetch | `libra remote add -f <n> <u>` | `git remote add -f <n> <u>` | N/A |
+| Add mirror remote | `libra remote add --mirror <n> <u>` (marker only) | `git remote add --mirror=fetch <n> <u>` | N/A |
 | Remove remote | `libra remote remove <n>` | `git remote remove <n>` | `jj git remote remove <n>` |
 | Rename remote | `libra remote rename <o> <n>` | `git remote rename <o> <n>` | `jj git remote rename <o> <n>` |
 | Get URL | `libra remote get-url <n>` | `git remote get-url <n>` | N/A |

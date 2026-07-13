@@ -56,10 +56,10 @@ pub const LIBRA_ERROR_JSON_ENV: &str = "LIBRA_ERROR_JSON";
 /// fine-grained 2..=9 category codes. Recognised values: `1`, `true`, `yes`, `on`.
 pub const LIBRA_FINE_EXIT_CODES_ENV: &str = "LIBRA_FINE_EXIT_CODES";
 /// Canonical issue tracker URL shown for unexpected internal failures.
-pub const LIBRA_ISSUES_URL: &str = "https://github.com/web3infra-foundation/libra/issues";
+pub const LIBRA_ISSUES_URL: &str = "https://github.com/libra-tools/libra/issues";
 /// Human-facing hint appended to internal-invariant errors.
 pub const INTERNAL_ERROR_REPORT_HINT: &str =
-    "please report this issue at: https://github.com/web3infra-foundation/libra/issues";
+    "please report this issue at: https://github.com/libra-tools/libra/issues";
 
 /// Returns `true` when `LIBRA_FINE_EXIT_CODES=1` is set, enabling backward-
 /// compatible category-specific exit codes (2–9) instead of the default
@@ -83,6 +83,9 @@ fn fine_exit_codes_enabled() -> bool {
 pub enum CliErrorKind {
     /// `libra foo` where `foo` is not a known subcommand. Renders without prefix.
     UnknownCommand,
+    /// Runtime failure whose Git-compatible human output intentionally renders
+    /// without an `error:` / `fatal:` prefix.
+    UnprefixedFailure,
     /// Top-level argv parse failure (clap-detected). Renders with `error:` prefix.
     ParseUsage,
     /// Subcommand-specific usage failure (e.g. mutually exclusive flags).
@@ -141,6 +144,7 @@ pub type ExitCode = CliExitCode;
 pub enum CliErrorCategory {
     Cli,
     Repo,
+    Config,
     Conflict,
     Network,
     Auth,
@@ -158,6 +162,7 @@ impl CliErrorCategory {
         match self {
             Self::Cli => "cli",
             Self::Repo => "repo",
+            Self::Config => "config",
             Self::Conflict => "conflict",
             Self::Network => "network",
             Self::Auth => "auth",
@@ -189,8 +194,26 @@ pub enum StableErrorCode {
     RepoNotFound,
     RepoCorrupt,
     RepoStateInvalid,
+    /// Global config database schema is newer than this Libra binary supports.
+    ConfigSchemaFuture,
     ConflictUnresolved,
     ConflictOperationBlocked,
+    /// Branch policy (protect/archive metadata) blocked a ref update — the
+    /// first enforcement code of the 1.13 policy layer (branch reset +
+    /// update-ref); future delete/push/merge enforcement reuses it.
+    PolicyRefUpdateBlocked,
+    /// A case-fold path collision was refused under `core.casehandling=error`
+    /// (lore.md 1.14) — mv/add/checkout/switch on case-insensitive views.
+    ConflictCaseCollision,
+    /// A `layer apply` destination collided with tracked (index/HEAD) content
+    /// (lore.md 2.4) — fail-closed; a layer may only ADD untracked paths.
+    LayerConflict,
+    /// `file obliterate` on an object with no payload / unknown OID (2.5).
+    ObliterateNotFound,
+    /// `file obliterate` refused a packed-only object (no pack surgery) (2.5).
+    ObliteratePacked,
+    /// `file obliterate` refused to proceed without `--yes` confirmation (2.5).
+    ObliterateConfirm,
     NetworkUnavailable,
     NetworkProtocol,
     AuthMissingCredentials,
@@ -213,6 +236,61 @@ pub enum StableErrorCode {
     /// AI agent run hit a configured budget cap (cost, tokens, steps,
     /// or wall-clock). OC-Phase 5 P5.3 enforcement surface.
     AgentBudgetExceeded,
+    /// External `libra-agent-*` discovery/invocation requested while the
+    /// `agent.external_agents.enabled` gate (default `false`) is off (E10
+    /// `ERR_AGENT_EXTERNAL_AGENTS_DISABLED`, AG-18).
+    AgentExternalAgentsDisabled,
+    /// External agent binary negotiated an incompatible protocol version
+    /// (E10 `ERR_AGENT_PROTOCOL_VERSION_MISMATCH`, AG-18).
+    AgentProtocolVersionMismatch,
+    /// Method invoked on an external agent without being declared in its
+    /// negotiated capabilities (E10 `ERR_AGENT_CAPABILITY_UNDECLARED`, AG-18).
+    AgentCapabilityUndeclared,
+    /// External binary failed provenance revalidation — sha256/device/
+    /// inode/mtime changed since trust was recorded, or the binary is not
+    /// trusted (E10 `ERR_AGENT_PROVENANCE_REJECTED`, AG-18).
+    AgentProvenanceRejected,
+    /// External `libra-agent-*` binary tried to shadow a built-in agent
+    /// slug (E10 `ERR_AGENT_BUILTIN_SLUG_IMPERSONATION`, AG-18).
+    AgentBuiltinSlugImpersonation,
+    /// External agent IO exceeded hard caps or failed redaction; output is
+    /// withheld fail-closed (E10 `ERR_AGENT_IO_REDACTION_SECURITY_FAILURE`,
+    /// AG-18/AG-19).
+    AgentIoRedactionSecurityFailure,
+    /// Hook envelope failed central validation (UTF-8/JSON/schema/path)
+    /// before checkpoint persistence (E10 `ERR_AGENT_HOOK_ENVELOPE_INVALID`,
+    /// AG-19).
+    AgentHookEnvelopeInvalid,
+    /// Agent checkpoint store inconsistent across ref/DB/object-index
+    /// (E10 `ERR_AGENT_CHECKPOINT_STORE_INCONSISTENT`, AG-20).
+    AgentCheckpointStoreInconsistent,
+    /// `review --fix` / `investigate fix` requested but the internal
+    /// AgentRuntime fix bridge is unavailable (E10
+    /// `ERR_AGENT_FIX_BRIDGE_UNAVAILABLE`, AG-22/AG-23).
+    AgentFixBridgeUnavailable,
+    /// Untrusted seed content attempted to enter a mutating workflow
+    /// without explicit approval (E10 `ERR_AGENT_UNTRUSTED_SEED_FOR_MUTATION`,
+    /// AG-22/AG-23).
+    AgentUntrustedSeedForMutation,
+    /// External agent RPC transport failed — invoke timeout, broken
+    /// pipe / unexpected exit, or a malformed JSON-RPC frame — and the
+    /// invocation was withheld fail-closed (E10
+    /// `ERR_AGENT_RPC_TRANSPORT_FAILED`, allocated during the AG-18
+    /// implementation slice; distinct from the IO hard-cap / redaction
+    /// failures covered by `LBR-AGENT-007`).
+    AgentRpcTransportFailed,
+    /// Raw (un-redacted) checkpoint access/export was requested without
+    /// the required `--allow-raw` authorization, and was refused
+    /// fail-closed (AG-24a compliance, E10
+    /// `ERR_AGENT_RAW_ACCESS_DENIED`). The refusal is itself audited in
+    /// `agent_audit_log` (granted = 0).
+    AgentRawAccessDenied,
+    /// A `review` / `investigate` run was refused because the shared
+    /// run-level admission queue is full (more than `agent.max_concurrent_runs`
+    /// runs are active and the wait queue already holds its cap). Fail-closed
+    /// so callers never silently overrun the concurrency budget (A0-04, E10
+    /// `ERR_AGENT_RUN_QUEUE_FULL`).
+    AgentRunQueueFull,
 }
 
 impl Serialize for StableErrorCode {
@@ -235,8 +313,15 @@ impl StableErrorCode {
             Self::RepoNotFound => "LBR-REPO-001",
             Self::RepoCorrupt => "LBR-REPO-002",
             Self::RepoStateInvalid => "LBR-REPO-003",
+            Self::ConfigSchemaFuture => "LBR-CONFIG-001",
             Self::ConflictUnresolved => "LBR-CONFLICT-001",
             Self::ConflictOperationBlocked => "LBR-CONFLICT-002",
+            Self::PolicyRefUpdateBlocked => "LBR-POLICY-001",
+            Self::ConflictCaseCollision => "LBR-CASE-001",
+            Self::LayerConflict => "LBR-LAYER-001",
+            Self::ObliterateNotFound => "LBR-OBLITERATE-001",
+            Self::ObliteratePacked => "LBR-OBLITERATE-002",
+            Self::ObliterateConfirm => "LBR-OBLITERATE-003",
             Self::NetworkUnavailable => "LBR-NET-001",
             Self::NetworkProtocol => "LBR-NET-002",
             Self::AuthMissingCredentials => "LBR-AUTH-001",
@@ -251,6 +336,19 @@ impl StableErrorCode {
             Self::BisectRunFailed => "LBR-BISECT-002",
             Self::BisectNoCandidates => "LBR-BISECT-003",
             Self::AgentBudgetExceeded => "LBR-AGENT-001",
+            Self::AgentExternalAgentsDisabled => "LBR-AGENT-002",
+            Self::AgentProtocolVersionMismatch => "LBR-AGENT-003",
+            Self::AgentCapabilityUndeclared => "LBR-AGENT-004",
+            Self::AgentProvenanceRejected => "LBR-AGENT-005",
+            Self::AgentBuiltinSlugImpersonation => "LBR-AGENT-006",
+            Self::AgentIoRedactionSecurityFailure => "LBR-AGENT-007",
+            Self::AgentHookEnvelopeInvalid => "LBR-AGENT-008",
+            Self::AgentCheckpointStoreInconsistent => "LBR-AGENT-009",
+            Self::AgentFixBridgeUnavailable => "LBR-AGENT-010",
+            Self::AgentUntrustedSeedForMutation => "LBR-AGENT-011",
+            Self::AgentRpcTransportFailed => "LBR-AGENT-012",
+            Self::AgentRawAccessDenied => "LBR-AGENT-013",
+            Self::AgentRunQueueFull => "LBR-AGENT-014",
         }
     }
 
@@ -264,7 +362,14 @@ impl StableErrorCode {
             Self::RepoNotFound | Self::RepoCorrupt | Self::RepoStateInvalid => {
                 CliErrorCategory::Repo
             }
-            Self::ConflictUnresolved | Self::ConflictOperationBlocked => CliErrorCategory::Conflict,
+            Self::ConfigSchemaFuture => CliErrorCategory::Config,
+            Self::ConflictUnresolved
+            | Self::ConflictOperationBlocked
+            // Policy refusals ride the Conflict category (no dedicated
+            // Policy category yet; the JSON envelope reads "conflict").
+            | Self::PolicyRefUpdateBlocked
+            | Self::ConflictCaseCollision
+            | Self::LayerConflict => CliErrorCategory::Conflict,
             Self::NetworkUnavailable | Self::NetworkProtocol => CliErrorCategory::Network,
             Self::AuthMissingCredentials | Self::AuthPermissionDenied => CliErrorCategory::Auth,
             Self::IoReadFailed | Self::IoWriteFailed => CliErrorCategory::Io,
@@ -274,11 +379,29 @@ impl StableErrorCode {
             Self::WarningEmitted => CliErrorCategory::Warning,
             Self::AddNothingStaged => CliErrorCategory::Cli,
             Self::BisectNotActive | Self::BisectNoCandidates => CliErrorCategory::Repo,
+            // Obliteration: not-found/packed are object-state (Repo); the
+            // confirmation refusal is a Conflict-style block against an
+            // irreversible destructive action.
+            Self::ObliterateNotFound | Self::ObliteratePacked => CliErrorCategory::Repo,
+            Self::ObliterateConfirm => CliErrorCategory::Conflict,
             // Budget caps surface as runtime/internal failures: the run
             // didn't crash, but the operator-configured cap forced an
             // early abort. Fits the Internal category (the run could
             // continue if the cap were lifted) per docs/error-codes.md.
             Self::AgentBudgetExceeded => CliErrorCategory::Internal,
+            Self::AgentExternalAgentsDisabled
+            | Self::AgentProtocolVersionMismatch
+            | Self::AgentCapabilityUndeclared
+            | Self::AgentProvenanceRejected
+            | Self::AgentBuiltinSlugImpersonation
+            | Self::AgentIoRedactionSecurityFailure
+            | Self::AgentHookEnvelopeInvalid
+            | Self::AgentCheckpointStoreInconsistent
+            | Self::AgentFixBridgeUnavailable
+            | Self::AgentUntrustedSeedForMutation
+            | Self::AgentRpcTransportFailed
+            | Self::AgentRawAccessDenied
+            | Self::AgentRunQueueFull => CliErrorCategory::Internal,
         }
     }
 
@@ -310,6 +433,7 @@ impl StableErrorCode {
         match self.category() {
             CliErrorCategory::Cli => 2,
             CliErrorCategory::Repo => 3,
+            CliErrorCategory::Config => 8,
             CliErrorCategory::Conflict => 4,
             CliErrorCategory::Network => 5,
             CliErrorCategory::Auth => 6,
@@ -331,8 +455,27 @@ impl StableErrorCode {
             Self::RepoStateInvalid => {
                 "Repository state prevents the requested operation from proceeding."
             }
+            Self::ConfigSchemaFuture => {
+                "Global config database schema is newer than this Libra binary supports."
+            }
             Self::ConflictUnresolved => {
                 "Operation stopped because unresolved conflicts are present."
+            }
+            Self::PolicyRefUpdateBlocked => {
+                "Branch policy (protect/archive metadata) blocked the ref update."
+            }
+            Self::ConflictCaseCollision => {
+                "Paths that differ only by case collide on a case-insensitive filesystem."
+            }
+            Self::LayerConflict => {
+                "A layer overlay path collided with tracked content; a layer may only add                  untracked paths."
+            }
+            Self::ObliterateNotFound => "No payload was found for the object to obliterate.",
+            Self::ObliteratePacked => {
+                "The object exists only inside a packfile; v1 obliteration cannot rewrite packs."
+            }
+            Self::ObliterateConfirm => {
+                "Obliteration was not confirmed; it is irreversible and requires --yes."
             }
             Self::ConflictOperationBlocked => {
                 "Operation was blocked to avoid overwriting local or remote state."
@@ -366,6 +509,45 @@ impl StableErrorCode {
             }
             Self::AgentBudgetExceeded => {
                 "AI agent run hit a configured budget cap (cost, tokens, steps, or wall-clock)."
+            }
+            Self::AgentExternalAgentsDisabled => {
+                "External libra-agent-* agents are disabled; set agent.external_agents.enabled=true to opt in."
+            }
+            Self::AgentProtocolVersionMismatch => {
+                "External agent binary negotiated an incompatible protocol version."
+            }
+            Self::AgentCapabilityUndeclared => {
+                "Method not declared in the external agent's negotiated capabilities."
+            }
+            Self::AgentProvenanceRejected => {
+                "External agent binary failed provenance revalidation (untrusted or changed since trust)."
+            }
+            Self::AgentBuiltinSlugImpersonation => {
+                "External libra-agent-* binary tried to impersonate a built-in agent slug."
+            }
+            Self::AgentIoRedactionSecurityFailure => {
+                "External agent IO exceeded hard caps or failed redaction; output withheld fail-closed."
+            }
+            Self::AgentHookEnvelopeInvalid => {
+                "Hook envelope failed validation before checkpoint persistence."
+            }
+            Self::AgentCheckpointStoreInconsistent => {
+                "Agent checkpoint store inconsistent across ref/DB/object-index; run libra agent doctor."
+            }
+            Self::AgentFixBridgeUnavailable => {
+                "review/investigate --fix requires the internal AgentRuntime fix bridge, which is not available."
+            }
+            Self::AgentUntrustedSeedForMutation => {
+                "Untrusted seed content cannot enter a mutating workflow without explicit approval."
+            }
+            Self::AgentRpcTransportFailed => {
+                "External agent RPC transport failed (timeout, broken pipe, or malformed frame); invocation withheld fail-closed."
+            }
+            Self::AgentRawAccessDenied => {
+                "Raw (un-redacted) checkpoint access/export denied without --allow-raw; redacted --detail/--transcript output stays available."
+            }
+            Self::AgentRunQueueFull => {
+                "Too many concurrent review/investigate runs are active and the wait queue is full; the run was refused fail-closed."
             }
         }
     }
@@ -492,6 +674,14 @@ impl CliError {
             .with_stable_code(StableErrorCode::CliUnknownCommand)
     }
 
+    /// Runtime failure rendered without a leading severity prefix.
+    ///
+    /// Use this only for Git-compatible command surfaces whose canonical human
+    /// output is an advisory block instead of an `error:` line.
+    pub fn unprefixed_failure(message: impl Into<String>) -> Self {
+        Self::new(CliErrorKind::UnprefixedFailure, message)
+    }
+
     /// Argv parse error detected by clap (root-level). Renders with the `error:`
     /// prefix. Use this for failures that occur before any subcommand handler runs.
     pub fn parse_usage(message: impl Into<String>) -> Self {
@@ -602,7 +792,7 @@ impl CliError {
             CliErrorKind::ParseUsage | CliErrorKind::CommandUsage | CliErrorKind::Failure => {
                 Some(ErrorLevel::Error)
             }
-            CliErrorKind::UnknownCommand => None,
+            CliErrorKind::UnknownCommand | CliErrorKind::UnprefixedFailure => None,
         }
     }
 
@@ -738,7 +928,7 @@ impl CliError {
         serde_json::to_string(&self.report()).unwrap_or_else(|_| {
             "{\"ok\":false,\"error_code\":\"LBR-INTERNAL-001\",\"category\":\"internal\",\
 \"exit_code\":128,\"severity\":\"fatal\",\"message\":\"failed to serialize CLI error report\",\
-\"hints\":[\"please report this issue at: https://github.com/web3infra-foundation/libra/issues\"]}"
+\"hints\":[\"please report this issue at: https://github.com/libra-tools/libra/issues\"]}"
                 .to_string()
         })
     }
@@ -811,11 +1001,30 @@ impl CliError {
         }
     }
 
+    /// True when this error is the normal Unix "downstream closed stdout"
+    /// condition rather than a user-visible failure.
+    pub fn is_stdout_broken_pipe(&self) -> bool {
+        if self.silent {
+            return false;
+        }
+        let lower = self.message.to_ascii_lowercase();
+        let broken_pipe = lower.contains("broken pipe") || lower.contains("os error 32");
+        let stdout_write = lower.contains("failed printing to stdout")
+            || lower.contains("failed to write output")
+            || lower.contains("failed to write json output")
+            || lower.contains("failed to write clap output")
+            || lower.contains("failed to write completion script")
+            || lower.contains("failed to write ls-files output")
+            || lower.contains("stdout");
+        broken_pipe && stdout_write
+    }
+
     /// Rendered severity string used by JSON envelopes. Stable across releases.
     fn severity(&self) -> &'static str {
         match self.kind {
             CliErrorKind::Fatal => "fatal",
             CliErrorKind::UnknownCommand
+            | CliErrorKind::UnprefixedFailure
             | CliErrorKind::ParseUsage
             | CliErrorKind::CommandUsage
             | CliErrorKind::Failure => "error",
@@ -840,7 +1049,9 @@ impl CliError {
     fn render_human(&self, include_error_code: bool) -> String {
         let mut lines = Vec::new();
         match self.kind {
-            CliErrorKind::UnknownCommand => lines.push(self.message.clone()),
+            CliErrorKind::UnknownCommand | CliErrorKind::UnprefixedFailure => {
+                lines.push(self.message.clone());
+            }
             CliErrorKind::ParseUsage | CliErrorKind::CommandUsage | CliErrorKind::Failure => {
                 lines.push(format!("error: {}", self.message));
             }
@@ -1026,7 +1237,9 @@ fn infer_stable_error_code(kind: CliErrorKind, message: &str) -> StableErrorCode
                 StableErrorCode::CliInvalidArguments
             }
         }
-        CliErrorKind::Fatal | CliErrorKind::Failure => infer_runtime_error_code(&lower),
+        CliErrorKind::Fatal | CliErrorKind::Failure | CliErrorKind::UnprefixedFailure => {
+            infer_runtime_error_code(&lower)
+        }
     }
 }
 
@@ -1418,7 +1631,13 @@ mod tests {
         );
     }
 
+    // Tests asserting DEFAULT exit codes must be `#[serial]`: the
+    // fine-exit-code tests flip the process-global
+    // `LIBRA_FINE_EXIT_CODES` env var under `#[serial]`, and an
+    // unmarked reader running in parallel can observe it mid-flight
+    // (seen as exit code 3 instead of 128 in CI-like parallel runs).
     #[test]
+    #[serial]
     fn unknown_command_has_no_error_prefix() {
         let err =
             CliError::unknown_command("libra: 'wat' is not a libra command. See 'libra --help'.");
@@ -1428,6 +1647,16 @@ mod tests {
             "libra: 'wat' is not a libra command. See 'libra --help'."
         );
         assert_eq!(err.exit_code(), 129);
+    }
+
+    #[test]
+    #[serial]
+    fn unprefixed_failure_has_no_error_prefix_but_keeps_runtime_exit_code() {
+        let err = CliError::unprefixed_failure("plain advisory block")
+            .with_stable_code(StableErrorCode::RepoStateInvalid);
+        assert_eq!(err.kind(), CliErrorKind::UnprefixedFailure);
+        assert_eq!(err.render(), "plain advisory block");
+        assert_eq!(err.exit_code(), 128);
     }
 
     #[test]
@@ -1446,7 +1675,7 @@ mod tests {
         let rendered = CliError::internal("status index should be loaded").render();
         assert_eq!(
             rendered,
-            "fatal: status index should be loaded\n\nHint: please report this issue at: https://github.com/web3infra-foundation/libra/issues"
+            "fatal: status index should be loaded\n\nHint: please report this issue at: https://github.com/libra-tools/libra/issues"
         );
     }
 
@@ -1455,7 +1684,7 @@ mod tests {
         let rendered = CliError::fatal("tree creation failed")
             .with_stable_code(StableErrorCode::InternalInvariant)
             .render();
-        assert!(rendered.contains("https://github.com/web3infra-foundation/libra/issues"));
+        assert!(rendered.contains("https://github.com/libra-tools/libra/issues"));
     }
 
     #[test]
@@ -1471,7 +1700,7 @@ mod tests {
         assert_eq!(payload["error_code"], "LBR-INTERNAL-001");
         assert_eq!(
             payload["hints"][0],
-            "please report this issue at: https://github.com/web3infra-foundation/libra/issues"
+            "please report this issue at: https://github.com/libra-tools/libra/issues"
         );
     }
 
@@ -1490,6 +1719,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stable_code_maps_repo_not_found_to_exit_code_128() {
         let err = CliError::repo_not_found();
         assert_eq!(err.stable_code(), StableErrorCode::RepoNotFound);
@@ -1497,6 +1727,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stable_code_infers_auth_missing() {
         let err = CliError::fatal("OPENAI_API_KEY is not set");
         assert_eq!(err.stable_code(), StableErrorCode::AuthMissingCredentials);
@@ -1504,6 +1735,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn stable_code_infers_conflict() {
         let err = CliError::fatal("rebase already in progress");
         assert_eq!(err.stable_code(), StableErrorCode::ConflictOperationBlocked);
@@ -1569,6 +1801,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn render_report_appends_json_payload() {
         let rendered = CliError::repo_not_found().render_report();
         assert!(rendered.contains("Error-Code: LBR-REPO-001"));
@@ -1637,7 +1870,7 @@ mod tests {
     /// would invalidate every downstream pin without tripping any
     /// test until end-to-end JSON harness assertions caught it.
     ///
-    /// Enumerate all 22 variants so a new addition trips both this
+    /// Enumerate all 23 non-agent variants so a new addition trips both this
     /// list and the `as_str` impl's exhaustive match.
     #[test]
     fn stable_error_code_as_str_pins_each_variant() {
@@ -1647,6 +1880,10 @@ mod tests {
         assert_eq!(StableErrorCode::RepoNotFound.as_str(), "LBR-REPO-001");
         assert_eq!(StableErrorCode::RepoCorrupt.as_str(), "LBR-REPO-002");
         assert_eq!(StableErrorCode::RepoStateInvalid.as_str(), "LBR-REPO-003");
+        assert_eq!(
+            StableErrorCode::ConfigSchemaFuture.as_str(),
+            "LBR-CONFIG-001",
+        );
         assert_eq!(
             StableErrorCode::ConflictUnresolved.as_str(),
             "LBR-CONFLICT-001",
@@ -1684,6 +1921,41 @@ mod tests {
             StableErrorCode::AgentBudgetExceeded.as_str(),
             "LBR-AGENT-001",
         );
+        for (variant, code) in [
+            (
+                StableErrorCode::AgentExternalAgentsDisabled,
+                "LBR-AGENT-002",
+            ),
+            (
+                StableErrorCode::AgentProtocolVersionMismatch,
+                "LBR-AGENT-003",
+            ),
+            (StableErrorCode::AgentCapabilityUndeclared, "LBR-AGENT-004"),
+            (StableErrorCode::AgentProvenanceRejected, "LBR-AGENT-005"),
+            (
+                StableErrorCode::AgentBuiltinSlugImpersonation,
+                "LBR-AGENT-006",
+            ),
+            (
+                StableErrorCode::AgentIoRedactionSecurityFailure,
+                "LBR-AGENT-007",
+            ),
+            (StableErrorCode::AgentHookEnvelopeInvalid, "LBR-AGENT-008"),
+            (
+                StableErrorCode::AgentCheckpointStoreInconsistent,
+                "LBR-AGENT-009",
+            ),
+            (StableErrorCode::AgentFixBridgeUnavailable, "LBR-AGENT-010"),
+            (
+                StableErrorCode::AgentUntrustedSeedForMutation,
+                "LBR-AGENT-011",
+            ),
+            (StableErrorCode::AgentRpcTransportFailed, "LBR-AGENT-012"),
+            (StableErrorCode::AgentRawAccessDenied, "LBR-AGENT-013"),
+            (StableErrorCode::AgentRunQueueFull, "LBR-AGENT-014"),
+        ] {
+            assert_eq!(variant.as_str(), code);
+        }
     }
 
     /// Pin the [`CliErrorCategory`] grouping returned by
@@ -1727,6 +1999,10 @@ mod tests {
         assert_eq!(
             StableErrorCode::RepoStateInvalid.category(),
             CliErrorCategory::Repo,
+        );
+        assert_eq!(
+            StableErrorCode::ConfigSchemaFuture.category(),
+            CliErrorCategory::Config,
         );
         assert_eq!(
             StableErrorCode::ConflictUnresolved.category(),
@@ -1798,5 +2074,24 @@ mod tests {
             StableErrorCode::AgentBudgetExceeded.category(),
             CliErrorCategory::Internal,
         );
+        // E10 agent codes (LBR-AGENT-002..012) all route to Internal —
+        // per docs/development/tracing/agent.md E10 they must exit 128
+        // (runtime category), never 129.
+        for variant in [
+            StableErrorCode::AgentExternalAgentsDisabled,
+            StableErrorCode::AgentProtocolVersionMismatch,
+            StableErrorCode::AgentCapabilityUndeclared,
+            StableErrorCode::AgentProvenanceRejected,
+            StableErrorCode::AgentBuiltinSlugImpersonation,
+            StableErrorCode::AgentIoRedactionSecurityFailure,
+            StableErrorCode::AgentHookEnvelopeInvalid,
+            StableErrorCode::AgentCheckpointStoreInconsistent,
+            StableErrorCode::AgentFixBridgeUnavailable,
+            StableErrorCode::AgentUntrustedSeedForMutation,
+            StableErrorCode::AgentRpcTransportFailed,
+            StableErrorCode::AgentRawAccessDenied,
+        ] {
+            assert_eq!(variant.category(), CliErrorCategory::Internal);
+        }
     }
 }

@@ -21,6 +21,22 @@ pub(super) const CLAUDE_LIFECYCLE_FALLBACK_EVENTS: &[&str] = &[
     "Compaction",
 ];
 
+/// Every Claude hook event name [`parse_claude_hook_event`] understands.
+/// Keep in sync with its `match`; the dispatcher consults this via
+/// `HookProvider::recognizes_event` to skip-and-log names a newer Claude
+/// Code emits that this build does not know yet (AG-19).
+pub(super) const CLAUDE_HOOK_EVENT_NAMES: &[&str] = &[
+    "SessionStart",
+    "UserPromptSubmit",
+    "PostToolUse",
+    "PreToolUse",
+    "Stop",
+    "SessionStop",
+    "ModelUpdate",
+    "Compaction",
+    "SessionEnd",
+];
+
 /// Translate a Claude hook event name into a canonical lifecycle event.
 ///
 /// Functional scope: routes each known Claude hook (SessionStart,

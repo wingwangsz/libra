@@ -7,7 +7,7 @@ Show the working tree status.
 ## Synopsis
 
 ```
-libra status [OPTIONS]
+libra status [OPTIONS] [pathspec]...
 ```
 
 ## Description
@@ -22,18 +22,77 @@ human-readable long format (default, also selectable explicitly with `--long`), 
 format, structured JSON for agent consumption, and `-z` NUL-terminated machine output. It can
 also detect renames (`--find-renames`), align output into columns (`--column`), and control
 whether upstream ahead/behind counts are shown (`--ahead-behind` / `--no-ahead-behind`).
+Optional pathspecs limit the reported staged, unstaged, unmerged, ignored, and
+untracked paths. They use the shared pathspec engine, including `:(top)`,
+`:(exclude)`, `:(icase)`, `:(literal)`, and `:(glob)` magic.
+An in-progress merge is still reported as a global repository state even when
+the selected pathspec hides every conflicted path; `--exit-code` remains dirty
+until the merge is continued or aborted.
+
+During merge, rebase, and cherry-pick conflicts, unmerged index entries are reported as conflicts
+instead of untracked files. Porcelain v1/short output uses Git-style XY codes such as `UU
+conflict.txt`; porcelain v2 emits `u <XY> ...` records with stage modes and object IDs.
+
+Tracked symlinks participate in the same HEAD/index/worktree comparison as
+regular files. `status` treats the symlink itself as the worktree object,
+compares the stored link target bytes, and reports target changes as
+modifications instead of following the link or treating dangling symlinks as
+deleted.
+
+### Display config defaults (`status.*`)
+
+When the corresponding CLI flag is absent, Libra honors these Git-compatible
+defaults, each read through the local → global → system cascade
+(case-insensitive keys; encrypted local/global values decrypted; legacy rows
+honored; an unreadable or unsupported system scope skipped):
+
+- `status.showUntrackedFiles=no|normal|all` selects the untracked-file mode for
+  every output format (`-u`/`--untracked-files` overrides it).
+- `status.short=true|false` selects the short format by default; an explicit
+  `--long` or `--porcelain` still wins.
+- `status.branch=true|false` adds the branch header to the **short format
+  only** (matching Git); porcelain headers still require an explicit
+  `-b`/`--branch`, keeping porcelain output config-immune. `--no-branch`
+  overrides a configured `true`.
+- `status.showStash=true|false` shows the stash-count hint in the long format;
+  `--no-show-stash` overrides a configured `true`.
+- `status.relativePaths=true|false` (config-only, like Git): `true` — the
+  default — renders human long/short paths relative to the current directory;
+  `false` keeps repository-root-relative paths.
+
+All five keys are validated up front: an invalid value fails closed with
+`LBR-CLI-002` and an unreadable local/global scope with `LBR-IO-001`, before
+any status output is produced. Boolean values use the full Git grammar
+(`true`/`yes`/`on`, `false`/`no`/`off`, and integers — non-zero is true — with
+optional `k`/`m`/`g` suffixes); an empty value is rejected.
 
 ## Options
+
+### `<pathspec>...`
+
+Limit status output to matching paths. Pathspecs resolve from the current
+working directory unless `:(top)` is used, and support exact files, directory
+prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` /
+`:(literal)` / `:(glob)` magic.
 
 ### `-s, --short`
 
 Give the output in the short format. Each file is shown on a single line with a two-character
 status code (e.g., `M ` for staged modified, ` M` for unstaged modified, `??` for untracked).
-Conflicts with `--porcelain`.
+Conflicts with `--porcelain`. `status.short=true` selects this format by default.
 
 ```bash
 libra status -s
 libra status --short
+```
+
+### `--long`
+
+Give the output in the long format — Libra's default — overriding
+`status.short=true`. Conflicts with `--short`/`--porcelain`.
+
+```bash
+libra status --long
 ```
 
 ### `--porcelain [VERSION]`
@@ -47,16 +106,19 @@ libra status --porcelain v1
 libra status --porcelain v2
 ```
 
-### `--branch` (`-b`)
+### `--branch` (`-b`) / `--no-branch`
 
 Include branch information in short or porcelain output. Shows the current branch and its
 tracking relationship on the first line. `-b` is the short alias, so `libra status -sb`
-matches `git status -sb`.
+matches `git status -sb`. `status.branch=true` enables the header for the short format only
+(porcelain requires the explicit flag, matching Git); `--no-branch` overrides the config
+(and an earlier `--branch`; the last one wins).
 
 ```bash
 libra status --short --branch
 libra status -sb
 libra status --porcelain --branch
+libra status --no-branch          # suppress a configured status.branch=true
 ```
 
 ### `--ahead-behind` / `--no-ahead-behind`
@@ -91,6 +153,16 @@ and ignored sections, file names are laid out in multiple columns.
 libra status --column
 ```
 
+### `--no-column`
+
+Do not align status entries into columns (equivalent to `--column=never`),
+countermanding an earlier `--column` (last one on the command line wins). Status
+is not columnar by default, so on its own this is a no-op.
+
+```bash
+libra status --no-column
+```
+
 ### `--find-renames [PERCENT]`
 
 Detect renames among staged and unstaged changes. When a deleted file and a new file have the
@@ -114,11 +186,19 @@ libra status --renames
 libra status --no-renames
 ```
 
-Show the number of stash entries. Only effective in standard (long) output mode.
+### `--scan` / `--cached` / `--check-dirty` (Libra extensions, lore.md 1.1)
 
-```bash
-libra status --show-stash
-```
+`--scan` runs the normal full status AND atomically rebuilds the dirty-set
+cache from it (TOCTOU-guarded on the index fingerprint + HEAD; a scan lock
+blocks concurrent scanners, stale locks are stolen). `--cached` consumes the
+cache instead of walking the worktree — O(dirty paths); any freshness doubt
+degrades to the full status with a hint. Snapshot semantics: worktree-only
+edits made after the scan are invisible until a rescan or a `libra dirty`
+mark (that is what the marks are for). NOTE: unrelated to Git's `--cached`
+(= the index). `--check-dirty` re-verifies only the cached set, pruning rows
+proven clean. The three are mutually exclusive and conflict with
+`--porcelain`/`--short`/`--ignored`; default `status` never touches the
+cache and its JSON gains no keys. See [dirty.md](dirty.md).
 
 ### `--ignored`
 
@@ -128,15 +208,31 @@ Include ignored files in the output.
 libra status --ignored
 ```
 
-### `--untracked-files <MODE>`
+### `-u, --untracked-files [<MODE>]`
 
 Control how untracked files are displayed. Accepted values: `normal` (default, shows untracked
 directories but not their contents), `all` (recursively lists files within untracked directories),
-`no` (hides untracked files entirely).
+`no` (hides untracked files entirely). As in Git, the flag with no value means `all`, and the short
+form takes an attached value (`-uno`, `-uall`, `-unormal`). When the flag is absent, the
+`status.showUntrackedFiles` config default applies (any output format); the flag always wins.
 
 ```bash
-libra status --untracked-files=no
+libra status -uno                  # hide untracked files
+libra status -u                    # same as -uall (recurse into untracked dirs)
 libra status --untracked-files=all
+```
+
+### `--show-stash` / `--no-show-stash`
+
+Show the number of stash entries after the long-format status ("Your stash
+currently has N entries"). Only the long format renders the hint (short and
+porcelain are unaffected). `status.showStash=true` enables it by default;
+`--no-show-stash` overrides the config (and an earlier `--show-stash`; the
+last one wins).
+
+```bash
+libra status --show-stash
+libra status --no-show-stash
 ```
 
 ### `--exit-code`
@@ -204,6 +300,12 @@ A  src/feature.rs
 M  src/lib.rs
  M README.md
 ?? notes.txt
+```
+
+Unmerged conflict:
+
+```text
+UU conflict.txt
 ```
 
 `--quiet` suppresses all `stdout` output. Combined with `--exit-code`, it acts as a
@@ -309,7 +411,8 @@ Detached HEAD:
 - `upstream` is `null` when no tracking branch is configured or HEAD is detached
 - `upstream.gone` is `true` when the remote tracking branch no longer exists
 - `upstream.ahead` / `upstream.behind` are `null` when `gone` is `true`
-- `is_clean` is `true` when all staged, unstaged, and untracked lists are empty
+- `is_clean` is `true` only when staged, unstaged, untracked, and unmerged
+  lists are empty and no global merge state is active
 - `has_commits` is `false` in a freshly initialized repository with no commits
 - `stash_entries` (optional, integer): present only when `--show-stash` is
   passed. Counts the entries on the stash stack (matching `libra stash list`)
@@ -335,6 +438,10 @@ matching Git's own v2 encoding. The implementation lives in
 `src/command/status.rs::output_porcelain_v2` and is fed by
 `build_porcelain_v2_data`, which pulls mode + hash metadata out of the
 index and HEAD tree before rendering.
+
+With `-z`, porcelain v1 and v2 records are NUL-terminated and contain no
+trailing newlines. Rename-capable porcelain output does not use the human
+`old -> new` arrow form under `-z`; scripts should split fields on NUL.
 
 Most consumers should still prefer `--json` (or `--machine` for compact
 single-line JSON): the JSON envelope carries the same staged/unstaged/
@@ -381,10 +488,10 @@ a branch needs to be pushed or pulled, without having to run separate `libra log
 | Branch info in short | `git status -sb` | Always shown | `libra status -sb` (`--short --branch`) |
 | Show stash count | `git status --show-stash` | N/A | `libra status --show-stash` (standard mode) |
 | Show ignored files | `git status --ignored` | N/A | `libra status --ignored` |
-| Untracked files control | `git status -u<mode>` | N/A (always shows) | `libra status --untracked-files=<mode>` |
+| Untracked files control | `git status -u<mode>` | N/A (always shows) | `libra status -u<mode>` / `--untracked-files=<mode>` |
 | Exit code for dirty | `git diff --exit-code` | N/A | `libra status --exit-code` |
 | Quiet mode | `git status -q` | N/A | `libra status --quiet` (global flag) |
-| Column display | `git status --column` | N/A | N/A |
+| Column display | `git status --column` | N/A | `libra status --column` (`--no-column` countermands) |
 | Ahead/behind display | `git status -sb` (text only) | N/A | Human + structured `upstream` object in JSON |
 | Find renames | `git status -M` | Automatic | `--find-renames` / `--renames` |
 | Ignore submodules | `git status --ignore-submodules` | N/A | N/A (no submodules) |
@@ -419,4 +526,4 @@ Every `StatusError` variant maps to an explicit `StableErrorCode`.
 - `--porcelain v2` is accepted but currently produces v1-format output; use `--json` for full structured data
 - jj's `jj status` always uses a short format and does not distinguish staged from unstaged changes (jj has no staging area)
 - Rename detection is supported via `--find-renames[=<n>]` and the `--renames`/`--no-renames` toggles; Git's short `-M` alias is not exposed
-- `--column` display is not supported
+- `--column` column-aligned display is supported; `--no-column` (equivalent to `--column=never`) countermands an earlier `--column` via clap's symmetric override (last one wins), and status is not columnar by default so `--no-column` alone is a no-op

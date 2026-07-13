@@ -607,7 +607,7 @@ pub fn builtin_migrations() -> Vec<Migration> {
         // Phase 4 completion: the formal final `Decision` artifact table,
         // closing the ValidationReport -> RiskScoreBreakdown ->
         // DecisionProposal -> Decision chain. Mirrors `ai_decision_proposal`
-        // (per-thread latest pointer). See docs/development/commands/agent.md
+        // (per-thread latest pointer). See docs/development/tracing/agent.md
         // Implementation Phase 4.
         sql_migration(
             2026053101,
@@ -648,12 +648,104 @@ pub fn builtin_migrations() -> Vec<Migration> {
         // created before the rename keep their captured checkpoint history under
         // the new name. Conflict-safe + idempotent — see
         // `src/internal/branch.rs` (`TRACES_BRANCH` / `LEGACY_TRACES_BRANCH`)
-        // and docs/development/commands/agent.md.
+        // and docs/development/tracing/agent.md.
         sql_migration(
             2026062301,
             "rename_agent_traces_branch",
             include_str!("../../../sql/migrations/2026062301_rename_agent_traces_branch.sql"),
             include_str!("../../../sql/migrations/2026062301_rename_agent_traces_branch_down.sql"),
+        ),
+        // 2026-07-02: unified scoped metadata KV table (lore.md 1.5) — the
+        // single store for branch (and future scoped) metadata; protect /
+        // archive / lineage.* are keys here, never separate tables. Repo-scope
+        // metadata intentionally lives in config_kv under `metadata.*`.
+        // Owner API: `internal::metadata::MetadataKv` (the only writer/reader).
+        sql_migration(
+            2026070201,
+            "metadata_kv",
+            include_str!("../../../sql/migrations/2026070201_metadata_kv.sql"),
+            include_str!("../../../sql/migrations/2026070201_metadata_kv_down.sql"),
+        ),
+        // 2026-07-02: dirty-set cache (lore.md 1.1) — advisory working-tree
+        // dirty snapshot + staged set, rebuilt by `status --scan`, consumed by
+        // the opt-in `status --cached`/`--check-dirty`/`libra dirty` surfaces
+        // only. Default `status` never touches it; freshness keys on the index
+        // fingerprint + HEAD OID. Owner API: `internal::dirty::DirtyCache`.
+        sql_migration(
+            2026070202,
+            "working_dirty",
+            include_str!("../../../sql/migrations/2026070202_working_dirty.sql"),
+            include_str!("../../../sql/migrations/2026070202_working_dirty_down.sql"),
+        ),
+        // 2026-07-03: revision ordinal index (lore.md 1.16) — rebuildable
+        // OID<->ordinal mapping over per-ref first-parent chains, freshness
+        // fingerprinted on tip OID + refs/replace digest. Owner API:
+        // `internal::revision_ordinal::RevisionOrdinalIndex`.
+        sql_migration(
+            2026070301,
+            "revision_ordinal",
+            include_str!("../../../sql/migrations/2026070301_revision_ordinal.sql"),
+            include_str!("../../../sql/migrations/2026070301_revision_ordinal_down.sql"),
+        ),
+        // lore.md 2.6: unified sequencer state (`sequence_state`). Folds the
+        // in-progress cherry-pick forward, retires cherry-pick's lazy DDL and
+        // the `revert_sequence` orphan. Owner: `internal::sequencer`.
+        sql_migration(
+            2026070401,
+            "sequence_state",
+            include_str!("../../../sql/migrations/2026070401_sequence_state.sql"),
+            include_str!("../../../sql/migrations/2026070401_sequence_state_down.sql"),
+        ),
+        // lore.md 2.4: Lore's `layer` local-overlay primitive. Owner:
+        // `internal::layer::LayerStore`. Never serialized into a commit.
+        sql_migration(
+            2026070501,
+            "layer",
+            include_str!("../../../sql/migrations/2026070501_layer.sql"),
+            include_str!("../../../sql/migrations/2026070501_layer_down.sql"),
+        ),
+        // lore.md 2.5: index-flagged obliteration tombstone registry. Owner:
+        // `internal::obliteration::ObliterationStore`.
+        sql_migration(
+            2026070601,
+            "object_obliteration",
+            include_str!("../../../sql/migrations/2026070601_object_obliteration.sql"),
+            include_str!("../../../sql/migrations/2026070601_object_obliteration_down.sql"),
+        ),
+        // lore.md 2.2: read-only sparse view include patterns. Owner:
+        // `internal::sparse::SparseViewStore`.
+        sql_migration(
+            2026070701,
+            "sparse_view",
+            include_str!("../../../sql/migrations/2026070701_sparse_view.sql"),
+            include_str!("../../../sql/migrations/2026070701_sparse_view_down.sql"),
+        ),
+        // lore.md 2.1: per-worktree HEAD/index/HEAD-reflog isolation — adds a
+        // nullable `worktree_id` scoping column to `reference` and `reflog`.
+        sql_migration(
+            2026070801,
+            "worktree_isolation",
+            include_str!("../../../sql/migrations/2026070801_worktree_isolation.sql"),
+            include_str!("../../../sql/migrations/2026070801_worktree_isolation_down.sql"),
+        ),
+        // AG-20 (plan.md Task A5): `agent_checkpoint.traces_commit` probe
+        // index (deliberately NON-unique — see the .sql header for the
+        // brick-avoidance rationale) plus keyset pagination indexes for
+        // `agent session list` / `agent checkpoint list`.
+        sql_migration(
+            2026070802,
+            "agent_checkpoint_paging",
+            include_str!("../../../sql/migrations/2026070802_agent_checkpoint_paging.sql"),
+            include_str!("../../../sql/migrations/2026070802_agent_checkpoint_paging_down.sql"),
+        ),
+        // AG-24a (plan.md Task A8.5): append-only `agent_audit_log` for raw
+        // checkpoint access/export. The `_down` deliberately preserves audit
+        // data (freezes writes rather than dropping) — see the .sql headers.
+        sql_migration(
+            2026070803,
+            "agent_audit_log",
+            include_str!("../../../sql/migrations/2026070803_agent_audit_log.sql"),
+            include_str!("../../../sql/migrations/2026070803_agent_audit_log_down.sql"),
         ),
     ]
 }
@@ -783,9 +875,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 13);
+        assert_eq!(runner.len(), 23);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026062301));
+        assert_eq!(runner.max_registered_version(), Some(2026070803));
     }
 
     #[test]

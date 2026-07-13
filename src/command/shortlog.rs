@@ -52,7 +52,7 @@
 use std::{
     collections::HashMap,
     fmt,
-    io::{self, Write},
+    io::{self, IsTerminal, Read, Write},
 };
 
 use clap::Parser;
@@ -60,10 +60,13 @@ use git_internal::internal::object::commit::Commit;
 use serde::Serialize;
 
 use crate::{
-    internal::log::date_parser::parse_date,
+    internal::log::{
+        date_parser::parse_date,
+        formatter::{CommitFormatter, FormatContext, FormatType},
+    },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
-        output::{OutputConfig, emit_json_data},
+        output::{ColorChoice, OutputConfig, emit_json_data},
         util::{self, CommitBaseError, require_repo},
     },
 };
@@ -78,9 +81,11 @@ EXAMPLES:
     libra shortlog --no-merges      Exclude merge commits from the summary
     libra shortlog --merges         Summarize only merge commits
     libra shortlog --top 5          Show only the top 5 authors
+    libra shortlog --format='%h %s' Render each commit line with a custom template
     libra shortlog --since 24h      Restrict to commits in the last 24 hours
     libra shortlog -w50             Wrap commit subjects at 50 columns
-    libra shortlog --json           Structured JSON output for agents";
+    libra shortlog --json           Structured JSON output for agents
+    git log | libra shortlog        Summarize piped log output (Git's stdin mode)";
 
 #[derive(Parser, Debug)]
 #[command(after_help = SHORTLOG_EXAMPLES)]
@@ -146,6 +151,13 @@ pub struct ShortlogArgs {
     #[clap(long = "group", value_name = "TYPE")]
     pub group: Option<String>,
 
+    /// Render each commit under its author header with a custom format string
+    /// (the same `%`-placeholders as `libra log --format`, including `%b`,
+    /// `%B`, `%n`, ASCII/control `%xNN`, strict ISO dates, raw timestamps,
+    /// decorations, marks, and color placeholders) instead of the commit subject.
+    #[clap(long = "format", value_name = "FORMAT")]
+    pub format: Option<String>,
+
     /// Revision to summarize. Defaults to HEAD.
     pub revision: Option<String>,
 }
@@ -192,20 +204,20 @@ fn resolve_group_mode(args: &ShortlogArgs) -> CliResult<GroupMode> {
 /// one identity (Value parsed as `Name <email>`, or the raw text with an empty
 /// email). A commit may contribute several identities (or none).
 fn extract_trailer_identities(message: &str, key: &str) -> Vec<(String, String)> {
-    // The trailer block is the final non-empty paragraph.
-    let block = match message.trim_end().rsplit("\n\n").next() {
-        Some(b) => b,
-        None => return Vec::new(),
-    };
+    // Shared Git-faithful parser (internal::log::trailer, lore.md §1.9): the
+    // block must QUALIFY per git's rules (last paragraph, not the title,
+    // alnum/dash keys, 25% rule). This tightened the old loose rsplit("\n\n")
+    // parser to agree with `git shortlog --group=trailer:<key>` — notably a
+    // single-paragraph message and a prose-heavy final paragraph no longer
+    // contribute groups. The `key` itself is strengthened as a recognized key
+    // so an explicitly requested group qualifies its own mixed block, matching
+    // git's behavior for configured/requested trailers.
     let mut identities = Vec::new();
-    for line in block.lines() {
-        let Some((raw_key, raw_value)) = line.split_once(':') else {
-            continue;
-        };
-        if !raw_key.trim().eq_ignore_ascii_case(key) {
+    for trailer in crate::internal::log::trailer::parse_trailers_with_recognized(message, &[key]) {
+        if !trailer.key_matches(key) {
             continue;
         }
-        let value = raw_value.trim();
+        let value = trailer.value.as_str();
         if value.is_empty() {
             continue;
         }
@@ -278,7 +290,7 @@ struct ShortlogOutput {
 /// quiet modes, use [`execute_safe`].
 pub async fn execute_to(args: ShortlogArgs, writer: &mut impl Write) -> CliResult<()> {
     require_repo().map_err(|_| CliError::repo_not_found())?;
-    let shortlog_output = run_shortlog(&args).await?;
+    let shortlog_output = run_shortlog(&args, false).await?;
     render_shortlog_output(&shortlog_output, writer)
 }
 
@@ -374,7 +386,7 @@ pub async fn execute(args: ShortlogArgs) {
 /// [`execute_to`] for formatted output.
 pub async fn execute_safe(args: ShortlogArgs, output: &OutputConfig) -> CliResult<()> {
     require_repo().map_err(|_| CliError::repo_not_found())?;
-    let shortlog_output = run_shortlog(&args).await?;
+    let shortlog_output = run_shortlog(&args, color_enabled_for_output(output)).await?;
 
     if output.is_json() {
         emit_json_data("shortlog", &shortlog_output, output)?;
@@ -386,7 +398,36 @@ pub async fn execute_safe(args: ShortlogArgs, output: &OutputConfig) -> CliResul
     Ok(())
 }
 
-async fn run_shortlog(args: &ShortlogArgs) -> CliResult<ShortlogOutput> {
+fn color_enabled_for_output(output: &OutputConfig) -> bool {
+    match output.color {
+        ColorChoice::Always => true,
+        ColorChoice::Never => false,
+        ColorChoice::Auto => std::io::stdout().is_terminal(),
+    }
+}
+
+async fn run_shortlog(args: &ShortlogArgs, color_enabled: bool) -> CliResult<ShortlogOutput> {
+    // Pipe-input mode (matching `git log | git shortlog`): with no explicit
+    // revision and a non-interactive stdin that carries data, summarise the
+    // piped `git log` output instead of walking the repository. An empty /
+    // terminal stdin falls back to the `HEAD` default (an intentional
+    // convenience over Git, which has no default revision); see the command
+    // docs. Walk-only options (`--since`/`--until`/`--merges`/`--no-merges`/
+    // `--format`) have no commits to act on here and are ignored, as in Git.
+    if args.revision.is_none() && !io::stdin().is_terminal() {
+        let mut buffer = String::new();
+        io::stdin().read_to_string(&mut buffer).map_err(|err| {
+            CliError::fatal(format!("failed to read standard input: {err}"))
+                .with_stable_code(StableErrorCode::IoReadFailed)
+        })?;
+        if !buffer.trim().is_empty() {
+            let group_mode = resolve_group_mode(args)?;
+            let wrap = parse_wrap_spec(args.wrap.as_deref())?;
+            let commits = parse_shortlog_stdin(&buffer);
+            return Ok(aggregate_shortlog_stdin(args, &group_mode, commits, wrap));
+        }
+    }
+
     let since_ts = parse_shortlog_date_arg(args.since.as_deref(), "--since")?;
     let until_ts = parse_shortlog_date_arg(args.until.as_deref(), "--until")?;
     let revision = args.revision.clone().unwrap_or_else(|| "HEAD".to_string());
@@ -420,6 +461,7 @@ async fn run_shortlog(args: &ShortlogArgs) -> CliResult<ShortlogOutput> {
         &revision,
         commits,
         wrap,
+        color_enabled,
     ))
 }
 
@@ -429,9 +471,18 @@ fn aggregate_shortlog(
     revision: &str,
     commits: Vec<Commit>,
     wrap: Option<(usize, usize, usize)>,
+    color_enabled: bool,
 ) -> ShortlogOutput {
     let total_commits = commits.len();
     let mut author_map: HashMap<String, AuthorStats> = HashMap::new();
+
+    // `--format`: render each commit with a custom template (the same renderer as
+    // `libra log --format`) instead of its subject. The short-hash width matches
+    // what `libra log` uses so `%h` is consistent across the two commands.
+    let formatter = args.format.as_ref().map(|fmt| {
+        CommitFormatter::new(FormatType::Custom(fmt.clone())).with_color_enabled(color_enabled)
+    });
+    let abbrev_len = util::get_min_unique_hash_length(&commits).max(7);
 
     for commit in commits {
         // Each commit contributes one identity for author/committer grouping,
@@ -447,7 +498,18 @@ fn aggregate_shortlog(
             GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
         };
 
-        let subject = commit.format_message();
+        let subject = match &formatter {
+            Some(formatter) => {
+                let ctx = FormatContext {
+                    graph_prefix: "",
+                    decoration: "",
+                    abbrev_len,
+                    extra_hashes: "",
+                };
+                formatter.format(&commit, &ctx)
+            }
+            None => commit.format_message(),
+        };
 
         for (author_name, author_email) in identities {
             let key = if args.email {
@@ -462,6 +524,20 @@ fn aggregate_shortlog(
         }
     }
 
+    finalize_shortlog(args, author_map, revision, total_commits, wrap)
+}
+
+/// Shared tail of aggregation (used by both the repository-walk and the
+/// standard-input paths): turn the per-identity `author_map` into a sorted,
+/// filtered [`ShortlogOutput`] honouring `--numbered` / `--summary` / `--email`
+/// / `--min-count` / `--reverse` / `--top`.
+fn finalize_shortlog(
+    args: &ShortlogArgs,
+    author_map: HashMap<String, AuthorStats>,
+    revision: &str,
+    total_commits: usize,
+    wrap: Option<(usize, usize, usize)>,
+) -> ShortlogOutput {
     let mut authors: Vec<ShortlogAuthor> = author_map
         .into_values()
         .map(|stats| ShortlogAuthor {
@@ -507,6 +583,146 @@ fn aggregate_shortlog(
     }
 }
 
+/// A single commit parsed from `git log` output supplied on standard input.
+/// Only the fields Git's `shortlog` consumes from its stdin are kept: the
+/// author/committer identities and the (de-indented) log message.
+struct StdinCommit {
+    author: Option<(String, String)>,
+    committer: Option<(String, String)>,
+    message: String,
+}
+
+/// Split a `Name <email>` identity string into `(name, email)`, tolerating a
+/// missing angle-bracket address (the whole string becomes the name).
+fn split_ident(ident: &str) -> (String, String) {
+    let ident = ident.trim();
+    if let Some(open) = ident.rfind(" <")
+        && ident.ends_with('>')
+    {
+        let name = ident[..open].trim().to_string();
+        let email = ident[open + 2..ident.len() - 1].to_string();
+        return (name, email);
+    }
+    (ident.to_string(), String::new())
+}
+
+/// Parse the default (`medium`) or `fuller` `git log` output into per-commit
+/// records. Records are delimited by `commit <hash>` lines; `Author:` /
+/// `Commit:` header lines give the identities (the `:` distinguishes them from
+/// `AuthorDate:` / `CommitDate:`), and 4-space-indented lines form the message
+/// (its first line is the subject).
+fn parse_shortlog_stdin(input: &str) -> Vec<StdinCommit> {
+    let mut commits = Vec::new();
+    let mut current: Option<StdinCommit> = None;
+    let mut message_lines: Vec<String> = Vec::new();
+
+    fn flush(
+        current: &mut Option<StdinCommit>,
+        message_lines: &mut Vec<String>,
+        commits: &mut Vec<StdinCommit>,
+    ) {
+        if let Some(mut commit) = current.take() {
+            commit.message = message_lines.join("\n").trim_end().to_string();
+            commits.push(commit);
+        }
+        message_lines.clear();
+    }
+
+    for line in input.lines() {
+        if line.starts_with("commit ") {
+            flush(&mut current, &mut message_lines, &mut commits);
+            current = Some(StdinCommit {
+                author: None,
+                committer: None,
+                message: String::new(),
+            });
+        } else if let Some(rest) = line.strip_prefix("Author:") {
+            current
+                .get_or_insert_with(|| StdinCommit {
+                    author: None,
+                    committer: None,
+                    message: String::new(),
+                })
+                .author = Some(split_ident(rest));
+        } else if let Some(rest) = line.strip_prefix("Commit:") {
+            current
+                .get_or_insert_with(|| StdinCommit {
+                    author: None,
+                    committer: None,
+                    message: String::new(),
+                })
+                .committer = Some(split_ident(rest));
+        } else if let Some(body) = line.strip_prefix("    ") {
+            // A message line (Git indents the log message by 4 spaces).
+            if current.is_some() {
+                message_lines.push(body.to_string());
+            }
+        } else if line.trim().is_empty() && !message_lines.is_empty() {
+            // Preserve blank lines *within* a message (e.g. the subject/body
+            // separator) so trailer grouping can still see the body, but drop
+            // the blank lines that sit between the headers and the subject.
+            message_lines.push(String::new());
+        }
+        // All other header lines (`Date:`, `AuthorDate:`, `Merge:`, …) are
+        // irrelevant to the summary and ignored.
+    }
+    flush(&mut current, &mut message_lines, &mut commits);
+    commits
+}
+
+/// Aggregate commits parsed from standard input. Mirrors the repository-walk
+/// aggregation but draws identities and subjects from the parsed text: there is
+/// no [`Commit`] object, so `--format` is not applied (the parsed subject is
+/// used verbatim, as in Git). `--author` still filters by author identity even
+/// when grouping by committer.
+fn aggregate_shortlog_stdin(
+    args: &ShortlogArgs,
+    group_mode: &GroupMode,
+    commits: Vec<StdinCommit>,
+    wrap: Option<(usize, usize, usize)>,
+) -> ShortlogOutput {
+    let author_needle = args.author.as_ref().map(|pattern| pattern.to_lowercase());
+    let mut author_map: HashMap<String, AuthorStats> = HashMap::new();
+    // Count commits that survive the `--author` filter, matching the repo-walk
+    // path (which filters before aggregation) so `total_commits` is consistent
+    // across both modes — important for `--json` output.
+    let mut total_commits = 0usize;
+
+    for commit in commits {
+        if let Some(needle) = &author_needle {
+            let matches = commit
+                .author
+                .as_ref()
+                .is_some_and(|(name, email)| author_identity_matches(name, email, needle));
+            if !matches {
+                continue;
+            }
+        }
+        total_commits += 1;
+
+        let subject = commit.message.lines().next().unwrap_or("").to_string();
+        let identities: Vec<(String, String)> = match group_mode {
+            GroupMode::Author => commit.author.into_iter().collect(),
+            GroupMode::Committer => commit.committer.into_iter().collect(),
+            GroupMode::Trailer(key) => extract_trailer_identities(&commit.message, key),
+        };
+
+        for (author_name, author_email) in identities {
+            let key = if args.email {
+                format!("{} <{}>", author_name, author_email)
+            } else {
+                author_name.clone()
+            };
+            author_map
+                .entry(key)
+                .or_insert_with(|| AuthorStats::new(author_name.clone(), author_email.clone()))
+                .add_commit(subject.clone());
+        }
+    }
+
+    finalize_shortlog(args, author_map, "(standard input)", total_commits, wrap)
+}
+
 fn render_shortlog_output(output: &ShortlogOutput, writer: &mut impl Write) -> CliResult<()> {
     let max_count = output
         .authors
@@ -539,17 +755,22 @@ fn render_shortlog_output(output: &ShortlogOutput, writer: &mut impl Write) -> C
 
         if !output.summary {
             for subject in &stats.subjects {
-                match output.wrap {
-                    Some((width, indent1, indent2)) => {
-                        for line in wrap_subject_lines(subject, width, indent1, indent2) {
-                            if !write_shortlog_line(writer, format_args!("{line}"))? {
-                                return Ok(());
+                // A `--format` template may render multiple physical lines; each
+                // is indented independently (a plain subject is always one line,
+                // so this is a no-op for the default path).
+                for physical in subject.split('\n') {
+                    match output.wrap {
+                        Some((width, indent1, indent2)) => {
+                            for line in wrap_subject_lines(physical, width, indent1, indent2) {
+                                if !write_shortlog_line(writer, format_args!("{line}"))? {
+                                    return Ok(());
+                                }
                             }
                         }
-                    }
-                    None => {
-                        if !write_shortlog_line(writer, format_args!("      {}", subject))? {
-                            return Ok(());
+                        None => {
+                            if !write_shortlog_line(writer, format_args!("      {}", physical))? {
+                                return Ok(());
+                            }
                         }
                     }
                 }

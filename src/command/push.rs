@@ -54,7 +54,7 @@ use crate::{
     },
 };
 
-const ISSUE_URL: &str = "https://github.com/web3infra-foundation/libra/issues";
+const ISSUE_URL: &str = "https://github.com/libra-tools/libra/issues";
 
 /// Total timeout for push reference discovery and initial connection setup.
 const PUSH_CONNECT_TIMEOUT: Duration = Duration::from_secs(60);
@@ -117,8 +117,11 @@ pub struct PushArgs {
     #[clap(long, num_args = 0..=1, require_equals = true, conflicts_with = "force")]
     pub force_with_lease: Option<Option<String>>,
 
-    /// Accepted for `git push` compatibility; currently a no-op (the lease check
-    /// uses the remote-tracking ref OID only)
+    /// With --force-with-lease (All/Ref forms): additionally require the
+    /// remote-tracking tip to be integrated locally (reachable from the
+    /// pushed branch's reflog) — Git's safety refinement against pushing
+    /// over fetched-but-unseen updates. Silent no-op with the exact
+    /// `=<ref>:<oid>` lease form or without a lease (Git parity).
     #[clap(long)]
     pub force_if_includes: bool,
 
@@ -172,6 +175,11 @@ pub struct PushArgs {
     /// nothing to bypass.
     #[clap(long = "no-verify")]
     pub no_verify: bool,
+
+    /// Do not show the progress meter (the "Compressing objects" / "Writing
+    /// objects" reporters) on stderr, matching `git push --no-progress`.
+    #[clap(long = "no-progress")]
+    pub no_progress: bool,
 }
 
 impl PushArgs {
@@ -197,6 +205,24 @@ impl PushArgs {
             tags: false,
             mirror: false,
             no_verify: false,
+            no_progress: false,
+        }
+    }
+
+    /// Like [`Self::for_refspecs`] but with a `--force-with-lease=<spec>`
+    /// lease attached (`<refname>` or `<refname>:<expect>` forms). Used by
+    /// `libra agent push --force-rewrite`, whose Libra-managed
+    /// `refs/libra/traces` ref is rewritten wholesale by `agent clean`
+    /// prunes: the lease permits the non-fast-forward update while still
+    /// failing closed when the remote moved past the expected tip.
+    pub(crate) fn for_refspecs_with_lease(
+        repository: String,
+        refspecs: Vec<String>,
+        force_with_lease: String,
+    ) -> Self {
+        Self {
+            force_with_lease: Some(Some(force_with_lease)),
+            ..Self::for_refspecs(repository, refspecs)
         }
     }
 }
@@ -242,6 +268,15 @@ pub enum PushError {
 
     #[error("network timeout during {phase} after {seconds}s")]
     Timeout { phase: String, seconds: u64 },
+
+    #[error(
+        "updates were rejected for '{remote_ref}': the remote-tracking tip {tracking_oid} has \
+         not been integrated locally (remote ref updated since checkout)"
+    )]
+    ForceIfIncludesRejected {
+        remote_ref: String,
+        tracking_oid: String,
+    },
 
     #[error("cannot push to '{remote_ref}': non-fast-forward update")]
     NonFastForward {
@@ -342,6 +377,12 @@ impl From<PushError> for CliError {
             PushError::Timeout { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::NetworkUnavailable)
                 .with_hint("check network connectivity and retry"),
+            PushError::ForceIfIncludesRejected { .. } => CliError::fatal(error.to_string())
+                .with_stable_code(StableErrorCode::ConflictOperationBlocked)
+                .with_hint("integrate the remote update first: 'libra pull' (or fetch + rebase)")
+                .with_hint(
+                    "drop --force-if-includes only if discarding the remote update is intended",
+                ),
             PushError::NonFastForward { .. } => CliError::fatal(error.to_string())
                 .with_stable_code(StableErrorCode::ConflictOperationBlocked)
                 .with_hint("pull and integrate remote changes first: 'libra pull'")
@@ -992,11 +1033,17 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     // OIDs (from discovery) before collecting objects, encoding a pack, uploading
     // LFS, or sending anything. A failed lease aborts with no remote/local change.
     if let Some(lease) = parse_force_with_lease(&args.force_with_lease) {
-        if args.force_if_includes {
-            warnings.push(FORCE_IF_INCLUDES_NOOP_WARNING.to_string());
-        }
         let tracking = collect_lease_tracking_oids(&repository, &plans).await;
         validate_force_with_lease(&lease, &plans, &tracking)?;
+        // `--force-if-includes` (lore.md 2.10): a lease REFINEMENT — beyond
+        // "the remote still points where my tracking ref says", require the
+        // tracking tip to have been INTEGRATED locally (reachable from a
+        // local reflog entry of the pushed branch, per Git's semantics).
+        // Active only for the All/Ref lease forms; with the Exact form (or
+        // no lease at all) it is Git's documented silent no-op.
+        if args.force_if_includes && !matches!(lease, ForceWithLease::Exact { .. }) {
+            validate_force_if_includes(&lease, &plans, &tracking).await?;
+        }
     }
 
     let obj_result = collect_push_objects(&plans).await?;
@@ -1128,7 +1175,62 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
     }
 
     let mut pack_data = Vec::new();
-    if !objs.is_empty() {
+    if !objs.is_empty() && args.thin {
+        // `--thin` (lore.md 2.10): REF_DELTA entries against SERVER-KNOWN
+        // bases. Base harvesting is deliberately conservative: only blobs
+        // modified at the same path between a plan's advertised old tip
+        // (non-zero old_oid = the server told us it has it) and the pushed
+        // tip qualify. Anything without a net wire win ships full; the
+        // receiving `git receive-pack` completes the pack via
+        // index-pack --fix-thin / unpack-objects.
+        let bases = harvest_thin_bases(&plans, &objs).await;
+        let progress_output = progress_output_config(output, args.no_progress);
+        let progress = ProgressReporter::new(
+            "Compressing objects (thin)",
+            Some(objs.len() as u64),
+            &progress_output,
+        );
+        let mut entries = Vec::with_capacity(objs.len());
+        let mut delta_count = 0usize;
+        for (i, obj) in objs.iter().enumerate() {
+            let mut entry = crate::utils::thin_pack::ThinPackEntry {
+                hash: obj.hash,
+                obj_type: obj.obj_type,
+                data: obj.data.clone(),
+                delta_base: None,
+            };
+            // Size caps guard both CPU (byte-level matching) and the wire
+            // (correctness margin far below the 16 MiB copy ceiling — our
+            // ops are capped at 64 KiB regardless).
+            const DELTA_SIZE_CAP: usize = 8 * 1024 * 1024;
+            if obj.obj_type == git_internal::internal::object::types::ObjectType::Blob
+                && obj.data.len() <= DELTA_SIZE_CAP
+                && let Some(base_hash) = bases.get(&obj.hash)
+                && let Ok(base_data) = load_object_data(base_hash)
+                && base_data.len() <= DELTA_SIZE_CAP
+            {
+                let delta = crate::utils::thin_pack::delta_encode(&base_data, &obj.data);
+                // Net win only: the delta plus the raw base hash must beat
+                // the full payload with margin.
+                if delta.len() + base_hash.to_data().len() < obj.data.len() * 3 / 4 {
+                    entry.data = delta;
+                    entry.delta_base = Some(*base_hash);
+                    delta_count += 1;
+                }
+            }
+            entries.push(entry);
+            progress.tick((i + 1) as u64);
+        }
+        progress.finish();
+        pack_data = crate::utils::thin_pack::encode_thin_pack(&entries)
+            .map_err(|e| PushError::PackEncoding(format!("thin pack encoding failed: {e}")))?;
+        if delta_count > 0 && !output.quiet {
+            info_println!(
+                output,
+                "thin pack: {delta_count} delta object(s) against server-known bases"
+            );
+        }
+    } else if !objs.is_empty() {
         let (entry_tx, entry_rx) = mpsc::channel::<MetaAttached<Entry, EntryMeta>>(1_000_000);
         let (stream_tx, mut stream_rx) = mpsc::channel(1_000_000);
 
@@ -1138,7 +1240,7 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
             .await
             .map_err(|e| PushError::PackEncoding(e.to_string()))?;
 
-        let progress_output = progress_output_config(output);
+        let progress_output = progress_output_config(output, args.no_progress);
         let progress = ProgressReporter::new(
             "Compressing objects",
             Some(objs.len() as u64),
@@ -1183,7 +1285,14 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
         }
         RemoteClient::Http(http_client) => {
             let res = http_client.send_pack(data.freeze()).await.map_err(|e| {
-                classify_transport_error("send-pack", std::io::Error::other(e.to_string()))
+                // reqwest's Display can embed the credentialed remote URL; redact
+                // before it reaches an error surfaced to the user (lore.md §0.2).
+                classify_transport_error(
+                    "send-pack",
+                    std::io::Error::other(crate::utils::redact::redact_url_credentials(
+                        &e.to_string(),
+                    )),
+                )
             })?;
             if res.status() != 200 {
                 return Err(PushError::Network(format!(
@@ -1192,7 +1301,12 @@ pub async fn run_push(args: PushArgs, output: &OutputConfig) -> Result<PushOutpu
                 )));
             }
             let data = res.bytes().await.map_err(|e| {
-                classify_transport_error("receive-pack", std::io::Error::other(e.to_string()))
+                classify_transport_error(
+                    "receive-pack",
+                    std::io::Error::other(crate::utils::redact::redact_url_credentials(
+                        &e.to_string(),
+                    )),
+                )
             })?;
             validate_receive_pack_response(data, &plans)?;
         }
@@ -1432,8 +1546,105 @@ async fn resolve_tag_ref(short_name: &str, original: &str) -> Result<ResolvedLoc
 
 /// One-time warning emitted when `--force-if-includes` is paired with
 /// `--force-with-lease` (the flag is accepted but not yet implemented).
-const FORCE_IF_INCLUDES_NOOP_WARNING: &str =
-    "--force-if-includes is accepted but currently a no-op; lease check uses tracking-ref OID only";
+/// `--force-if-includes` (lore.md 2.10): for every leased Update plan whose
+/// expectation came from a TRACKING ref, require the tracking tip to be
+/// integrated locally — the tip must be the plan's new OID, an ancestor of
+/// it, or REACHABLE from a reflog entry of the pushed local branch (Git's
+/// remote.c contract: reachability, not entry equality — a merged-then-
+/// rewound tip still counts as seen). Conservative directions: an empty
+/// reflog, an unloadable tip, or no reachability proof all REJECT (never
+/// fail-open). Divergences (documented): no timestamp cutoff (we check the
+/// whole reflog — strictly a git performance heuristic), and rejection is a
+/// whole-push error rather than a per-ref porcelain row.
+async fn validate_force_if_includes(
+    lease: &ForceWithLease,
+    plans: &[RefUpdatePlan],
+    tracking: &HashMap<String, Option<String>>,
+) -> Result<(), PushError> {
+    for plan in plans {
+        let remote_ref = &plan.update.remote_ref;
+        match lease {
+            ForceWithLease::All => {}
+            ForceWithLease::Ref(name) if lease_ref_matches(remote_ref, name) => {}
+            _ => continue,
+        }
+        // Delete plans have no local integration question.
+        let Some(new_oid) = plan.new_oid else {
+            continue;
+        };
+        let Some(Some(tracking_oid)) = tracking.get(remote_ref) else {
+            continue; // no tracking expectation — the lease already handled it
+        };
+        let Ok(tip) = ObjectHash::from_str(tracking_oid) else {
+            return Err(PushError::ForceIfIncludesRejected {
+                remote_ref: remote_ref.clone(),
+                tracking_oid: tracking_oid.clone(),
+            });
+        };
+        // CONSERVATIVE: the tip must load as a commit before ANY acceptance
+        // path (equality included) — a corrupt/partial local store must
+        // reject, never fail open (Codex P1).
+        if Commit::try_load(&tip).is_none() {
+            return Err(PushError::ForceIfIncludesRejected {
+                remote_ref: remote_ref.clone(),
+                tracking_oid: tracking_oid.clone(),
+            });
+        }
+        // Fast paths: pushing the tip itself, or a descendant of it.
+        if tip == new_oid || is_ancestor(&tip, &new_oid) {
+            continue;
+        }
+        // Reflog integration: one reverse walk from the union of the pushed
+        // branch's reflog OIDs (new first, then old), shared visited set —
+        // the tip must be REACHABLE from some entry, not merely equal.
+        let branch_ref = &plan.update.local_ref;
+        let db = crate::internal::db::get_db_conn_instance().await;
+        let entries = crate::internal::reflog::Reflog::find_all(&db, branch_ref)
+            .await
+            .unwrap_or_default();
+        let mut starts: Vec<ObjectHash> = Vec::new();
+        for entry in &entries {
+            for oid_text in [&entry.new_oid, &entry.old_oid] {
+                if let Ok(oid) = ObjectHash::from_str(oid_text) {
+                    starts.push(oid);
+                }
+            }
+        }
+        if !reachable_from_any(&tip, &starts) {
+            return Err(PushError::ForceIfIncludesRejected {
+                remote_ref: remote_ref.clone(),
+                tracking_oid: tracking_oid.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// Whether `target` is reachable (ancestor-or-equal) from ANY of `starts`,
+/// with one shared visited set across the whole walk.
+fn reachable_from_any(target: &ObjectHash, starts: &[ObjectHash]) -> bool {
+    let mut queue: VecDeque<ObjectHash> = VecDeque::new();
+    let mut visited: HashSet<ObjectHash> = HashSet::new();
+    for start in starts {
+        if visited.insert(*start) {
+            queue.push_back(*start);
+        }
+    }
+    while let Some(commit_id) = queue.pop_front() {
+        if &commit_id == target {
+            return true;
+        }
+        let Some(commit) = Commit::try_load(&commit_id) else {
+            continue;
+        };
+        for parent in commit.parent_commit_ids {
+            if visited.insert(parent) {
+                queue.push_back(parent);
+            }
+        }
+    }
+    false
+}
 
 /// Parsed `--force-with-lease[=<refname>[:<expect>]]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1529,11 +1740,27 @@ async fn collect_lease_tracking_oids(
     for plan in plans {
         let tracking_oid = if let Some(branch) = plan.update.remote_ref.strip_prefix("refs/heads/")
         {
-            Branch::find_branch_result(branch, Some(repository))
+            // Tracking refs are stored under TWO naming conventions (clone
+            // writes short names, fetch writes full refs/remotes paths) —
+            // consult both, or a lease after a fetch-only update would see
+            // no expectation at all (pre-existing bug surfaced by the 2.10
+            // interop tests).
+            let short = Branch::find_branch_result(branch, Some(repository))
+                .await
+                .ok()
+                .flatten();
+            let full = if short.is_none() {
+                Branch::find_branch_result(
+                    &format!("refs/remotes/{repository}/{branch}"),
+                    Some(repository),
+                )
                 .await
                 .ok()
                 .flatten()
-                .map(|b| b.commit.to_string())
+            } else {
+                None
+            };
+            short.or(full).map(|b| b.commit.to_string())
         } else {
             None
         };
@@ -2206,9 +2433,11 @@ fn format_bytes(bytes: u64) -> String {
     }
 }
 
-fn progress_output_config(output: &OutputConfig) -> OutputConfig {
+fn progress_output_config(output: &OutputConfig, no_progress: bool) -> OutputConfig {
     let mut config = output.clone();
-    if config.is_json() {
+    // `--no-progress` (or JSON mode) forces the "Compressing/Writing objects"
+    // reporters off, matching `git push --no-progress`.
+    if config.is_json() || no_progress {
         config.progress = ProgressMode::None;
         config.progress_preference = crate::utils::output::ProgressPreference::None;
     }
@@ -2374,23 +2603,83 @@ fn collect_history_commits(commit_id: &ObjectHash) -> HashSet<ObjectHash> {
 
     let mut commits = HashSet::new();
     let mut queue = VecDeque::new();
+    commits.insert(*commit_id);
     queue.push_back(*commit_id);
     while let Some(commit) = queue.pop_front() {
-        commits.insert(commit);
-
         let commit = match Commit::try_load(&commit) {
             Some(c) => c,
             None => continue,
         };
 
         for parent in commit.parent_commit_ids.iter() {
-            queue.push_back(*parent);
+            // Dedupe at enqueue time: without this, every merge commit
+            // re-enqueues its shared ancestry, and a merge-heavy history
+            // makes the walk exponential — pushing any merge tip then
+            // spins for hours (observed on this repo, 2026-07-05).
+            if commits.insert(*parent) {
+                queue.push_back(*parent);
+            }
         }
     }
     commits
 }
 
 /// Collected objects and any warnings emitted during object traversal.
+/// Harvest thin-pack delta bases (lore.md 2.10): for each Update plan whose
+/// advertised old tip is non-zero (the SERVER declared it during ref
+/// discovery — known by construction), diff the old and new trees and map
+/// same-path modified blobs `new → old`. Conservative by design: type
+/// changes, adds, deletes, and anything not in the outgoing object set are
+/// ignored; a failed load just skips the candidate (thin is an optimization,
+/// never a failure source).
+async fn harvest_thin_bases(
+    plans: &[RefUpdatePlan],
+    objs: &HashSet<Entry>,
+) -> HashMap<ObjectHash, ObjectHash> {
+    use crate::utils::object_ext::TreeExt;
+    let outgoing: HashSet<ObjectHash> = objs.iter().map(|obj| obj.hash).collect();
+    let mut bases = HashMap::new();
+    for plan in plans {
+        let Some(new_oid) = plan.new_oid else {
+            continue;
+        };
+        let zero = plan.old_oid.to_string().chars().all(|c| c == '0');
+        if zero {
+            continue; // creating a new ref: the server has nothing yet
+        }
+        let Some(old_commit) = Commit::try_load(&plan.old_oid) else {
+            continue;
+        };
+        let Some(new_commit) = Commit::try_load(&new_oid) else {
+            continue;
+        };
+        let Some(old_tree) = Tree::try_load(&old_commit.tree_id) else {
+            continue;
+        };
+        let Some(new_tree) = Tree::try_load(&new_commit.tree_id) else {
+            continue;
+        };
+        let old_items: HashMap<std::path::PathBuf, ObjectHash> =
+            old_tree.get_plain_items().into_iter().collect();
+        for (path, new_blob) in new_tree.get_plain_items() {
+            if let Some(old_blob) = old_items.get(&path)
+                && *old_blob != new_blob
+                && outgoing.contains(&new_blob)
+            {
+                // First-wins keeps the mapping deterministic.
+                bases.entry(new_blob).or_insert(*old_blob);
+            }
+        }
+    }
+    bases
+}
+
+/// Load a local object's raw data (base blobs for thin deltas).
+fn load_object_data(hash: &ObjectHash) -> Result<Vec<u8>, GitError> {
+    let storage = crate::utils::client_storage::ClientStorage::init(crate::utils::path::objects());
+    storage.get(hash)
+}
+
 struct IncrementalObjsResult {
     objs: HashSet<Entry>,
     warnings: Vec<String>,
@@ -2836,6 +3125,7 @@ mod test {
     }
 
     #[tokio::test]
+    #[serial_test::serial]
     async fn incremental_objs_fast_forward_skips_unchanged_subtree_blobs() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -2888,7 +3178,44 @@ mod test {
         assert_eq!(hashes.len(), 4);
     }
 
+    /// Regression (2026-07-05): `collect_history_commits` enqueued parents
+    /// without a visited check, so every merge commit re-enqueued its
+    /// shared ancestry — a merge-heavy history made the walk exponential
+    /// and pushing any merge tip effectively hung forever. 40 stacked
+    /// merges are infeasible pre-fix (~2^40 queue operations) and
+    /// instantaneous post-fix.
     #[tokio::test]
+    #[serial_test::serial]
+    async fn collect_history_commits_dedupes_merge_heavy_history() {
+        let repo = tempfile::tempdir().expect("repo tempdir should be created");
+        crate::utils::test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = crate::utils::test::ChangeDirGuard::new(repo.path());
+
+        let blob = save_test_blob("shared content");
+        let tree = save_test_tree(vec![TreeItem::new(
+            TreeItemMode::Blob,
+            blob.id,
+            "file.txt".to_string(),
+        )]);
+
+        let root = save_test_commit(tree.id, vec![], "root");
+        let mut tip = root.id;
+        let mut expected = 1usize;
+        for i in 0..40 {
+            let side = save_test_commit(tree.id, vec![tip], &format!("side {i}"));
+            let merge = save_test_commit(tree.id, vec![tip, side.id], &format!("merge {i}"));
+            tip = merge.id;
+            expected += 2;
+        }
+
+        let commits = collect_history_commits(&tip);
+        assert_eq!(commits.len(), expected, "every commit visited exactly once");
+        assert!(commits.contains(&root.id));
+        assert!(commits.contains(&tip));
+    }
+
+    #[tokio::test]
+    #[serial_test::serial]
     async fn diff_tree_objs_recurses_by_path_for_changed_subtrees() {
         let repo = tempfile::tempdir().expect("repo tempdir should be created");
         crate::utils::test::setup_with_new_libra_in(repo.path()).await;
@@ -3287,6 +3614,7 @@ mod test {
             tags: false,
             mirror: false,
             no_verify: false,
+            no_progress: false,
         };
         assert!(matches!(
             validate_push_args(&args),

@@ -56,6 +56,9 @@ async fn test_basic_cherry_pick() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -77,6 +80,7 @@ async fn test_basic_cherry_pick() {
 
     // --- 2. Create and switch to feature branch ---
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -105,6 +109,9 @@ async fn test_basic_cherry_pick() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -143,6 +150,9 @@ async fn test_basic_cherry_pick() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -164,6 +174,7 @@ async fn test_basic_cherry_pick() {
 
     // --- 4. Switch back to master branch ---
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -290,6 +301,9 @@ async fn test_cherry_pick_with_commit() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -310,6 +324,7 @@ async fn test_cherry_pick_with_commit() {
 
     // Create feature branch and commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -335,6 +350,9 @@ async fn test_cherry_pick_with_commit() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -359,6 +377,7 @@ async fn test_cherry_pick_with_commit() {
 
     // Switch back to master
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -437,6 +456,9 @@ async fn test_cherry_pick_multiple_commits() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -457,6 +479,7 @@ async fn test_cherry_pick_multiple_commits() {
 
     // Create feature branch
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".to_string()),
         force_create: None,
@@ -483,6 +506,9 @@ async fn test_cherry_pick_multiple_commits() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -516,6 +542,9 @@ async fn test_cherry_pick_multiple_commits() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(CommitArgs {
@@ -537,6 +566,7 @@ async fn test_cherry_pick_multiple_commits() {
 
     // Switch back to master
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".to_string()),
         create: None,
         force_create: None,
@@ -778,6 +808,9 @@ async fn test_cherry_pick_sha256_hash_handling() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(commit::CommitArgs {
@@ -798,6 +831,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
 
     // feature branch with one commit
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: None,
         create: Some("feature".into()),
         force_create: None,
@@ -822,6 +856,9 @@ async fn test_cherry_pick_sha256_hash_handling() {
 
         pathspec_from_file: None,
         pathspec_file_nul: false,
+        chmod: None,
+        renormalize: false,
+        ignore_missing: false,
     })
     .await;
     commit::execute(commit::CommitArgs {
@@ -844,6 +881,7 @@ async fn test_cherry_pick_sha256_hash_handling() {
 
     // back to main
     switch::execute(SwitchArgs {
+        no_progress: false,
         branch: Some("main".into()),
         create: None,
         force_create: None,
@@ -908,6 +946,13 @@ fn cp_head_message(repo: &std::path::Path) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+/// Raw `HEAD` commit-object bytes via `cat-file --batch` (includes `gpgsig`).
+fn cp_raw_head_commit(repo: &std::path::Path) -> String {
+    let out = run_libra_command_with_stdin(&["cat-file", "--batch"], repo, "HEAD\n");
+    assert_cli_success(&out, "cat-file --batch HEAD");
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
 /// Fresh repo with a `feature` branch holding one commit that adds `file`=`content`
 /// (message `msg`). Returns `(repo, feature_oid)` with HEAD back on `main`.
 fn repo_with_feature_commit(file: &str, content: &str, msg: &str) -> (tempfile::TempDir, String) {
@@ -926,6 +971,202 @@ fn repo_with_feature_commit(file: &str, content: &str, msg: &str) -> (tempfile::
     let oid = cp_rev_parse(p, "HEAD");
     assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
     (repo, oid)
+}
+
+/// Like [`repo_with_feature_commit`], but the feature commit's message is stored
+/// verbatim (`commit --cleanup=verbatim`), so a later `cherry-pick --cleanup`
+/// has comment/whitespace content to act on (a plain `-m` commit is already
+/// Strip-cleaned).
+fn repo_with_verbatim_feature_commit(
+    file: &str,
+    content: &str,
+    msg: &str,
+) -> (tempfile::TempDir, String) {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "switch -c feature",
+    );
+    std::fs::write(p.join(file), content).unwrap();
+    assert_cli_success(&run_libra_command(&["add", file], p), "add feature file");
+    assert_cli_success(
+        &run_libra_command(
+            &["commit", "--cleanup=verbatim", "-m", msg, "--no-verify"],
+            p,
+        ),
+        "verbatim feature commit",
+    );
+    let oid = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    (repo, oid)
+}
+
+/// `cherry-pick --cleanup=strip` removes `#` comment lines and trailing
+/// whitespace from the replayed message; `--cleanup=verbatim` preserves them.
+#[test]
+fn cherry_pick_cleanup_strip_then_verbatim() {
+    let msg = "pick subject\n\nkept body line\n# comment to strip\n";
+
+    let (repo, oid) = repo_with_verbatim_feature_commit("f.txt", "feat\n", msg);
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--cleanup=strip", &oid], repo.path()),
+        "cherry-pick --cleanup=strip",
+    );
+    let stripped = cp_head_message(repo.path());
+    assert!(
+        stripped.contains("pick subject"),
+        "subject kept: {stripped}"
+    );
+    assert!(stripped.contains("kept body line"), "body kept: {stripped}");
+    assert!(
+        !stripped.contains("# comment to strip"),
+        "strip must drop the `#` comment line: {stripped}"
+    );
+
+    // verbatim keeps the comment line intact.
+    let (repo2, oid2) = repo_with_verbatim_feature_commit("f.txt", "feat\n", msg);
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--cleanup=verbatim", &oid2], repo2.path()),
+        "cherry-pick --cleanup=verbatim",
+    );
+    assert!(
+        cp_head_message(repo2.path()).contains("# comment to strip"),
+        "verbatim must preserve the `#` comment line"
+    );
+
+    // `--cleanup=strip -s`: the body is cleaned but the blank-line separator
+    // before the appended Signed-off-by trailer must survive (the trailer is
+    // appended AFTER cleanup, so it is never collapsed into the body).
+    let (repo3, oid3) = repo_with_verbatim_feature_commit("f.txt", "feat\n", msg);
+    assert_cli_success(
+        &run_libra_command(
+            &["cherry-pick", "--cleanup=strip", "-s", &oid3],
+            repo3.path(),
+        ),
+        "cherry-pick --cleanup=strip -s",
+    );
+    let signed = cp_head_message(repo3.path());
+    assert!(
+        signed.contains("\n\nSigned-off-by:"),
+        "trailer separator preserved under strip: {signed:?}"
+    );
+    assert!(
+        !signed.contains("# comment to strip"),
+        "strip still drops the comment: {signed:?}"
+    );
+
+    // `--cleanup=default` with no editor falls back to `whitespace` (keeps `#`
+    // lines), matching Git's "if the message is to be edited" clause and commit.
+    let (repo4, oid4) = repo_with_verbatim_feature_commit("f.txt", "feat\n", msg);
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--cleanup=default", &oid4], repo4.path()),
+        "cherry-pick --cleanup=default",
+    );
+    assert!(
+        cp_head_message(repo4.path()).contains("# comment to strip"),
+        "default without an editor keeps `#` lines (whitespace fallback)"
+    );
+}
+
+/// The `--cleanup` mode round-trips through the SQLite sequencer: a pick that
+/// conflicts, is resolved, and resumed with `--continue` still cleans the
+/// resumed commit's message.
+#[test]
+fn cherry_pick_cleanup_survives_conflict_resume() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+
+    // feature: a commit touching shared.txt with a verbatim (messy) message.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "switch -c feature",
+    );
+    std::fs::write(p.join("shared.txt"), "feature\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add shared");
+    assert_cli_success(
+        &run_libra_command(
+            &[
+                "commit",
+                "--cleanup=verbatim",
+                "-m",
+                "conflicting subject\n\nkept body\n# strip me\n",
+                "--no-verify",
+            ],
+            p,
+        ),
+        "verbatim feature commit",
+    );
+    let oid = cp_rev_parse(p, "HEAD");
+
+    // main diverges on shared.txt so the pick conflicts.
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("shared.txt"), "main\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main edit", "--no-verify"], p),
+        "commit main",
+    );
+
+    // cherry-pick --cleanup=strip → conflict.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--cleanup=strip", &oid], p)
+            .status
+            .code(),
+        Some(128),
+        "pick conflicts"
+    );
+
+    // Resolve + continue → the resumed commit applies the stored cleanup mode.
+    std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "add resolved",
+    );
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--continue"], p),
+        "cherry-pick --continue",
+    );
+    let msg = cp_head_message(p);
+    assert!(msg.contains("conflicting subject"), "subject kept: {msg}");
+    assert!(
+        !msg.contains("# strip me"),
+        "cleanup mode survived the resume and stripped the comment: {msg}"
+    );
+}
+
+/// `cherry-pick --cleanup=<bogus>` is a usage error (exit 129, LBR-CLI-002),
+/// rejected up front before any commit is created.
+#[test]
+fn cherry_pick_invalid_cleanup_mode_rejected() {
+    let (repo, oid) = repo_with_feature_commit("f.txt", "feat\n", "feature work");
+    let out = run_libra_command(&["cherry-pick", "--cleanup=bogus", &oid], repo.path());
+    assert_eq!(
+        out.status.code(),
+        Some(129),
+        "invalid cleanup mode should exit 129: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let (_h, report) = parse_cli_error_stderr(&out.stderr);
+    assert_eq!(report.error_code, "LBR-CLI-002");
+
+    // The mode is validated BEFORE the sequencer-control dispatch, so an invalid
+    // mode fails fast even alongside `--continue` (rather than slipping through
+    // to a resumed commit / a "no cherry-pick in progress" error).
+    let cont = run_libra_command(
+        &["cherry-pick", "--continue", "--cleanup=bogus"],
+        repo.path(),
+    );
+    assert_eq!(
+        cont.status.code(),
+        Some(129),
+        "invalid --cleanup with --continue should still exit 129: {}",
+        String::from_utf8_lossy(&cont.stderr)
+    );
+    assert_eq!(
+        parse_cli_error_stderr(&cont.stderr).1.error_code,
+        "LBR-CLI-002"
+    );
 }
 
 /// Default cherry-pick (no `-x`) must NOT append the cherry-picked-from line
@@ -1148,12 +1389,9 @@ fn cherry_pick_redundant_blocked_then_kept() {
 #[test]
 fn cherry_pick_unsupported_flags_rejected() {
     let (repo, oid) = repo_with_feature_commit("f.txt", "feat\n", "feature work");
-    let cases: Vec<Vec<&str>> = vec![
-        vec!["cherry-pick", "--empty", "drop", &oid],
-        vec!["cherry-pick", "--cleanup", "strip", &oid],
-        vec!["cherry-pick", "--rerere-autoupdate", &oid],
-        vec!["cherry-pick", "--commit", &oid],
-    ];
+    // `--rerere-autoupdate` is now honoured (it steers the rerere hook), so it is
+    // no longer in this rejection list.
+    let cases: Vec<Vec<&str>> = vec![vec!["cherry-pick", "--commit", &oid]];
     for args in cases {
         let out = run_libra_command(&args, repo.path());
         assert_eq!(
@@ -1312,6 +1550,68 @@ fn conflict_sequence_repo() -> (tempfile::TempDir, String, String) {
         "commit main",
     );
     (repo, f1, f2)
+}
+
+/// `merge.conflictStyle = diff3` is honored by cherry-pick's line-level markers
+/// (parity with `libra merge` — Git honors the config for both): the base block
+/// appears as `||||||| base` with the common-ancestor content (lore.md §1.3).
+#[test]
+fn cherry_pick_conflict_honors_diff3_style() {
+    let (repo, feat) = conflict_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "diff3"], p),
+        "set conflictStyle",
+    );
+    let out = run_libra_command(&["cherry-pick", &feat], p);
+    assert_eq!(out.status.code(), Some(128), "conflict exit");
+    let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
+    assert!(
+        body.contains("||||||| base\nbase\n=======\n"),
+        "diff3 base block with ancestor content: {body:?}"
+    );
+}
+
+/// An unsupported `merge.conflictStyle` is a hard error raised BEFORE the
+/// conflicted index/worktree state is written: no markers, no persisted
+/// sequencer state (a follow-up pick is NOT blocked), worktree untouched.
+#[test]
+fn cherry_pick_conflict_style_invalid_rejected_before_mutation() {
+    let (repo, feat) = conflict_repo();
+    let p = repo.path();
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "zdiff3"], p),
+        "set conflictStyle",
+    );
+    let out = run_libra_command(&["cherry-pick", &feat], p);
+    assert_eq!(out.status.code(), Some(128), "invalid style is fatal");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("unsupported merge.conflictStyle 'zdiff3'"),
+        "actionable error names the bad value: {stderr}"
+    );
+    let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
+    assert_eq!(
+        body, "main side\n",
+        "worktree untouched — no markers, no partial reset"
+    );
+    // No sequencer state persisted: fixing the config lets a fresh pick proceed
+    // (it conflicts normally rather than reporting an in-progress pick).
+    assert_cli_success(
+        &run_libra_command(&["config", "merge.conflictStyle", "merge"], p),
+        "fix conflictStyle",
+    );
+    let retry = run_libra_command(&["cherry-pick", &feat], p);
+    let retry_stderr = String::from_utf8_lossy(&retry.stderr);
+    assert!(
+        !retry_stderr.contains("already in progress"),
+        "no stale sequencer state was left behind: {retry_stderr}"
+    );
+    let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
+    assert!(
+        body.contains("<<<<<<< HEAD"),
+        "retry conflicts normally with markers: {body}"
+    );
 }
 
 /// A conflict exits 128/LBR-CONFLICT-001, writes worktree markers, and persists
@@ -1565,9 +1865,11 @@ async fn cherry_pick_malformed_todo_oid_errors_not_panics() {
     // Corrupt the persisted todo OID directly in the repo database.
     let db_url = format!("sqlite://{}?mode=rwc", p.join(".libra/libra.db").display());
     let conn = Database::connect(db_url).await.expect("connect repo db");
+    // lore.md 2.6: cherry-pick state now lives in the unified `sequence_state`
+    // table (kind='cherry_pick'), not the retired `cherry_pick_state` table.
     conn.execute(Statement::from_string(
         DatabaseBackend::Sqlite,
-        "UPDATE cherry_pick_state SET todo = 'not-a-valid-oid'".to_string(),
+        "UPDATE sequence_state SET todo = 'not-a-valid-oid' WHERE kind = 'cherry_pick'".to_string(),
     ))
     .await
     .expect("corrupt todo");
@@ -1742,7 +2044,12 @@ fn cherry_pick_gpg_sign_via_vault_succeeds() {
     let (repo, feat) = repo_with_feature_commit("f.txt", "feat\n", "feature work");
     assert_cli_success(
         &run_libra_command(&["cherry-pick", "-S", &feat], repo.path()),
-        "cherry-pick -S signs via vault (a clean exit proves the vault yielded a signature)",
+        "cherry-pick -S signs via vault",
+    );
+    let body = cp_raw_head_commit(repo.path());
+    assert!(
+        body.contains("-----BEGIN PGP SIGNATURE-----"),
+        "cherry-pick -S must write a signed commit: {body}"
     );
 }
 
@@ -1771,12 +2078,13 @@ fn cherry_pick_continue_retains_gpg_sign() {
     );
     // HEAD = f2's resumed commit; HEAD~1 = f1's finalized commit. Both must be
     // signed — proving `gpg_sign` was not dropped on resume.
-    let head_body = cp_head_message(p);
+    let head_body = cp_raw_head_commit(p);
     assert!(
         head_body.contains("-----BEGIN PGP SIGNATURE-----"),
         "resumed commit must stay signed: {head_body}"
     );
-    let prev = run_libra_command(&["cat-file", "-p", "HEAD~1"], p);
+    let prev = run_libra_command_with_stdin(&["cat-file", "--batch"], p, "HEAD~1\n");
+    assert_cli_success(&prev, "cat-file --batch HEAD~1");
     let prev_body = String::from_utf8_lossy(&prev.stdout);
     assert!(
         prev_body.contains("-----BEGIN PGP SIGNATURE-----"),
@@ -1863,4 +2171,295 @@ fn cherry_pick_resume_nonconflict_error_keeps_accurate_state() {
         report.error_code, "LBR-REPO-003",
         "state cleared after skip"
     );
+}
+
+/// `--empty=<mode>` controls a pick that becomes redundant against HEAD after
+/// replay: `drop` skips it (HEAD unchanged), `stop` (default) halts, `keep`
+/// records the empty commit. An invalid mode is a usage error.
+#[tokio::test]
+#[serial]
+async fn test_cherry_pick_empty_modes() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    let _guard = ChangeDirGuard::new(p);
+
+    // feature: add line X to shared.txt.
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch feature",
+    );
+    std::fs::write(p.join("shared.txt"), "base\nX\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "add on feature",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "add X", "--no-verify"], p),
+        "feature commit",
+    );
+    let feature_commit = Head::current_commit()
+        .await
+        .expect("feature commit")
+        .to_string();
+
+    // main: make the IDENTICAL change, so cherry-picking feature's commit is
+    // redundant (the resulting tree equals HEAD's).
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("shared.txt"), "base\nX\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add on main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main also adds X", "--no-verify"], p),
+        "main commit",
+    );
+    let main_tip = Head::current_commit().await.expect("main tip");
+
+    // --empty=drop: skip the redundant commit; HEAD must not move, and the
+    // "dropping … patch contents already upstream" notice names the real subject.
+    let drop = run_libra_command(&["cherry-pick", "--empty=drop", &feature_commit], p);
+    assert_cli_success(&drop, "--empty=drop succeeds");
+    assert_eq!(
+        Head::current_commit().await.expect("HEAD"),
+        main_tip,
+        "--empty=drop leaves HEAD unmoved"
+    );
+    let drop_out = String::from_utf8_lossy(&drop.stdout);
+    assert!(
+        drop_out.contains("dropping")
+            && drop_out.contains("add X")
+            && drop_out.contains("already upstream"),
+        "--empty=drop reports the dropped commit: {drop_out}"
+    );
+
+    // --empty=stop (the default) halts with a "redundant" error.
+    let stop = run_libra_command(&["cherry-pick", "--empty=stop", &feature_commit], p);
+    assert_ne!(stop.status.code(), Some(0), "--empty=stop halts");
+    assert!(
+        String::from_utf8_lossy(&stop.stderr).contains("redundant"),
+        "--empty=stop explains the redundancy"
+    );
+
+    // --empty=keep: record the empty commit; HEAD advances.
+    let keep = run_libra_command(&["cherry-pick", "--empty=keep", &feature_commit], p);
+    assert_cli_success(&keep, "--empty=keep succeeds");
+    assert_ne!(
+        Head::current_commit().await.expect("HEAD"),
+        main_tip,
+        "--empty=keep records the (empty) commit, advancing HEAD"
+    );
+
+    // Invalid mode is a usage error (exit 129) naming the bad value.
+    let bogus = run_libra_command(&["cherry-pick", "--empty=bogus", &feature_commit], p);
+    assert_eq!(
+        bogus.status.code(),
+        Some(129),
+        "invalid --empty mode exits 129"
+    );
+    assert!(
+        String::from_utf8_lossy(&bogus.stderr).contains("--empty"),
+        "the error names --empty"
+    );
+}
+
+/// `--empty=drop` survives a conflict + `--continue`: the mode round-trips through
+/// the sequencer state, so a LATER commit in the sequence that becomes redundant
+/// is dropped (not stopped on) when the resume reaches it.
+#[test]
+#[serial]
+fn cherry_pick_empty_drop_survives_conflict_resume() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("shared.txt"), "base\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base shared", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch feature",
+    );
+
+    // f1: conflicting edit to shared.txt.
+    std::fs::write(p.join("shared.txt"), "feature\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add f1");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "f1", "--no-verify"], p),
+        "commit f1",
+    );
+    let f1 = cp_rev_parse(p, "HEAD");
+
+    // f2: add redundant.txt=R — main will already have the identical file, so this
+    // pick becomes redundant against HEAD after f1 lands.
+    std::fs::write(p.join("redundant.txt"), "R\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "redundant.txt"], p), "add f2");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "f2 add R", "--no-verify"], p),
+        "commit f2",
+    );
+    let f2 = cp_rev_parse(p, "HEAD");
+
+    // main: conflict on shared.txt AND already add the identical redundant.txt.
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("shared.txt"), "main\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "add main edit",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main edit", "--no-verify"], p),
+        "commit main edit",
+    );
+    std::fs::write(p.join("redundant.txt"), "R\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "redundant.txt"], p),
+        "add main R",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main adds R", "--no-verify"], p),
+        "commit main R",
+    );
+
+    // Pick f1, f2 with --empty=drop → f1 conflicts and halts.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", "--empty=drop", &f1, &f2], p)
+            .status
+            .code(),
+        Some(128),
+        "f1 conflicts"
+    );
+
+    // Resolve f1 and continue: f1 commits, then the resume reaches f2 — which is
+    // redundant — and (because --empty=drop round-tripped through the state) drops
+    // it rather than halting. The sequence completes.
+    std::fs::write(p.join("shared.txt"), "resolved\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "shared.txt"], p),
+        "add resolved",
+    );
+    let cont = run_libra_command(&["cherry-pick", "--continue"], p);
+    assert_cli_success(&cont, "--continue drops the redundant f2 and finishes");
+    let cont_out = String::from_utf8_lossy(&cont.stdout);
+    assert!(
+        cont_out.contains("dropping") && cont_out.contains("already upstream"),
+        "the resumed redundant f2 is reported as dropped: {cont_out}"
+    );
+
+    // State cleared (sequence complete): another sequencer control errors.
+    let after = run_libra_command(&["cherry-pick", "--continue"], p);
+    let (_h, report) = parse_cli_error_stderr(&after.stderr);
+    assert_eq!(
+        report.error_code, "LBR-REPO-003",
+        "state cleared after resume"
+    );
+}
+
+/// A modify/modify conflict on one line of a multi-line file produces LINE-LEVEL
+/// conflict markers (matching Git): the shared context lines stay OUTSIDE the
+/// `<<<<<<< / ======= / >>>>>>>` region, which only encloses the diverging line.
+/// This would fail under the old whole-file presentation (which wrapped every
+/// line of each side inside the markers).
+#[test]
+fn cherry_pick_conflict_is_line_level() {
+    let repo = create_committed_repo_via_cli();
+    let p = repo.path();
+    std::fs::write(p.join("shared.txt"), "top\nl1\nl2\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add base");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "base", "--no-verify"], p),
+        "commit base",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "-c", "feature"], p),
+        "branch",
+    );
+    std::fs::write(p.join("shared.txt"), "top\nl1\nFEATURE\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add feat");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "feature edit", "--no-verify"], p),
+        "commit feat",
+    );
+    let feat = cp_rev_parse(p, "HEAD");
+    assert_cli_success(&run_libra_command(&["switch", "main"], p), "switch main");
+    std::fs::write(p.join("shared.txt"), "top\nl1\nMAIN\nl3\nbottom\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "shared.txt"], p), "add main");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "main edit", "--no-verify"], p),
+        "commit main",
+    );
+
+    let out = run_libra_command(&["cherry-pick", &feat], p);
+    assert_eq!(out.status.code(), Some(128), "conflict exits 128");
+    let body = std::fs::read_to_string(p.join("shared.txt")).unwrap();
+
+    // Shared context is OUTSIDE the conflict region (line-level, like Git).
+    assert!(
+        body.starts_with("top\nl1\n<<<<<<< HEAD\n"),
+        "shared prefix precedes the markers: {body:?}"
+    );
+    assert!(
+        body.ends_with("l3\nbottom\n"),
+        "shared suffix follows the markers: {body:?}"
+    );
+    // The "ours" region encloses ONLY the diverging line, not the whole file.
+    let ours = body
+        .split_once("<<<<<<< HEAD\n")
+        .and_then(|(_, rest)| rest.split_once("\n======="))
+        .map(|(mid, _)| mid)
+        .expect("conflict region present");
+    assert_eq!(
+        ours, "MAIN",
+        "ours hunk is just the diverging line: {body:?}"
+    );
+    assert!(
+        body.contains("\nFEATURE\n"),
+        "theirs hunk present: {body:?}"
+    );
+    // Whole-file would have put the shared lines inside the markers.
+    assert!(
+        !ours.contains("top") && !ours.contains("bottom"),
+        "shared lines must not be inside the conflict region: {body:?}"
+    );
+}
+
+/// lore.md 2.6 symmetric mutex: an in-progress cherry-pick conflict blocks a
+/// NEW merge / revert / rebase with LBR-CONFLICT-002, while the cherry-pick's
+/// own --continue/--abort stay available.
+#[test]
+fn cherry_pick_in_progress_blocks_other_sequences() {
+    let (repo, f1, f2) = conflict_sequence_repo();
+    let p = repo.path().to_path_buf();
+    // Pause on a conflict.
+    assert_eq!(
+        run_libra_command(&["cherry-pick", &f1, &f2], &p)
+            .status
+            .code(),
+        Some(128),
+        "cherry-pick conflicts and pauses"
+    );
+    // A NEW sequence of a DIFFERENT kind is refused, naming the blocking op.
+    for argv in [
+        vec!["merge", "feature"],
+        vec!["revert", "HEAD"],
+        vec!["rebase", "feature"],
+    ] {
+        let out = run_libra_command(&argv, &p);
+        assert_eq!(
+            out.status.code(),
+            Some(128),
+            "{argv:?} must be blocked by the in-progress cherry-pick"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("cherry-pick") && stderr.contains("LBR-CONFLICT-002"),
+            "{argv:?} names the blocking op + typed code: {stderr}"
+        );
+    }
+    // The cherry-pick's own --abort is NOT blocked.
+    assert_cli_success(
+        &run_libra_command(&["cherry-pick", "--abort"], &p),
+        "own --abort stays available",
+    );
+    // After abort, a fresh sequence starts cleanly.
+    let after = run_libra_command(&["revert", "HEAD", "--no-edit"], &p);
+    assert_eq!(after.status.code(), Some(0), "sequence clear after abort");
 }

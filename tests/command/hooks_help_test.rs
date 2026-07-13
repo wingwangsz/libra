@@ -31,9 +31,13 @@ fn test_hooks_help_lists_examples_banner() {
         "libra hooks claude tool-use",
         "libra hooks claude stop",
         "libra hooks claude session-end",
-        "libra hooks gemini session-start",
-        "libra hooks gemini prompt",
-        "libra hooks gemini tool-use",
+        // AG-19: gemini is uninstall-only (single reject line) and codex
+        // is the new stable installed surface.
+        "libra hooks codex session-start",
+        "libra hooks codex stop",
+        "libra hooks codex subagent-start",
+        "libra hooks gemini <event>",
+        "libra agent remove gemini",
     ] {
         assert!(
             stdout.contains(invocation),
