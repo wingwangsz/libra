@@ -58,6 +58,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `subface_labels.rs` | CG-01 (plan-20260708) | `COMPATIBILITY.md` 的「Sub-face compatibility grading」矩阵机器校验：子面标签限于固定五枚举、被分级命令集钉死在 P0/P1 触达面且不脱离 `src/cli.rs::Commands`、同一命令不得把一个子面分进两档、每个 `unsupported` 子面带治理编号并与 `_compatibility.md` 登记表双向一致 |
 | `conflict_status_diff_test.rs` | P0-01 (plan-20260708) | merge / rebase / cherry-pick 内容冲突后，`status --porcelain` 输出 `UU`、porcelain v2 输出 `u UU ...`、`ls-files -u/-t` 暴露 stage 1/2/3，`diff` 使用 `diff --cc` 而不是把冲突文件误报为 `/dev/null` 新增 |
 | `diff_check_safety_test.rs` | P0-02 (plan-20260708) | `diff --check` 覆盖 Git 的三类安全检查：尾随空白、leftover conflict marker、new blank line at EOF，且任一命中退出码为 2 |
+| `diff_review_options_test.rs` | P1-08a (plan-20260708) | `diff --raw` A/D/M/R/T 与 NUL rename 字段、工作树侧 zero OID/纯 mode 方向 ID、`--summary` mode change、external-driver mode/hash、content+mode/executable-content unified/full-index header、textconv/空白 body suppression 后保留 mode、rename 不跨 regular/symlink file type 配对、`--compact-summary`、`--diff-filter` include/exclude/真正 all-or-none 及 sparse-view 投影后重判、`--full-index`、CLI src/dst prefix 与坏默认短路 |
 | `clone_shallow_integrity_test.rs` | P0-03 (plan-20260708) | 本地 Libra 源的 `clone --depth` / `fetch --depth` 必须 fail-closed（`LBR-REPO-002`）且不留下 broken target / shallow metadata；`rev-parse --is-shallow-repository` 正确报告 shallow 布尔 |
 | `checkout_branch_startpoint_test.rs` | P0-04 (plan-20260708) | `checkout -b/-B <branch> <start-point>` 与 `switch -C <branch> <start-point>` 必须把 `HEAD` 保持为目标分支的 symbolic ref；无效 start-point 必须 fail-closed 且不移动 `HEAD` / 既有分支引用 |
 | `switch_orphan_root_test.rs` | P0-05 (plan-20260708) | `switch --orphan` / `checkout --orphan` 必须把 `HEAD` 指向 unborn 分支、保留 index/worktree、JSON 标记 `unborn=true`，并让首个用户提交成为无 parent 的 root commit；已有分支和不支持的 start-point 必须 fail-closed |
@@ -77,7 +78,7 @@ top-level `[[test]]` entries in `Cargo.toml`.
 | `config_defaults_edge_cases_test.rs` | P1-05a (plan-20260708) | 加密 local/global 默认值先解密、不可读/不支持 system scope 跳过、Git 转换报告源 `HEAD` 分支，以及配置默认值边界回归 |
 | `config_history_defaults_test.rs` | P1-05b (plan-20260708) | 历史相关默认值：`merge.ff`、`merge.log`、`merge.verifySignatures`、`commit.gpgSign` 与 CLI override 优先级 |
 | `fetch_remote_refspec_test.rs` | P1-06 (plan-20260708) | 显式/配置 fetch refspec 精确映射、FETCH_HEAD/remote HEAD 元数据、`remotes.default`、多 ref 事务回滚、remote rename tracking namespace 迁移与 `ls-remote --symref` |
-| `noninteractive_history_controls_test.rs` | P1-07a (plan-20260708) | rebase `--autostash` staged/worktree 分层恢复、conflict-held OID 经 maintenance GC 后 abort、逐提交 sandbox `--exec` 停止/重试/越界写阻断与 exec-created commit 对齐、`--update-refs` 原子移动/已检出分支排除/skip+start-empty 映射、`--fork-point` reflog 最具体选点，以及三组负向 toggle last-wins |
+| `noninteractive_history_controls_test.rs` | P1-07a/P1-07b/P1-07c (plan-20260708) | rebase 非交互 controls；merge `-s ours`、hunk-level `-X`、无关历史与 `--log`；cherry-pick/revert last-wins hunk-level `-X`、revert cleanup conflict→continue 与 corrupt-index fail-closed，以及 reset merge/keep staged/unstaged 保留或拒绝、untracked collision、file/directory 转换、symlink ancestor no-follow 和原子回滚（Unix 33 E2E） |
 
 ## Authoring guidelines
 
