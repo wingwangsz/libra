@@ -648,17 +648,24 @@ mod tests {
         let t = turn("u1", "hi", Completeness::Complete);
 
         // Stale writer reserves at now=0 (lease expires at 60_000).
-        let stale = reserve_live_turn_claims(&conn, session, &[t.clone()], "stale-owner", 0)
-            .await
-            .expect("reserve");
+        let stale =
+            reserve_live_turn_claims(&conn, session, std::slice::from_ref(&t), "stale-owner", 0)
+                .await
+                .expect("reserve");
         assert_eq!(stale.reserved.len(), 1);
         let stale_claim = stale.reserved[0].clone();
         assert_eq!(stale_claim.fence_token, 1);
 
         // Lease expired: a new writer takes over with fence 2.
-        let fresh = reserve_live_turn_claims(&conn, session, &[t.clone()], "fresh-owner", 100_000)
-            .await
-            .expect("takeover");
+        let fresh = reserve_live_turn_claims(
+            &conn,
+            session,
+            std::slice::from_ref(&t),
+            "fresh-owner",
+            100_000,
+        )
+        .await
+        .expect("takeover");
         assert_eq!(fresh.reserved.len(), 1);
         assert_eq!(fresh.reserved[0].fence_token, 2);
 
@@ -671,6 +678,36 @@ mod tests {
         assert_eq!(state, "reserved_live");
         assert_eq!(revision, 0, "stale commit must not advance the claim");
         assert_eq!(fence, Some(2));
+        // coverage_revision_atomic_current_pointer: the failed transaction
+        // must leave NOTHING behind — no catalog row, no revision row; the
+        // claim pointer, revision history and catalog stay consistent
+        // together.
+        let count = |sql: &'static str| {
+            let conn = conn.clone();
+            async move {
+                let row = conn
+                    .query_one(Statement::from_string(
+                        conn.get_database_backend(),
+                        sql.to_string(),
+                    ))
+                    .await
+                    .expect("count query")
+                    .expect("count row");
+                let n: i64 = row.try_get_by("n").expect("count");
+                n
+            }
+        };
+        assert_eq!(
+            count("SELECT COUNT(*) AS n FROM agent_checkpoint WHERE checkpoint_id = 'cp-stale'")
+                .await,
+            0,
+            "rolled-back transaction must not leave a catalog row"
+        );
+        assert_eq!(
+            count("SELECT COUNT(*) AS n FROM agent_coverage_revision").await,
+            0,
+            "rolled-back transaction must not leave a revision row"
+        );
 
         // The fresh holder commits fine.
         commit_reserved(

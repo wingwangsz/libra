@@ -8,10 +8,13 @@
 //! idempotence the `agent_coverage_claim` gate depends on.
 //!
 //! Strictness notes:
-//! - [`CanonValue`] parsing rejects duplicate object keys and non-integer
-//!   numbers (coverage-v1.md §4.5/§4.6) instead of silently last-wins /
-//!   lossy-float behavior — different producers would otherwise disagree on
-//!   the digest for the same malformed source.
+//! - [`CanonValue`] parsing rejects duplicate object keys (coverage-v1.md
+//!   §4.6) instead of silent last-wins — different producers would otherwise
+//!   disagree on the digest for the same malformed source. Non-integer
+//!   numbers parse as [`CanonValue::Float`] so PROVENANCE fields (timestamps,
+//!   usage) never poison a turn; a float in a SEMANTIC position (tool input)
+//!   marks the turn `incomplete` and is sanitized before canonicalization
+//!   (coverage-v1.md §4.5).
 //! - Canonical bytes use minimal escaping, raw UTF-8 and recursive key
 //!   sorting by Unicode code point (coverage-v1.md §4).
 
@@ -31,6 +34,13 @@ pub enum CanonValue {
     Null,
     Bool(bool),
     Int(i64),
+    /// Fractional / beyond-i64 number, stored as raw `f64` bits. Tolerated in
+    /// PROVENANCE positions (timestamps, usage counters in the line envelope)
+    /// so a harmless non-integer field never poisons a turn; a `Float` inside
+    /// a SEMANTIC position (tool input) marks the turn `incomplete` and is
+    /// sanitized to `Null` before canonicalization (coverage-v1.md §4.5 —
+    /// non-integers never enter a digest as numbers).
+    Float(u64),
     Str(String),
     Array(Vec<CanonValue>),
     Object(BTreeMap<String, CanonValue>),
@@ -90,15 +100,13 @@ impl<'de> Deserialize<'de> for CanonValue {
             }
 
             fn visit_u64<E: de::Error>(self, v: u64) -> Result<CanonValue, E> {
-                i64::try_from(v)
+                Ok(i64::try_from(v)
                     .map(CanonValue::Int)
-                    .map_err(|_| E::custom("coverage v1 rejects integers beyond i64 range"))
+                    .unwrap_or_else(|_| CanonValue::Float((v as f64).to_bits())))
             }
 
-            fn visit_f64<E: de::Error>(self, _v: f64) -> Result<CanonValue, E> {
-                Err(E::custom(
-                    "coverage v1 rejects non-integer numbers in semantic positions",
-                ))
+            fn visit_f64<E: de::Error>(self, v: f64) -> Result<CanonValue, E> {
+                Ok(CanonValue::Float(v.to_bits()))
             }
 
             fn visit_str<E>(self, v: &str) -> Result<CanonValue, E> {
@@ -172,6 +180,11 @@ fn write_canon_value(out: &mut Vec<u8>, value: &CanonValue) {
         CanonValue::Bool(true) => out.extend_from_slice(b"true"),
         CanonValue::Bool(false) => out.extend_from_slice(b"false"),
         CanonValue::Int(n) => out.extend_from_slice(n.to_string().as_bytes()),
+        // Defensive: semantic positions are float-sanitized before
+        // canonicalization (splitter marks the turn incomplete and nulls the
+        // value); an unexpected leftover serializes as null, never as a
+        // platform-dependent decimal rendering.
+        CanonValue::Float(_) => out.extend_from_slice(b"null"),
         CanonValue::Str(s) => write_canon_string(out, s),
         CanonValue::Array(items) => {
             out.push(b'[');
@@ -321,6 +334,27 @@ pub struct NormalizedTurn {
 impl NormalizedTurn {
     pub fn digest_hex(&self) -> String {
         coverage_digest_hex(&self.records)
+    }
+}
+
+/// Does this (semantic-position) value contain any fractional number?
+fn contains_float(value: &CanonValue) -> bool {
+    match value {
+        CanonValue::Float(_) => true,
+        CanonValue::Array(items) => items.iter().any(contains_float),
+        CanonValue::Object(map) => map.values().any(contains_float),
+        _ => false,
+    }
+}
+
+/// Replace every `Float` with `Null` so canonical bytes stay well-defined
+/// (the enclosing turn is already marked `incomplete` by the caller).
+fn sanitize_floats(value: &mut CanonValue) {
+    match value {
+        CanonValue::Float(_) => *value = CanonValue::Null,
+        CanonValue::Array(items) => items.iter_mut().for_each(sanitize_floats),
+        CanonValue::Object(map) => map.values_mut().for_each(sanitize_floats),
+        _ => {}
     }
 }
 
@@ -481,7 +515,15 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
                                 .get("id")
                                 .and_then(CanonValue::as_str)
                                 .map(str::to_string);
-                            let input = block.get("input").cloned().unwrap_or(CanonValue::Null);
+                            let mut input = block.get("input").cloned().unwrap_or(CanonValue::Null);
+                            // coverage-v1.md §4.5: fractional numbers in a
+                            // SEMANTIC position never enter a digest — the
+                            // turn fails closed to `incomplete` and the value
+                            // is sanitized so canonical bytes stay defined.
+                            if contains_float(&input) {
+                                turn.completeness = Completeness::Incomplete;
+                                sanitize_floats(&mut input);
+                            }
                             turn.records.push(SemanticRecord::ToolCall {
                                 call_id,
                                 input,
@@ -510,6 +552,50 @@ pub fn normalize_claude_transcript(data: &[u8]) -> Vec<NormalizedTurn> {
         }
     }
     turns
+}
+
+/// Redact every allowlisted string field of the normalized turns IN PLACE —
+/// coverage-v1.md §1 pins the order: typed normalize → **typed-field redact**
+/// → canonicalize/digest. Digests are therefore always computed over
+/// secret-free content, and every path (live/import/export) applying the
+/// same default redactor reproduces the same digest.
+pub fn redact_turns(turns: &mut [NormalizedTurn]) {
+    let redactor = crate::internal::ai::observed_agents::Redactor::new_default();
+    let redact_string = |s: &mut String| {
+        let (bytes, _report) = redactor.redact(s.as_bytes());
+        *s = String::from_utf8_lossy(bytes.as_ref()).into_owned();
+    };
+    fn redact_value(value: &mut CanonValue, redact_string: &impl Fn(&mut String)) {
+        match value {
+            CanonValue::Str(s) => redact_string(s),
+            CanonValue::Array(items) => {
+                for item in items {
+                    redact_value(item, redact_string);
+                }
+            }
+            CanonValue::Object(map) => {
+                for item in map.values_mut() {
+                    redact_value(item, redact_string);
+                }
+            }
+            _ => {}
+        }
+    }
+    for turn in turns {
+        for record in &mut turn.records {
+            match record {
+                SemanticRecord::User { text } | SemanticRecord::Assistant { text } => {
+                    redact_string(text);
+                }
+                SemanticRecord::ToolCall { input, .. } => {
+                    redact_value(input, &redact_string);
+                }
+                SemanticRecord::ToolResult { content, .. } => {
+                    redact_string(content);
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]
@@ -589,9 +675,50 @@ mod tests {
     }
 
     #[test]
-    fn canon_parse_rejects_floats() {
-        assert!(parse_canon_value(br#"{"a":1.5}"#).is_err());
-        assert!(parse_canon_value(br#"{"a":18446744073709551615}"#).is_err());
+    fn canon_parse_tolerates_floats_as_provenance() {
+        // Floats parse (they are legal in provenance positions) …
+        let v = parse_canon_value(br#"{"a":1.5}"#).expect("floats parse");
+        assert!(contains_float(&v));
+        let big = parse_canon_value(br#"{"a":18446744073709551615}"#).expect("big ints parse");
+        assert!(contains_float(&big));
+    }
+
+    /// A fractional number in a PROVENANCE position (line envelope, e.g. a
+    /// summary timestamp) must NOT poison the turn; one in a SEMANTIC
+    /// position (tool input) fails that turn closed to `incomplete`.
+    #[test]
+    fn float_positions_provenance_tolerated_semantic_fails_closed() {
+        let transcript = [
+            r#"{"type":"summary","timestamp":1.5,"summary":"ignored"}"#,
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"},"cost":0.25}"#,
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"text","text":"hello"}]},"usage":{"cost":1.5}}"#,
+        ]
+        .join("\n");
+        let turns = normalize_claude_transcript(transcript.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Complete,
+            "provenance floats must not poison the turn"
+        );
+        // Identical semantic content → golden vector 1 digest.
+        assert_eq!(
+            turns[0].digest_hex(),
+            "df991cd9a1ac5c12c32b8cdf0254c3dfbbf26485b505a5afc83a90d1128ebc54"
+        );
+
+        let semantic_float = concat!(
+            r#"{"type":"user","uuid":"u1","message":{"role":"user","content":"hi"}}"#,
+            "\n",
+            r#"{"type":"assistant","uuid":"a1","message":{"role":"assistant","content":[{"type":"tool_use","id":"c1","name":"calc","input":{"x":1.5}}]}}"#,
+        );
+        let turns = normalize_claude_transcript(semantic_float.as_bytes());
+        assert_eq!(turns.len(), 1);
+        assert_eq!(
+            turns[0].completeness,
+            Completeness::Incomplete,
+            "semantic floats fail the turn closed"
+        );
     }
 
     #[test]

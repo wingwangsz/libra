@@ -1913,6 +1913,89 @@ pub struct TracesCommitCtx {
     pub metadata_blob_oid: String,
 }
 
+/// A catalog row reconstructed from a `refs/libra/traces` checkpoint commit
+/// (plan-20260713 DR-05c-0): the SHARED classification boundary used by
+/// doctor's class-2 repair and by claim recovery, so both apply the same
+/// fail-closed rules instead of duplicating them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuiltCatalogRow {
+    Committed {
+        checkpoint_id: String,
+        session_id: String,
+        parent_commit: Option<String>,
+        tree_oid: String,
+        metadata_blob_oid: String,
+        traces_commit: String,
+        created_at: i64,
+    },
+    Subagent {
+        checkpoint_id: String,
+        session_id: String,
+        parent_commit: Option<String>,
+        parent_checkpoint_id: Option<String>,
+        subagent_session_id: Option<String>,
+        tool_use_id: Option<String>,
+        description: Option<String>,
+        tree_oid: String,
+        metadata_blob_oid: String,
+        traces_commit: String,
+        created_at: i64,
+    },
+}
+
+/// Inputs for [`rebuild_catalog_row_from_traces_ref`] — the fields both a
+/// checkpoint commit's `metadata.json` and its ref position provide.
+#[derive(Debug, Clone, Default)]
+pub struct RebuildCatalogRowInputs {
+    pub scope: String,
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub parent_commit: Option<String>,
+    pub parent_checkpoint_id: Option<String>,
+    pub subagent_session_id: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub description: Option<String>,
+    pub tree_oid: String,
+    pub metadata_blob_oid: String,
+    pub traces_commit: String,
+    pub created_at: i64,
+}
+
+/// Classify + assemble a rebuildable catalog row from traces-ref evidence.
+/// Fail-closed: any scope other than `committed` / `subagent` is an error —
+/// the caller must route it to manual review, never guess a row shape.
+pub fn rebuild_catalog_row_from_traces_ref(
+    inputs: RebuildCatalogRowInputs,
+) -> Result<RebuiltCatalogRow> {
+    match inputs.scope.as_str() {
+        "committed" => Ok(RebuiltCatalogRow::Committed {
+            checkpoint_id: inputs.checkpoint_id,
+            session_id: inputs.session_id,
+            parent_commit: inputs.parent_commit,
+            tree_oid: inputs.tree_oid,
+            metadata_blob_oid: inputs.metadata_blob_oid,
+            traces_commit: inputs.traces_commit,
+            created_at: inputs.created_at,
+        }),
+        "subagent" => Ok(RebuiltCatalogRow::Subagent {
+            checkpoint_id: inputs.checkpoint_id,
+            session_id: inputs.session_id,
+            parent_commit: inputs.parent_commit,
+            parent_checkpoint_id: inputs.parent_checkpoint_id,
+            subagent_session_id: inputs.subagent_session_id,
+            tool_use_id: inputs.tool_use_id,
+            description: inputs.description,
+            tree_oid: inputs.tree_oid,
+            metadata_blob_oid: inputs.metadata_blob_oid,
+            traces_commit: inputs.traces_commit,
+            created_at: inputs.created_at,
+        }),
+        other => Err(anyhow!(
+            "checkpoint scope '{other}' is not auto-rebuildable (fail-closed; manual review)"
+        )),
+    }
+}
+
 /// Transactional companion writes for a traces ref update (ADR-DR-10).
 ///
 /// `apply` runs inside the SAME SQLite transaction as the successful ref
@@ -2652,6 +2735,61 @@ mod tests {
     use sea_orm::{ConnectionTrait, Database, Schema, Statement};
     use tempfile::tempdir;
     use tokio::time::sleep;
+
+    /// plan-20260713 DR-05c-0: the shared rebuild boundary classifies both
+    /// auto-rebuildable scopes and fails closed on anything else.
+    #[test]
+    fn rebuilt_catalog_row_committed_and_subagent() {
+        let base = RebuildCatalogRowInputs {
+            scope: "committed".to_string(),
+            checkpoint_id: "cp1".to_string(),
+            session_id: "s1".to_string(),
+            parent_commit: Some("p".to_string()),
+            tree_oid: "t".to_string(),
+            metadata_blob_oid: "m".to_string(),
+            traces_commit: "c".to_string(),
+            created_at: 7,
+            ..Default::default()
+        };
+        match rebuild_catalog_row_from_traces_ref(base.clone()).expect("committed rebuilds") {
+            RebuiltCatalogRow::Committed {
+                checkpoint_id,
+                session_id,
+                created_at,
+                ..
+            } => {
+                assert_eq!(checkpoint_id, "cp1");
+                assert_eq!(session_id, "s1");
+                assert_eq!(created_at, 7);
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+
+        let sub = RebuildCatalogRowInputs {
+            scope: "subagent".to_string(),
+            parent_checkpoint_id: Some("parent-cp".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            ..base.clone()
+        };
+        match rebuild_catalog_row_from_traces_ref(sub).expect("subagent rebuilds") {
+            RebuiltCatalogRow::Subagent {
+                parent_checkpoint_id,
+                tool_use_id,
+                ..
+            } => {
+                assert_eq!(parent_checkpoint_id.as_deref(), Some("parent-cp"));
+                assert_eq!(tool_use_id.as_deref(), Some("tool-1"));
+            }
+            other => panic!("expected Subagent, got {other:?}"),
+        }
+
+        // Fail-closed: unknown scopes are an error, never a guessed shape.
+        let weird = RebuildCatalogRowInputs {
+            scope: "temporary".to_string(),
+            ..base
+        };
+        assert!(rebuild_catalog_row_from_traces_ref(weird).is_err());
+    }
 
     use super::*;
     use crate::{internal::db, utils::storage::local::LocalStorage};
