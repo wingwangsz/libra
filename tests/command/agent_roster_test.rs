@@ -62,8 +62,8 @@ fn agent_list_add_remove_aliases_parse() {
 }
 
 /// The `list --json` payload carries the frozen AG-17 row shape and the E9
-/// roster: exactly 7 registered agents, supported = first-batch trio, and
-/// the codex row pinned to transcript-readable-only.
+/// roster: exactly the 3 supported agents (the first-batch trio), and the
+/// codex row exposing its landed hook-installable capability.
 #[test]
 fn agent_list_json_contains_capability_fields() {
     let temp = tempdir().expect("tempdir");
@@ -80,7 +80,11 @@ fn agent_list_json_contains_capability_fields() {
     assert_eq!(data["schema_version"], 1);
 
     let agents = data["agents"].as_array().expect("agents array");
-    assert_eq!(agents.len(), 7, "one row per AgentKind");
+    assert_eq!(
+        agents.len(),
+        3,
+        "listing surfaces only the supported roster"
+    );
 
     let supported: Vec<&str> = agents
         .iter()
@@ -140,21 +144,24 @@ fn agent_list_json_contains_capability_fields() {
     assert_eq!(codex["installed"], false);
     assert_eq!(codex["capabilities"]["hooks"], true);
 
-    let gemini = agents
-        .iter()
-        .find(|row| row["slug"] == "gemini")
-        .expect("gemini row");
-    assert_eq!(gemini["supported"], false);
-    assert_eq!(gemini["hook_installable"], false);
-    assert_eq!(gemini["installed"], false);
+    // The unsupported agents are omitted from the listing entirely — only the
+    // supported roster is shown. Their unsupported registry classification is
+    // pinned separately against the static registry by
+    // tests/compat/agent_capability_matrix_pin.rs.
+    for slug in ["gemini", "cursor", "copilot", "factory-ai"] {
+        assert!(
+            !agents.iter().any(|row| row["slug"] == slug),
+            "{slug} must not appear in the supported-only listing"
+        );
+    }
 }
 
 /// The `list --json` roster surface pins the A0-11 deferred-parity decision:
-/// exactly the first-batch trio is supported/launchable, and every
-/// non-first-batch agent (`gemini`/`cursor`/`copilot`/`factory-ai`) stays a
-/// fully-closed row — `supported`/`hook_installable`/`launchable_review`/
-/// `launchable_investigate`/`capabilities.hooks` all `false`. Keeps the docs'
-/// "deferred parity" roster claim honest against the registry.
+/// the listing surfaces exactly the first-batch trio (all supported), and
+/// every non-first-batch agent (`gemini`/`cursor`/`copilot`/`factory-ai`) is
+/// omitted from the listing entirely. Their fully-closed unsupported
+/// classification stays pinned against the static registry by
+/// `tests/compat/agent_capability_matrix_pin.rs`.
 #[test]
 fn agent_roster_surface() {
     let temp = tempdir().expect("tempdir");
@@ -170,44 +177,35 @@ fn agent_roster_surface() {
         .expect("agents array")
         .clone();
 
-    // Supported roster is exactly the first batch — nothing more, nothing less.
-    let supported: Vec<&str> = agents
+    // The listing surfaces exactly the first-batch trio, in registration
+    // order — nothing more, nothing less.
+    let slugs: Vec<&str> = agents
         .iter()
-        .filter(|row| row["supported"] == true)
         .map(|row| row["slug"].as_str().unwrap())
         .collect();
     assert_eq!(
-        supported,
+        slugs,
         ["claude-code", "codex", "opencode"],
-        "supported roster must be the first-batch trio"
+        "listing must surface exactly the first-batch trio"
     );
 
-    // Every deferred-parity agent is a fully-closed row.
+    // Every listed row is supported (the unsupported agents are omitted).
+    for row in &agents {
+        assert_eq!(
+            row["supported"], true,
+            "{} listed but not supported",
+            row["slug"]
+        );
+    }
+
+    // Every deferred-parity agent is omitted from the listing entirely. Their
+    // fully-closed unsupported classification (supported/hook_installable/
+    // launchable_*/capabilities.hooks all false) stays pinned against the
+    // static registry by tests/compat/agent_capability_matrix_pin.rs.
     for slug in ["gemini", "cursor", "copilot", "factory-ai"] {
-        let row = agents
-            .iter()
-            .find(|row| row["slug"] == slug)
-            .unwrap_or_else(|| panic!("registry must list {slug}"));
-        assert_eq!(row["supported"], false, "{slug} must stay unsupported");
-        assert_eq!(
-            row["hook_installable"], false,
-            "{slug} must not be hook-installable"
-        );
-        assert_eq!(
-            row["launchable_review"], false,
-            "{slug} must not be launchable for review"
-        );
-        assert_eq!(
-            row["launchable_investigate"], false,
-            "{slug} must not be launchable for investigate"
-        );
-        assert_eq!(
-            row["capabilities"]["hooks"], false,
-            "{slug} must not advertise the hooks capability"
-        );
         assert!(
-            row["support_wave"].is_null(),
-            "{slug} carries no support wave"
+            !agents.iter().any(|row| row["slug"] == slug),
+            "{slug} must not appear in the supported-only listing"
         );
     }
 }
