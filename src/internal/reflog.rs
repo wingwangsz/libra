@@ -306,6 +306,23 @@ impl Reflog {
         .await?)
     }
 
+    /// Return the newest checkout/switch movement from the current worktree's
+    /// HEAD reflog without loading the complete reflog into memory.
+    pub async fn find_latest_navigation<C: ConnectionTrait>(
+        db: &C,
+    ) -> Result<Option<Model>, ReflogError> {
+        Ok(Self::scope_head(
+            reflog::Entity::find()
+                .filter(reflog::Column::RefName.eq(HEAD))
+                .filter(reflog::Column::Action.is_in(["switch", "checkout"])),
+            HEAD,
+        )
+        .order_by_desc(reflog::Column::Timestamp)
+        .order_by_desc(reflog::Column::Id)
+        .one(db)
+        .await?)
+    }
+
     /// lore.md 2.1: scope a HEAD-reflog query to the current worktree (branch
     /// reflogs are shared, unscoped).
     fn scope_head(

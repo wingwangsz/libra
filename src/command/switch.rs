@@ -1,5 +1,7 @@
 //! Switch command to change branches safely, validating clean state, handling creation, and delegating checkout behavior to restore logic.
 
+use std::str::FromStr;
+
 use clap::Parser;
 use git_internal::{
     hash::{ObjectHash, get_hash_kind},
@@ -20,7 +22,7 @@ use crate::{
         config::ConfigKv,
         db::get_db_conn_instance,
         head::Head,
-        reflog::{ReflogAction, ReflogContext, with_reflog},
+        reflog::{Reflog, ReflogAction, ReflogContext, with_reflog},
         repo_hooks::{RepoHook, run_advisory_repo_hook},
     },
     utils::{
@@ -41,6 +43,7 @@ fn is_internal_switch_target(name: &str) -> bool {
 const SWITCH_EXAMPLES: &str = "\
 EXAMPLES:
     libra switch main                      Switch to an existing branch
+    libra switch -                         Return to the previous checkout target
     libra switch -c feature-x              Create and switch to a new branch
     libra switch -c fix-123 abc1234        Create branch from specific commit
     libra switch --detach v1.0             Detach HEAD at a tag
@@ -52,7 +55,7 @@ EXAMPLES:
 #[derive(Parser, Debug)]
 #[command(after_help = SWITCH_EXAMPLES)]
 pub struct SwitchArgs {
-    /// Target branch, commit, or remote-tracking ref to switch to (e.g. `main`, `abc1234`, `origin/main`)
+    /// Target branch, commit, or remote-tracking ref; use `-` for the previous checkout target
     pub branch: Option<String>,
 
     /// Create a new branch based on the given branch or current HEAD, and switch to it
@@ -359,6 +362,114 @@ async fn validate_new_branch_request(
 struct ResolvedSwitchBranch {
     name: String,
     commit: ObjectHash,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum PreviousCheckoutTarget {
+    Branch { name: String, commit: ObjectHash },
+    Detached { commit: ObjectHash },
+}
+
+fn previous_checkout_source(message: &str) -> Option<(&str, &str)> {
+    let movement = message.strip_prefix("moving from ")?;
+    let (from, to) = movement.rsplit_once(" to ")?;
+    if from.is_empty() || to.is_empty() {
+        return None;
+    }
+    Some((from, to))
+}
+
+fn detached_source_matches_old_oid(source: &str, old_oid: &str) -> bool {
+    source.len() >= 4
+        && source.len() <= old_oid.len()
+        && source.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && old_oid.starts_with(source)
+}
+
+fn previous_checkout_unavailable_error() -> SwitchError {
+    SwitchError::DelegatedCli(
+        CliError::fatal("no previous checkout target is available")
+            .with_stable_code(StableErrorCode::CliInvalidTarget)
+            .with_hint("switch to another branch or commit first."),
+    )
+}
+
+fn previous_checkout_read_error(detail: impl Into<String>) -> SwitchError {
+    SwitchError::DelegatedCli(
+        CliError::fatal(format!(
+            "failed to read the current worktree HEAD reflog: {}",
+            detail.into()
+        ))
+        .with_stable_code(StableErrorCode::IoReadFailed)
+        .with_hint("check .libra/libra.db permissions and retry."),
+    )
+}
+
+fn previous_checkout_invalid_error(detail: impl Into<String>) -> SwitchError {
+    SwitchError::DelegatedCli(
+        CliError::fatal(format!(
+            "the current worktree HEAD navigation record is invalid: {}",
+            detail.into()
+        ))
+        .with_stable_code(StableErrorCode::RepoCorrupt)
+        .with_hint(
+            "inspect 'libra reflog show HEAD' and remove or repair the corrupt newest navigation entry.",
+        ),
+    )
+}
+
+/// Resolve `-` from the current worktree's HEAD reflog without changing any
+/// repository state. Branch sources follow the branch's current tip; detached
+/// sources use the full old OID stored in the reflog instead of its abbreviated
+/// display value.
+pub(crate) async fn resolve_previous_checkout_target() -> Result<PreviousCheckoutTarget, SwitchError>
+{
+    let db = get_db_conn_instance().await;
+    let entry = Reflog::find_latest_navigation(&db)
+        .await
+        .map_err(|error| previous_checkout_read_error(error.to_string()))?
+        .ok_or_else(previous_checkout_unavailable_error)?;
+    let (source, _) = previous_checkout_source(&entry.message).ok_or_else(|| {
+        previous_checkout_invalid_error(format!(
+            "{} entry {} has a malformed movement message",
+            entry.action, entry.id
+        ))
+    })?;
+
+    if let Some(branch) = Branch::find_branch_result_with_conn(&db, source, None)
+        .await
+        .map_err(map_branch_store_error)?
+    {
+        if is_internal_switch_target(&branch.name) {
+            return Err(SwitchError::InternalBranchBlocked(branch.name));
+        }
+        return Ok(PreviousCheckoutTarget::Branch {
+            name: branch.name,
+            commit: branch.commit,
+        });
+    }
+
+    if detached_source_matches_old_oid(source, &entry.old_oid) {
+        let commit = ObjectHash::from_str(&entry.old_oid).map_err(|error| {
+            previous_checkout_invalid_error(format!(
+                "entry {} has an invalid old object ID: {error}",
+                entry.id
+            ))
+        })?;
+        load_object::<git_internal::internal::object::commit::Commit>(&commit).map_err(
+            |error| {
+                previous_checkout_invalid_error(format!(
+                    "entry {} points to an unreadable commit {commit}: {error}",
+                    entry.id
+                ))
+            },
+        )?;
+        return Ok(PreviousCheckoutTarget::Detached { commit });
+    }
+
+    // The latest navigation record is authoritative. If its source branch was
+    // deleted, do not silently fall through to an older movement.
+    Err(previous_checkout_unavailable_error())
 }
 
 #[derive(Debug, Clone)]
@@ -762,7 +873,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
         guess,
         no_guess,
     } = args;
-    let (previous_branch, previous_commit) = current_switch_state().await;
+    let (previous_branch, previous_commit) = current_switch_state().await?;
 
     if track {
         let target = branch.ok_or(SwitchError::MissingTrackTarget)?;
@@ -865,15 +976,31 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
                     )),
             ));
         }
-        return switch_to_orphan_branch(new_branch_name, previous_branch, previous_commit, output)
-            .await;
+        return switch_to_orphan_branch(
+            new_branch_name,
+            previous_branch,
+            previous_commit,
+            NavigationCommand::Switch,
+            output,
+        )
+        .await;
     }
+
+    let previous_target = if branch.as_deref() == Some("-") {
+        Some(resolve_previous_checkout_target().await?)
+    } else {
+        None
+    };
 
     if detach {
         let target = branch.ok_or(SwitchError::MissingDetachTarget)?;
-        let commit_base = get_commit_base(&target)
-            .await
-            .map_err(|e| SwitchError::CommitResolve(e.to_string()))?;
+        let commit_base = match previous_target {
+            Some(PreviousCheckoutTarget::Branch { commit, .. })
+            | Some(PreviousCheckoutTarget::Detached { commit }) => commit,
+            None => get_commit_base(&target)
+                .await
+                .map_err(|e| SwitchError::CommitResolve(e.to_string()))?,
+        };
         ensure_switch_clean_or_force(force, commit_base, output).await?;
 
         let commit = switch_to_commit(commit_base, output).await?;
@@ -891,13 +1018,34 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
     }
 
     let branch = branch.ok_or(SwitchError::MissingBranchName)?;
-    match resolve_switch_branch_target(&branch, guess, no_guess).await? {
+    let target = match previous_target {
+        Some(PreviousCheckoutTarget::Branch { name, commit }) => {
+            SwitchTarget::Local(ResolvedSwitchBranch { name, commit })
+        }
+        Some(PreviousCheckoutTarget::Detached { commit }) => {
+            ensure_switch_clean_or_force(force, commit, output).await?;
+            let commit = switch_to_commit(commit, output).await?;
+            return Ok(SwitchOutput {
+                previous_branch,
+                previous_commit,
+                branch: None,
+                commit: commit.to_string(),
+                created: false,
+                detached: true,
+                unborn: false,
+                already_on: false,
+                tracking: None,
+            });
+        }
+        None => resolve_switch_branch_target(&branch, guess, no_guess).await?,
+    };
+    match target {
         SwitchTarget::Local(target_branch) => {
-            if previous_branch.as_deref() == Some(&branch) {
+            if previous_branch.as_deref() == Some(target_branch.name.as_str()) {
                 return Ok(SwitchOutput {
                     previous_branch,
                     previous_commit: previous_commit.clone(),
-                    branch: Some(branch),
+                    branch: Some(target_branch.name),
                     commit: target_branch.commit.to_string(),
                     created: false,
                     detached: false,
@@ -909,6 +1057,7 @@ async fn run_switch(args: SwitchArgs, output: &OutputConfig) -> Result<SwitchOut
 
             ensure_switch_clean_or_force(force, target_branch.commit, output).await?;
 
+            let branch = target_branch.name.clone();
             let commit = switch_to_resolved_branch(target_branch, output).await?;
             Ok(SwitchOutput {
                 previous_branch,
@@ -1047,6 +1196,7 @@ pub(crate) async fn switch_to_orphan_branch(
     new_branch_name: String,
     previous_branch: Option<String>,
     previous_commit: Option<String>,
+    navigation_command: NavigationCommand,
     output: &OutputConfig,
 ) -> Result<SwitchOutput, SwitchError> {
     validate_new_branch_request(&new_branch_name, None, false).await?;
@@ -1069,7 +1219,7 @@ pub(crate) async fn switch_to_orphan_branch(
         ));
     }
     ensure_clean_status(output).await?;
-    switch_head_to_unborn_branch(&new_branch_name).await?;
+    switch_head_to_unborn_branch(&new_branch_name, navigation_command).await?;
 
     Ok(SwitchOutput {
         previous_branch,
@@ -1084,25 +1234,51 @@ pub(crate) async fn switch_to_orphan_branch(
     })
 }
 
-async fn switch_head_to_unborn_branch(branch_name: &str) -> Result<(), SwitchError> {
-    let db = get_db_conn_instance().await;
-    let old_oid = Head::current_commit_result_with_conn(&db)
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum NavigationCommand {
+    Switch,
+    Checkout,
+}
+
+fn navigation_reflog_action(command: NavigationCommand, from: String, to: String) -> ReflogAction {
+    match command {
+        NavigationCommand::Switch => ReflogAction::Switch { from, to },
+        NavigationCommand::Checkout => ReflogAction::Checkout { from, to },
+    }
+}
+
+fn short_object_id(hash: ObjectHash) -> String {
+    hash.to_string().chars().take(7).collect()
+}
+
+async fn current_navigation_state<C>(db: &C) -> Result<(String, String), SwitchError>
+where
+    C: sea_orm::ConnectionTrait,
+{
+    let old_oid = Head::current_commit_result_with_conn(db)
         .await
         .map_err(map_branch_store_error)?
         .map(|oid| oid.to_string())
         .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
-    let from_ref_name = match Head::current_result_with_conn(&db)
+    let from = match Head::current_result_with_conn(db)
         .await
         .map_err(map_branch_store_error)?
     {
         Head::Branch(name) => name,
-        Head::Detached(hash) => hash.to_string()[..7].to_string(),
+        Head::Detached(hash) => short_object_id(hash),
     };
+    Ok((old_oid, from))
+}
 
-    let action = ReflogAction::Switch {
-        from: from_ref_name,
-        to: branch_name.to_string(),
-    };
+async fn switch_head_to_unborn_branch(
+    branch_name: &str,
+    navigation_command: NavigationCommand,
+) -> Result<(), SwitchError> {
+    let db = get_db_conn_instance().await;
+    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
+
+    let action =
+        navigation_reflog_action(navigation_command, from_ref_name, branch_name.to_string());
     let context = ReflogContext {
         old_oid,
         new_oid: ObjectHash::zero_str(get_hash_kind()).to_string(),
@@ -1131,18 +1307,23 @@ async fn switch_to_commit(
     commit_hash: ObjectHash,
     output: &OutputConfig,
 ) -> Result<ObjectHash, SwitchError> {
+    move_to_commit(commit_hash, NavigationCommand::Switch, output).await
+}
+
+pub(crate) async fn checkout_to_commit(
+    commit_hash: ObjectHash,
+    output: &OutputConfig,
+) -> Result<ObjectHash, SwitchError> {
+    move_to_commit(commit_hash, NavigationCommand::Checkout, output).await
+}
+
+async fn move_to_commit(
+    commit_hash: ObjectHash,
+    navigation_command: NavigationCommand,
+    output: &OutputConfig,
+) -> Result<ObjectHash, SwitchError> {
     let db = get_db_conn_instance().await;
-
-    let old_oid = Head::current_commit_result_with_conn(&db)
-        .await
-        .map_err(map_branch_store_error)?
-        .map(|oid| oid.to_string())
-        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
-
-    let from_ref_name = match Head::current_with_conn(&db).await {
-        Head::Branch(name) => name,
-        Head::Detached(hash) => hash.to_string()[..7].to_string(), // Use short hash for detached HEAD
-    };
+    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
 
     // Case-collision preflight BEFORE any mutation — refusing after the
     // HEAD update would strand HEAD on the target with an unrestored tree.
@@ -1150,10 +1331,11 @@ async fn switch_to_commit(
         .await
         .map_err(SwitchError::CaseCollision)?;
 
-    let action = ReflogAction::Switch {
-        from: from_ref_name,
-        to: commit_hash.to_string()[..7].to_string(), // Use short hash for target commit
-    };
+    let action = navigation_reflog_action(
+        navigation_command,
+        from_ref_name,
+        short_object_id(commit_hash),
+    );
     let context = ReflogContext {
         old_oid,
         new_oid: commit_hash.to_string(),
@@ -1165,8 +1347,9 @@ async fn switch_to_commit(
         move |txn: &sea_orm::DatabaseTransaction| {
             Box::pin(async move {
                 let new_head = Head::Detached(commit_hash);
-                Head::update_with_conn(txn, new_head, None).await;
-                Ok(())
+                Head::update_result_with_conn(txn, new_head, None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
             })
         },
         false,
@@ -1185,22 +1368,39 @@ async fn switch_to_resolved_branch(
     target_branch: ResolvedSwitchBranch,
     output: &OutputConfig,
 ) -> Result<ObjectHash, SwitchError> {
+    move_to_resolved_branch(target_branch, NavigationCommand::Switch, output, false).await
+}
+
+pub(crate) async fn checkout_to_branch(
+    branch_name: String,
+    target_commit_id: ObjectHash,
+    output: &OutputConfig,
+    ignore_other_worktrees: bool,
+) -> Result<ObjectHash, SwitchError> {
+    move_to_resolved_branch(
+        ResolvedSwitchBranch {
+            name: branch_name,
+            commit: target_commit_id,
+        },
+        NavigationCommand::Checkout,
+        output,
+        ignore_other_worktrees,
+    )
+    .await
+}
+
+async fn move_to_resolved_branch(
+    target_branch: ResolvedSwitchBranch,
+    navigation_command: NavigationCommand,
+    output: &OutputConfig,
+    ignore_other_worktrees: bool,
+) -> Result<ObjectHash, SwitchError> {
     let ResolvedSwitchBranch {
         name: branch_name,
         commit: target_commit_id,
     } = target_branch;
     let db = get_db_conn_instance().await;
-
-    let old_oid = Head::current_commit_result_with_conn(&db)
-        .await
-        .map_err(map_branch_store_error)?
-        .map(|oid| oid.to_string())
-        .unwrap_or_else(|| ObjectHash::zero_str(get_hash_kind()).to_string());
-
-    let from_ref_name = match Head::current_with_conn(&db).await {
-        Head::Branch(name) => name,
-        Head::Detached(hash) => hash.to_string()[..7].to_string(),
-    };
+    let (old_oid, from_ref_name) = current_navigation_state(&db).await?;
 
     if from_ref_name == branch_name {
         // No-op: already on the target branch. The "Already on" message is
@@ -1212,7 +1412,9 @@ async fn switch_to_resolved_branch(
     // lore.md 2.1: branches are SHARED across worktrees, so refuse switching to
     // a branch already checked out in another worktree (both would move the
     // same pointer). git parity — detach instead to share the tip read-only.
-    if let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await {
+    if !ignore_other_worktrees
+        && let Some(other) = Head::branch_checked_out_elsewhere(&branch_name).await
+    {
         return Err(SwitchError::WorktreeConflict(
             CliError::fatal(format!(
                 "branch '{branch_name}' is already checked out at worktree '{other}'"
@@ -1222,10 +1424,7 @@ async fn switch_to_resolved_branch(
         ));
     }
 
-    let action = ReflogAction::Switch {
-        from: from_ref_name,
-        to: branch_name.clone(),
-    };
+    let action = navigation_reflog_action(navigation_command, from_ref_name, branch_name.clone());
     // Case-collision preflight BEFORE any mutation (see the detached flow).
     guard_target_tree_case(&target_commit_id)
         .await
@@ -1242,8 +1441,9 @@ async fn switch_to_resolved_branch(
         move |txn: &sea_orm::DatabaseTransaction| {
             Box::pin(async move {
                 let new_head = Head::Branch(branch_name.clone());
-                Head::update_with_conn(txn, new_head, None).await;
-                Ok(())
+                Head::update_result_with_conn(txn, new_head, None)
+                    .await
+                    .map_err(|error| sea_orm::DbErr::Custom(error.to_string()))
             })
         },
         false,
@@ -1340,19 +1540,19 @@ fn render_switch_output(result: &SwitchOutput, output: &OutputConfig) -> CliResu
     Ok(())
 }
 
-async fn current_switch_state() -> (Option<String>, Option<String>) {
-    let branch = match Head::current().await {
+async fn current_switch_state() -> Result<(Option<String>, Option<String>), SwitchError> {
+    let branch = match Head::current_result()
+        .await
+        .map_err(map_branch_store_error)?
+    {
         Head::Branch(name) => Some(name),
         Head::Detached(_) => None,
     };
-    let commit = match Head::current_commit_result().await {
-        Ok(commit) => commit.map(|hash| hash.to_string()),
-        Err(error) => {
-            tracing::error!("failed to resolve current switch state: {error}");
-            None
-        }
-    };
-    (branch, commit)
+    let commit = Head::current_commit_result()
+        .await
+        .map_err(map_branch_store_error)?
+        .map(|hash| hash.to_string());
+    Ok((branch, commit))
 }
 
 #[cfg(test)]
@@ -1437,6 +1637,55 @@ mod tests {
             SwitchError::UntrackedOverwrite("scratch.txt".to_string()).to_string(),
             "untracked working tree file would be overwritten by switch: scratch.txt",
         );
+    }
+
+    #[test]
+    fn previous_checkout_errors_pin_messages_and_codes() {
+        let unavailable = CliError::from(previous_checkout_unavailable_error());
+        assert_eq!(
+            unavailable.message(),
+            "no previous checkout target is available"
+        );
+        assert_eq!(unavailable.stable_code(), StableErrorCode::CliInvalidTarget);
+
+        let read = CliError::from(previous_checkout_read_error("database is locked"));
+        assert_eq!(
+            read.message(),
+            "failed to read the current worktree HEAD reflog: database is locked"
+        );
+        assert_eq!(read.stable_code(), StableErrorCode::IoReadFailed);
+
+        let invalid = CliError::from(previous_checkout_invalid_error("malformed movement"));
+        assert_eq!(
+            invalid.message(),
+            "the current worktree HEAD navigation record is invalid: malformed movement"
+        );
+        assert_eq!(invalid.stable_code(), StableErrorCode::RepoCorrupt);
+    }
+
+    #[test]
+    fn previous_checkout_message_parser_is_strict() {
+        assert_eq!(
+            previous_checkout_source("moving from main to topic"),
+            Some(("main", "topic")),
+        );
+        assert_eq!(
+            previous_checkout_source("moving from 0123456 to main"),
+            Some(("0123456", "main")),
+        );
+        assert_eq!(previous_checkout_source("moving from main"), None);
+        assert_eq!(previous_checkout_source("moving from  to topic"), None);
+        assert_eq!(previous_checkout_source("moving from main to "), None);
+        assert_eq!(
+            previous_checkout_source("commit: moving from main to topic"),
+            None
+        );
+
+        let oid = "0123456789abcdef0123456789abcdef01234567";
+        assert!(detached_source_matches_old_oid("0123456", oid));
+        assert!(detached_source_matches_old_oid(oid, oid));
+        assert!(!detached_source_matches_old_oid("012345g", oid));
+        assert!(!detached_source_matches_old_oid("0123", "fedcba9876543210"));
     }
 
     #[test]

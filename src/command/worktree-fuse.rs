@@ -55,6 +55,7 @@ pub struct WorktreeArgs {
 #[derive(Subcommand, Debug)]
 pub enum WorktreeSubcommand {
     Add {
+        /// Filesystem path at which to create the new worktree.
         path: String,
         #[clap(short = 'f', long, help = "Use FUSE overlay worktree mode (Unix only)")]
         fuse: bool,
@@ -84,25 +85,32 @@ pub enum WorktreeSubcommand {
         porcelain: bool,
     },
     Lock {
+        /// Filesystem path of the worktree to lock.
         path: String,
+        /// Optional explanation shown in `worktree list` while the worktree is locked.
         #[clap(long)]
         reason: Option<String>,
     },
     Unlock {
+        /// Filesystem path of the worktree to unlock.
         path: String,
     },
     Move {
+        /// Current filesystem path of the worktree.
         src: String,
+        /// New filesystem path for the worktree.
         dest: String,
     },
     Prune,
     Remove {
+        /// Filesystem path of the worktree to unregister.
         path: String,
         #[clap(long, help = "Also delete the worktree directory on disk")]
         delete_dir: bool,
     },
     #[clap(alias = "unmount", about = "Unmount a FUSE worktree mountpoint")]
     Umount {
+        /// Filesystem path of the FUSE mountpoint or its task worktree root.
         path: String,
         #[clap(
             long,

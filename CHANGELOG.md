@@ -4,6 +4,15 @@
 
 ### Added
 
+- **Previous checkout target shortcut (v0.18.83)**: adds worktree-scoped
+  `libra switch -` and `libra checkout -` toggling across local branches and
+  detached commits. Both commands share HEAD reflog history and record their
+  own navigation actions; missing history, deleted source branches, corrupt
+  records, and storage failures are rejected before HEAD, index, or worktree
+  mutation. English/Chinese user and developer docs plus a nine-case
+  compatibility target cover same-command, cross-command, detached, JSON, and
+  fail-closed behavior.
+
 - **Import/export fidelity (v0.18.82)**: expands `fast-export` with multiple
   revisions, incremental ranges, `--all`, annotated tags, notes, and Git path
   quoting; expands `fast-import` with inline blobs, copy/rename, annotated tags,

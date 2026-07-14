@@ -8,6 +8,7 @@
 
 ```
 libra switch <branch>
+libra switch -
 libra switch -c <name> [<start-point>]
 libra switch -C <name> [<start-point>]
 libra switch --orphan <name>
@@ -20,7 +21,9 @@ libra switch [--guess | --no-guess] <branch>
 
 `libra switch` 是更改分支的主要命令。它会在切换前验证工作树干净，更新 HEAD 和索引，并恢复工作树以匹配目标提交。与作为 Git 兼容表面存在的 `libra checkout` 不同，`switch` 是分支操作的推荐命令。
 
-该命令支持多种模式：切换到已有本地分支（默认）、用 `-c` 创建新分支、用 `-C` 强制创建或重置分支、用 `--orphan` 创建 unborn 无父提交分支、用 `-d` detach HEAD，以及用 `--track` 跟踪远程分支。当目标分支已经是当前分支时，该命令是 no-op，并完全跳过干净性检查。
+该命令支持多种模式：切换到已有本地分支（默认）、用 `-` 返回上一个 checkout 目标、用 `-c` 创建新分支、用 `-C` 强制创建或重置分支、用 `--orphan` 创建 unborn 无父提交分支、用 `-d` detach HEAD，以及用 `--track` 跟踪远程分支。当目标分支已经是当前分支时，该命令是 no-op，并完全跳过干净性检查。
+
+`libra switch -` 会从当前 worktree 的 HEAD reflog 中选择最近一次 `switch` 或 `checkout` 移动的来源。若来源是本地分支，则跟随该分支当前 tip；若来源是 detached HEAD，则使用 reflog 保存的完整 object ID。每次成功移动都会写入新记录，因此重复执行 `switch -` 会在两个目标间来回切换。如果没有导航记录、记录的分支已删除，或最新记录损坏，Libra 会在修改 HEAD、索引或工作树前 fail-closed。
 
 当找不到分支时，会通过 Levenshtein 距离提供模糊分支名建议，帮助捕获拼写错误，而无需精确匹配。
 
@@ -32,7 +35,7 @@ libra switch [--guess | --no-guess] <branch>
 
 | 标志 | 长选项 | 值 | 说明 |
 |------|------|-------|-------------|
-| | `<branch>` | 位置参数（可选） | 要切换到的本地分支；与 `--detach` 搭配时也可为提交、标签或分支 |
+| | `<branch>` | 位置参数（可选） | 要切换到的本地分支、表示上一 checkout 目标的 `-`；与 `--detach` 搭配时也可为提交、标签或分支 |
 | `-c` | `--create` | `<name>` | 创建新分支并切换到它 |
 | `-C` | `--force-create` | `<name>` | 创建新分支或重置已有分支并切换到它 |
 | | `--orphan` | `<name>` | 创建 unborn 无父提交分支并切换到它 |
@@ -74,6 +77,14 @@ libra switch --detach v1.0             # 在标签处 detach
 libra switch --detach abc1234          # 在提交处 detach
 ```
 
+**`-`**：返回最近一条 HEAD 导航记录中的上一分支或 detached commit。该快捷方式与 `checkout -` 共享历史，因此任一命令都能切回另一个命令刚离开的目标。
+
+```bash
+libra switch topic
+libra switch -                         # 返回之前的分支
+libra switch -                         # 再返回 topic
+```
+
 **`--track`**：查找远程跟踪引用，创建同名本地分支，设置 upstream tracking，并切换到它。与 `--create` 和 `--detach` 冲突。
 
 ```bash
@@ -92,6 +103,7 @@ libra switch --no-guess feature        # 禁止远程分支猜测
 
 ```bash
 libra switch main                      # 切换到已有分支
+libra switch -                         # 返回上一个 checkout 目标
 libra switch -c feature-x              # 创建并切换到新分支
 libra switch -c fix-123 abc1234        # 从特定提交创建分支
 libra switch -C feature-x              # 重置分支到 HEAD 并切换
@@ -276,6 +288,7 @@ Git 的 `checkout` 被过度重载：它切换分支、恢复文件、detach HEA
 | 功能 | Git | Libra | jj |
 |---------|-----|-------|----|
 | 切换分支 | `git switch main` | `libra switch main` | `jj edit <rev>` |
+| 上一个 checkout 目标 | `git switch -` | `libra switch -` | N/A |
 | 创建并切换 | `git switch -c feature` | `libra switch -c feature` | `jj new -m "feature"` + `jj branch create feature` |
 | 从提交创建 | `git switch -c fix abc1234` | `libra switch -c fix abc1234` | `jj new abc1234` + `jj branch create fix` |
 | Detach HEAD | `git switch --detach v1.0` | `libra switch --detach v1.0` | `jj edit <rev>`（始终类似 detached） |
@@ -296,6 +309,9 @@ Git 的 `checkout` 被过度重载：它切换分支、恢复文件、detach HEA
 | 缺少 detach 目标 | `LBR-CLI-002` | 129 | "provide a commit, tag, or branch to detach at." |
 | 缺少分支名 | `LBR-CLI-002` | 129 | "provide a branch name." |
 | 找不到分支 | `LBR-CLI-003` | 129 | "create it with 'libra switch -c {name}'." + 模糊建议 |
+| 没有可解析的上一 checkout 目标 | `LBR-CLI-003` | 129 | "switch to another branch or commit first." |
+| 读取上一 checkout reflog 失败 | `LBR-IO-001` | 128 | 检查 `.libra/libra.db` 权限后重试。 |
+| 上一 checkout 记录损坏或目标 commit 不可读 | `LBR-REPO-002` | 128 | 用 `libra reflog show HEAD` 检查，并删除或修复最新损坏的导航记录。 |
 | 得到远程分支 | `LBR-CLI-003` | 129 | "use 'libra switch --track ...' to create a local tracking branch." |
 | 找不到远程分支 | `LBR-CLI-003` | 129 | "Run 'libra fetch {remote}' to update remote-tracking branches." |
 | 无效远程分支 | `LBR-CLI-003` | 129 | "expected format: 'remote/branch'." |
