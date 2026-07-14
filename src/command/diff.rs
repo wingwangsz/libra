@@ -9,6 +9,7 @@ use std::{
     collections::{HashMap, HashSet, VecDeque},
     fmt::Write as _,
     io::{self, IsTerminal},
+    ops::Range,
     path::{Path, PathBuf},
     rc::Rc,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -21,7 +22,13 @@ use git_internal::{
     hash::ObjectHash,
     internal::{
         index::{Index, IndexEntry, Time},
-        object::{ObjectTrait, blob::Blob, commit::Commit, tree::Tree, types::ObjectType},
+        object::{
+            ObjectTrait,
+            blob::Blob,
+            commit::Commit,
+            tree::{Tree, TreeItemMode},
+            types::ObjectType,
+        },
         pack::utils::calculate_object_hash,
     },
 };
@@ -43,7 +50,6 @@ use crate::{
         client_storage::ClientStorage,
         error::{CliError, CliResult, StableErrorCode},
         ignore::{self, IgnorePolicy},
-        object_ext::TreeExt,
         output::{ColorChoice, OutputConfig, ProgressMode, emit_json_data},
         pager::Pager,
         path,
@@ -61,8 +67,17 @@ EXAMPLES:
     libra diff main...feature               Diff from merge-base(main,feature) to feature
     libra diff HEAD -- src/                 '--' separates revisions from paths
     libra diff --stat src/                  Show diff statistics under src/
+    libra diff --raw -z                     NUL-safe object/mode records for scripts
+    libra diff --diff-filter=AM --name-only Show only added/modified paths
+    libra diff -S'old_api' --name-only      Find files changing a string's occurrence count
+    libra diff -G'unsafe\\('                 Find files with matching added/removed lines
     libra diff --shortstat                  Show just the files-changed/insertions/deletions line
+    libra diff --full-index                 Show full object ids in patch index headers
     libra diff --word-diff                   Word-level diff ([-removed-]{+added+} inline)
+    libra diff --word-diff-regex='[A-Za-z]+' Compare custom regex-defined words
+    libra diff --color-words                 Word-level diff with colored changes
+    libra diff --patience                    Use unique-line anchors for reordered code
+    libra diff --anchored='fn '              Keep unique matching function lines as anchors
     libra diff -U0                          Patch with no surrounding context (default is 3)
     libra diff -w                           Ignore whitespace-only changes
     libra diff -b                           Ignore changes in the amount of whitespace
@@ -99,14 +114,50 @@ pub struct DiffArgs {
     #[clap(last = true, value_name = "PATH")]
     after_dashdash: Vec<String>,
 
-    /// Diff algorithm. `histogram` is currently the only implemented backend.
+    /// Select the diff algorithm. Myers is the default; `myersMinimal` uses the
+    /// same shortest-edit implementation without a deadline, while `patience`
+    /// and `histogram` prefer readability-oriented anchors.
     #[clap(
         long,
-        default_value = "histogram",
         value_name = "NAME",
-        value_parser = ["histogram", "myers", "myersMinimal"],
+        overrides_with_all = ["patience", "histogram", "anchored"],
     )]
     pub algorithm: Option<String>,
+
+    /// Request the smallest Myers edit script. Libra's Myers
+    /// backend already runs without a deadline, so this selects its guaranteed
+    /// shortest-edit mode and is output-equivalent to `--algorithm=myersMinimal`.
+    #[clap(long)]
+    pub minimal: bool,
+
+    /// Generate a diff using the patience algorithm.
+    #[clap(
+        long,
+        overrides_with_all = ["algorithm", "histogram", "anchored"],
+    )]
+    pub patience: bool,
+
+    /// Generate a diff using the histogram algorithm.
+    #[clap(
+        long,
+        overrides_with_all = ["algorithm", "patience", "anchored"],
+    )]
+    pub histogram: bool,
+
+    /// Generate an anchored patience diff. May be repeated; a line qualifies
+    /// when it is unique on both sides and starts with any supplied text.
+    #[clap(
+        long,
+        value_name = "TEXT",
+        action = clap::ArgAction::Append,
+        overrides_with_all = ["algorithm", "patience", "histogram"],
+    )]
+    pub anchored: Vec<String>,
+
+    /// Raw selector order captured by the top-level parser. `clap`'s final
+    /// fields cannot represent Git's retained-anchor precedence by themselves.
+    #[clap(skip)]
+    algorithm_events: Vec<DiffAlgorithmEvent>,
 
     /// Write the diff to `FILENAME` instead of stdout
     #[clap(long, value_name = "FILENAME")]
@@ -128,6 +179,19 @@ pub struct DiffArgs {
     /// whitespace-delimited.
     #[clap(long = "word-diff", value_name = "MODE", num_args = 0..=1, require_equals = true, default_missing_value = "plain")]
     pub word_diff: Option<String>,
+
+    /// Show a color word diff. Equivalent to `--word-diff=color` plus an
+    /// optional `--word-diff-regex=<REGEX>`. Unlike the general color mode, it
+    /// enables word colors when color selection is automatic even if stdout is
+    /// redirected. Use global `--color=never` to suppress ANSI.
+    #[clap(long = "color-words", value_name = "REGEX", num_args = 0..=1, require_equals = true)]
+    pub color_words: Option<Option<String>>,
+
+    /// Use each non-overlapping REGEX match as a word. Text between matches is
+    /// ignored for comparison; new-side delimiters remain visible. Implies
+    /// `--word-diff=plain` when no word mode is otherwise selected.
+    #[clap(long = "word-diff-regex", value_name = "REGEX")]
+    pub word_diff_regex: Option<String>,
 
     /// Show insertion/deletion counts in a machine-friendly format
     #[clap(long)]
@@ -189,9 +253,37 @@ pub struct DiffArgs {
     #[clap(long = "ignore-blank-lines")]
     pub ignore_blank_lines: bool,
 
-    /// Show a condensed summary of created and deleted files
+    /// Show a condensed summary of created/deleted files, detected renames, and
+    /// mode changes. Plain content-only edits produce no line.
     #[clap(long)]
     pub summary: bool,
+
+    /// Show raw object/mode/status records for scripts. Use `-z` for arbitrary
+    /// path names and unambiguous rename fields.
+    #[clap(long)]
+    pub raw: bool,
+
+    /// Add creation, deletion, symlink, and executable-mode metadata to the
+    /// diffstat. Implies `--stat`.
+    #[clap(long = "compact-summary")]
+    pub compact_summary: bool,
+
+    /// Select change kinds by Git status letters. Uppercase letters include;
+    /// lowercase letters exclude. Supported letters are A,C,D,M,R,T,U,X,B; `*`
+    /// retains the whole set when any record matches the other criteria.
+    #[clap(long = "diff-filter", value_name = "FILTER")]
+    pub diff_filter: Option<String>,
+
+    /// Show only file pairs where the number of non-overlapping occurrences of
+    /// STRING changes between the two sides (Git pickaxe `-S`). Matching uses
+    /// textconv output when textconv is active and raw bytes otherwise.
+    #[clap(short = 'S', value_name = "STRING", conflicts_with = "pickaxe_regex")]
+    pub pickaxe_string: Option<String>,
+
+    /// Show only file pairs whose added or removed patch lines match REGEX (Git
+    /// pickaxe `-G`). The regex is validated before scanning the working tree.
+    #[clap(short = 'G', value_name = "REGEX")]
+    pub pickaxe_regex: Option<String>,
 
     /// Output only the last line of `--stat`: the files-changed / insertions /
     /// deletions summary.
@@ -208,8 +300,8 @@ pub struct DiffArgs {
     #[clap(short = 's', long = "no-patch")]
     pub no_patch: bool,
 
-    /// NUL-terminate output records (for `--name-only`/`--name-status`/`--numstat`);
-    /// `--name-status` then emits the status and path as separate NUL fields.
+    /// NUL-terminate output records (for `--raw`/`--name-only`/`--name-status`/
+    /// `--numstat`); raw renames and name-status fields are emitted separately.
     #[clap(short = 'z', long = "null")]
     pub null: bool,
 
@@ -234,11 +326,24 @@ pub struct DiffArgs {
 
     /// Output a binary patch (`GIT binary patch` with base85-encoded literals for
     /// both directions) for files detected as binary, instead of "Binary files …
-    /// differ". The patch is valid and appliable, but its compressed bytes are not
-    /// byte-identical to Git's (Libra deflates with `flate2`, and always emits a
-    /// `literal` chunk rather than Git's smaller-of-literal/delta choice).
+    /// differ". Implies `--full-index`. The patch is valid and appliable, but its
+    /// compressed bytes are not byte-identical to Git's (Libra deflates with
+    /// `flate2`, and always emits a `literal` chunk rather than Git's
+    /// smaller-of-literal/delta choice).
     #[clap(long = "binary")]
     pub binary: bool,
+
+    /// Show full pre-image and post-image object ids on patch `index` lines.
+    #[clap(long = "full-index")]
+    pub full_index: bool,
+
+    /// Use this source prefix instead of `a/` (or the configured source prefix).
+    #[clap(long = "src-prefix", value_name = "PREFIX")]
+    pub src_prefix: Option<String>,
+
+    /// Use this destination prefix instead of `b/` (or the configured destination prefix).
+    #[clap(long = "dst-prefix", value_name = "PREFIX")]
+    pub dst_prefix: Option<String>,
 
     /// Disable the external diff driver (`diff.external`) for this run, forcing
     /// the built-in diff engine even when one is configured.
@@ -378,6 +483,16 @@ pub struct DiffFileStat {
     /// First new-side line in a trailing blank run, used only by `diff --check`.
     #[serde(skip)]
     check_trailing_blank_start: Option<usize>,
+    /// Directional object/mode metadata used by `--raw`, compact summaries, and
+    /// `--diff-filter`. Worktree object ids remain `None`, matching Git raw output.
+    #[serde(skip)]
+    old_id: Option<ObjectHash>,
+    #[serde(skip)]
+    new_id: Option<ObjectHash>,
+    #[serde(skip)]
+    old_mode: Option<u32>,
+    #[serde(skip)]
+    new_mode: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -423,10 +538,8 @@ pub(crate) enum DiffError {
     #[error("failed to write output file '{path}': {detail}")]
     OutputWrite { path: String, detail: String },
 
-    #[error(
-        "diff --algorithm={0} is not supported yet; only --algorithm=histogram is currently implemented"
-    )]
-    UnsupportedAlgorithm(String),
+    #[error("invalid diff algorithm '{0}'; expected myers, myersMinimal, patience, or histogram")]
+    InvalidAlgorithm(String),
 
     #[error("invalid argument to find-renames: '{0}'")]
     InvalidRenameScore(String),
@@ -439,6 +552,12 @@ pub(crate) enum DiffError {
 
     #[error("invalid argument to color-moved: '{0}'")]
     InvalidColorMoved(String),
+
+    #[error("invalid argument to diff-filter: '{0}'")]
+    InvalidDiffFilter(String),
+
+    #[error("invalid -G regex '{pattern}': {detail}")]
+    InvalidPickaxeRegex { pattern: String, detail: String },
 
     #[error("textconv filter '{command}' failed: {detail}")]
     TextconvFailed { command: String, detail: String },
@@ -492,11 +611,9 @@ impl From<DiffError> for CliError {
             DiffError::OutputWrite { .. } => {
                 CliError::fatal(message).with_stable_code(StableErrorCode::IoWriteFailed)
             }
-            DiffError::UnsupportedAlgorithm(_) => CliError::fatal(message)
+            DiffError::InvalidAlgorithm(_) => CliError::command_usage(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
-                .with_hint(
-                    "omit --algorithm or use --algorithm=histogram until alternate diff backends are available",
-                ),
+                .with_hint("choose --minimal, --patience, --histogram, --anchored=<text>, or a supported --algorithm value"),
             DiffError::InvalidRenameScore(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint(
@@ -510,6 +627,12 @@ impl From<DiffError> for CliError {
             DiffError::InvalidColorMoved(_) => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
                 .with_hint("expected no, default, plain, blocks, zebra, or dimmed-zebra"),
+            DiffError::InvalidDiffFilter(_) => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use status letters A,C,D,M,R,T,U,X,B; lowercase excludes, and '*' selects all when any requested kind matches"),
+            DiffError::InvalidPickaxeRegex { .. } => CliError::command_usage(message)
+                .with_stable_code(StableErrorCode::CliInvalidArguments)
+                .with_hint("use a valid regular expression after -G, for example: libra diff -G'handler_[0-9]+'"),
             DiffError::TextconvFailed { .. } => CliError::fatal(message)
                 .with_stable_code(StableErrorCode::IoReadFailed)
                 .with_hint(
@@ -555,10 +678,13 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     resolve_positional_revisions(&mut args)
         .await
         .map_err(CliError::from)?;
-    validate_diff_algorithm(&args).map_err(CliError::from)?;
+    let diff_algorithm = resolve_diff_algorithm(&args).map_err(CliError::from)?;
+    parse_diff_filter(args.diff_filter.as_deref()).map_err(CliError::from)?;
+    let pickaxe = parse_diff_pickaxe(&args).map_err(CliError::from)?;
+    let word_diff = resolve_word_diff_options(&args)?;
     let config = resolve_diff_config(&args).await.map_err(CliError::from)?;
     emit_worktree_scan_progress(&args, output);
-    let mut result = run_diff(&args, output, &config)
+    let mut result = run_diff(&args, output, &config, pickaxe.as_ref(), &diff_algorithm)
         .await
         .map_err(CliError::from)?;
     // lore.md 2.2: read-only sparse view — scope ONLY the working-tree diff
@@ -570,11 +696,26 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
     if !result.external_diff_applied && !args.staged && args.new.is_none() {
         apply_sparse_view_filter(&mut result).await;
     }
+    if !result.external_diff_applied
+        && let Some(filter) =
+            parse_diff_filter(args.diff_filter.as_deref()).map_err(CliError::from)?
+    {
+        // Re-apply after the sparse-view projection so `*` all-or-none is based
+        // only on the visible result set, not on a hidden out-of-view change.
+        apply_diff_filter(&mut result.files, &filter);
+        refresh_diff_totals(&mut result);
+    }
     // External-driver output is verbatim: skip the internal relative-path rewrite
     // and word-diff transforms (they would mangle the driver's own format).
     if !result.external_diff_applied {
         apply_relative_filter(&args, &mut result);
-        apply_word_diff(&args, &mut result, output, io::stdout().is_terminal())?;
+        apply_word_diff(
+            &args,
+            &word_diff,
+            &mut result,
+            output,
+            io::stdout().is_terminal(),
+        )?;
         apply_diff_prefixes(&mut result, &config.prefixes);
     }
     render_diff_output(&args, &result, output)
@@ -583,7 +724,14 @@ pub async fn execute_safe(args: DiffArgs, output: &OutputConfig) -> CliResult<()
 /// Whether `--word-diff` is set to a rendering mode (i.e. not `none`/absent), in
 /// which case the diff body is already fully rendered and must not be re-colored.
 fn word_diff_active(args: &DiffArgs) -> bool {
-    matches!(args.word_diff.as_deref(), Some(mode) if mode != "none")
+    if args.color_words.is_some() {
+        return true;
+    }
+    match args.word_diff.as_deref() {
+        Some("none") => false,
+        Some(_) => true,
+        None => args.word_diff_regex.is_some(),
+    }
 }
 
 /// The `--relative[=<path>]` directory prefix (with a trailing `/`) that the diff
@@ -629,9 +777,7 @@ async fn apply_sparse_view_filter(result: &mut DiffOutput) {
                 .as_deref()
                 .is_some_and(|from| view.contains_str(from))
     });
-    result.files_changed = result.files.len();
-    result.total_insertions = result.files.iter().map(|file| file.insertions).sum();
-    result.total_deletions = result.files.iter().map(|file| file.deletions).sum();
+    refresh_diff_totals(result);
 }
 
 fn apply_relative_filter(args: &DiffArgs, result: &mut DiffOutput) {
@@ -656,6 +802,10 @@ fn apply_relative_filter(args: &DiffArgs, result: &mut DiffOutput) {
         file.raw_diff = strip_relative_prefix_in_diff(&file.raw_diff, &strip, &full, &stripped);
         file.path = stripped;
     }
+    refresh_diff_totals(result);
+}
+
+fn refresh_diff_totals(result: &mut DiffOutput) {
     result.files_changed = result.files.len();
     result.total_insertions = result.files.iter().map(|file| file.insertions).sum();
     result.total_deletions = result.files.iter().map(|file| file.deletions).sum();
@@ -749,6 +899,15 @@ enum WordDiffMode {
     Porcelain,
 }
 
+/// Prevalidated word-diff controls. Regex compilation happens before config,
+/// progress, textconv, or external-driver work, and the compiled automaton is
+/// reused for every file/hunk in the result.
+struct ResolvedWordDiff {
+    mode: Option<WordDiffMode>,
+    regex: Option<regex::Regex>,
+    force_auto_color: bool,
+}
+
 /// Resolve a `--word-diff` value to a mode, or `None` for `none` (no transform).
 fn resolve_word_diff_mode(value: &str) -> CliResult<Option<WordDiffMode>> {
     match value {
@@ -763,21 +922,56 @@ fn resolve_word_diff_mode(value: &str) -> CliResult<Option<WordDiffMode>> {
     }
 }
 
+fn resolve_word_diff_options(args: &DiffArgs) -> CliResult<ResolvedWordDiff> {
+    // Preserve the distinction between an absent mode and explicit `none`:
+    // --word-diff-regex alone implies plain, while explicit none disables it.
+    let explicit_mode = match args.word_diff.as_deref() {
+        Some(value) => Some(resolve_word_diff_mode(value)?),
+        None => None,
+    };
+    let mode = if args.color_words.is_some() {
+        Some(WordDiffMode::Color)
+    } else {
+        match explicit_mode {
+            Some(mode) => mode,
+            None if args.word_diff_regex.is_some() => Some(WordDiffMode::Plain),
+            None => None,
+        }
+    };
+    // An explicit --word-diff-regex deterministically overrides the optional
+    // regex carried by --color-words. This avoids silently compiling two
+    // different tokenizers when both forms are present.
+    let regex_source = args
+        .word_diff_regex
+        .as_deref()
+        .or_else(|| args.color_words.as_ref().and_then(|value| value.as_deref()));
+    let regex = regex_source
+        .map(|pattern| {
+            regex::Regex::new(pattern).map_err(|error| {
+                CliError::command_usage(format!("invalid --word-diff-regex '{pattern}': {error}"))
+                    .with_stable_code(StableErrorCode::CliInvalidArguments)
+                    .with_hint("use a valid Rust regular expression for word matching")
+            })
+        })
+        .transpose()?;
+    Ok(ResolvedWordDiff {
+        mode,
+        regex,
+        force_auto_color: args.color_words.is_some(),
+    })
+}
+
 /// Apply `--word-diff`: rewrite each file's unified diff body into word-diff
 /// form (the headers/`@@` lines are kept; each hunk's old side vs new side is
 /// re-diffed at word granularity). `none`/absent is a no-op.
 fn apply_word_diff(
     args: &DiffArgs,
+    resolved: &ResolvedWordDiff,
     result: &mut DiffOutput,
     output: &OutputConfig,
-    color: bool,
+    stdout_is_terminal: bool,
 ) -> CliResult<()> {
-    let Some(value) = &args.word_diff else {
-        return Ok(());
-    };
-    // Resolve (and validate) the mode even when another output mode wins, so an
-    // invalid `--word-diff=<bad>` is still reported.
-    let Some(mode) = resolve_word_diff_mode(value)? else {
+    let Some(mode) = resolved.mode else {
         return Ok(());
     };
     // Word-diff only rewrites the textual patch body. Summary/check/JSON paths
@@ -792,16 +986,28 @@ fn apply_word_diff(
         || args.name_status
         || args.numstat
         || args.stat
+        || args.compact_summary
         || args.shortstat
         || args.summary
+        || args.raw
         || args.no_patch
         || output.is_json()
         || (output.quiet && args.output.is_none())
     {
         return Ok(());
     }
+    // `plain` must stay bracketed even on a terminal or under `--color=always`.
+    // `--word-diff=color` follows the global color policy, while the dedicated
+    // `--color-words` shorthand enables color under `auto` even when redirected
+    // (matching Git's shorthand); an explicit global `--color=never` still wins.
+    let color = mode == WordDiffMode::Color
+        && match output.color {
+            ColorChoice::Always => true,
+            ColorChoice::Never => false,
+            ColorChoice::Auto => resolved.force_auto_color || stdout_is_terminal,
+        };
     for file in &mut result.files {
-        file.raw_diff = word_diff_transform(&file.raw_diff, mode, color);
+        file.raw_diff = word_diff_transform(&file.raw_diff, mode, color, resolved.regex.as_ref());
     }
     Ok(())
 }
@@ -810,7 +1016,12 @@ fn apply_word_diff(
 /// lines (`diff --git`, `index`, `---`, `+++`, `@@`) are preserved; each hunk's
 /// body is reconstructed into its old side (context + removed lines) and new
 /// side (context + added lines), word-diffed, and re-rendered.
-fn word_diff_transform(raw_diff: &str, mode: WordDiffMode, color: bool) -> String {
+fn word_diff_transform(
+    raw_diff: &str,
+    mode: WordDiffMode,
+    color: bool,
+    regex: Option<&regex::Regex>,
+) -> String {
     let lines: Vec<&str> = raw_diff.lines().collect();
     let mut out = String::new();
     let mut i = 0;
@@ -856,14 +1067,14 @@ fn word_diff_transform(raw_diff: &str, mode: WordDiffMode, color: bool) -> Strin
         };
         let old_side = with_trailing(&old_lines);
         let new_side = with_trailing(&new_lines);
-        out.push_str(&render_word_diff(&old_side, &new_side, mode, color));
+        out.push_str(&render_word_diff(&old_side, &new_side, mode, color, regex));
     }
     out
 }
 
 /// Split text into word-diff tokens: a single newline, a run of non-newline
 /// whitespace, or a run of non-whitespace (a "word"). Matches Git's default
-/// whitespace-delimited tokenization (`--word-diff-regex` is not supported).
+/// whitespace-delimited tokenization when no custom word regex is selected.
 fn word_tokens(text: &str) -> Vec<&str> {
     let mut tokens = Vec::new();
     let mut chars = text.char_indices().peekable();
@@ -959,20 +1170,254 @@ fn normalize_word_changes(changes: Vec<(ChangeTag, &str)>) -> Vec<(ChangeTag, &s
     out
 }
 
+#[derive(Clone, Copy)]
+struct RegexWordToken<'a> {
+    text: &'a str,
+    start: usize,
+    end: usize,
+    line: usize,
+    newline: bool,
+}
+
+/// Tokenize only regex matches plus explicit newline boundaries. A regex match
+/// that crosses a newline contributes only its prefix before the first newline,
+/// matching Git's documented truncation rule; the match still consumes its
+/// full range, while every consumed newline remains a hard render boundary.
+fn regex_word_tokens<'a>(text: &'a str, regex: &regex::Regex) -> Vec<RegexWordToken<'a>> {
+    let mut tokens = Vec::new();
+    let mut cursor = 0;
+    let mut line = 0;
+    let push_newlines = |range_start: usize,
+                         range: &'a str,
+                         tokens: &mut Vec<RegexWordToken<'a>>,
+                         line: &mut usize| {
+        for (offset, byte) in range.bytes().enumerate() {
+            if byte == b'\n' {
+                let start = range_start + offset;
+                tokens.push(RegexWordToken {
+                    text: &text[start..start + 1],
+                    start,
+                    end: start + 1,
+                    line: *line,
+                    newline: true,
+                });
+                *line += 1;
+            }
+        }
+    };
+    for matched in regex.find_iter(text) {
+        push_newlines(
+            cursor,
+            &text[cursor..matched.start()],
+            &mut tokens,
+            &mut line,
+        );
+        let matched_text = matched.as_str();
+        let word_end = matched_text
+            .find('\n')
+            .map(|offset| matched.start() + offset)
+            .unwrap_or(matched.end());
+        if word_end > matched.start() {
+            tokens.push(RegexWordToken {
+                text: &text[matched.start()..word_end],
+                start: matched.start(),
+                end: word_end,
+                line,
+                newline: false,
+            });
+        }
+        push_newlines(matched.start(), matched_text, &mut tokens, &mut line);
+        cursor = matched.end();
+    }
+    push_newlines(cursor, &text[cursor..], &mut tokens, &mut line);
+    tokens
+}
+
+#[derive(Clone, Copy)]
+struct IndexedWordChange {
+    tag: ChangeTag,
+    old_index: Option<usize>,
+    new_index: Option<usize>,
+}
+
+fn push_owned_change(changes: &mut Vec<(ChangeTag, String)>, tag: ChangeTag, text: &str) {
+    if !text.is_empty() {
+        changes.push((tag, text.to_string()));
+    }
+}
+
+/// Build Git-shaped regex-word changes. Regex matches are the comparison keys;
+/// unmatched old-side delimiters are ignored, unmatched new-side delimiters are
+/// displayed, and a line with no equal word keeps its complete punctuation
+/// inside the insertion/deletion marker.
+fn regex_word_changes(old: &str, new: &str, regex: &regex::Regex) -> Vec<(ChangeTag, String)> {
+    let old_tokens = regex_word_tokens(old, regex);
+    let new_tokens = regex_word_tokens(new, regex);
+    let old_keys: Vec<&str> = old_tokens.iter().map(|token| token.text).collect();
+    let new_keys: Vec<&str> = new_tokens.iter().map(|token| token.text).collect();
+    let diff = TextDiff::from_slices(&old_keys, &new_keys);
+    let indexed: Vec<IndexedWordChange> = diff
+        .iter_all_changes()
+        .map(|change| IndexedWordChange {
+            tag: change.tag(),
+            old_index: change.old_index(),
+            new_index: change.new_index(),
+        })
+        .collect();
+
+    let old_line_count = old.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let new_line_count = new.bytes().filter(|byte| *byte == b'\n').count() + 1;
+    let mut old_equal = vec![false; old_line_count];
+    let mut new_equal = vec![false; new_line_count];
+    let mut old_changed = vec![false; old_line_count];
+    let mut new_changed = vec![false; new_line_count];
+    let mut old_newline_deleted = vec![false; old_line_count];
+    let mut new_newline_inserted = vec![false; new_line_count];
+    for change in &indexed {
+        if let Some(index) = change.old_index {
+            let token = old_tokens[index];
+            match change.tag {
+                ChangeTag::Equal if !token.newline => old_equal[token.line] = true,
+                ChangeTag::Delete if token.newline => old_newline_deleted[token.line] = true,
+                ChangeTag::Delete => old_changed[token.line] = true,
+                _ => {}
+            }
+        }
+        if let Some(index) = change.new_index {
+            let token = new_tokens[index];
+            match change.tag {
+                ChangeTag::Equal if !token.newline => new_equal[token.line] = true,
+                ChangeTag::Insert if token.newline => new_newline_inserted[token.line] = true,
+                ChangeTag::Insert => new_changed[token.line] = true,
+                _ => {}
+            }
+        }
+    }
+    let old_full_change: Vec<bool> = old_changed
+        .iter()
+        .zip(&old_equal)
+        .zip(&old_newline_deleted)
+        .map(|((&changed, &equal), &newline_deleted)| newline_deleted || (changed && !equal))
+        .collect();
+    let new_full_change: Vec<bool> = new_changed
+        .iter()
+        .zip(&new_equal)
+        .zip(&new_newline_inserted)
+        .map(|((&changed, &equal), &newline_inserted)| newline_inserted || (changed && !equal))
+        .collect();
+
+    // Avoid rescanning the remainder of the change list for every deletion:
+    // an all-delete input would otherwise turn delimiter placement into O(n²).
+    let mut next_new_indices = vec![None; indexed.len()];
+    let mut next_new_index = None;
+    for position in (0..indexed.len()).rev() {
+        if indexed[position].new_index.is_some() {
+            next_new_index = indexed[position].new_index;
+        }
+        next_new_indices[position] = next_new_index;
+    }
+
+    let mut changes = Vec::new();
+    let mut old_cursor = 0;
+    let mut new_cursor = 0;
+    for (position, change) in indexed.iter().enumerate() {
+        match change.tag {
+            ChangeTag::Equal => {
+                // INVARIANT: similar supplies both indices for an Equal change.
+                let old_token = old_tokens[change
+                    .old_index
+                    .expect("INVARIANT: equal word change has an old index")];
+                let new_token = new_tokens[change
+                    .new_index
+                    .expect("INVARIANT: equal word change has a new index")];
+                push_owned_change(
+                    &mut changes,
+                    ChangeTag::Equal,
+                    &new[new_cursor..new_token.start],
+                );
+                push_owned_change(&mut changes, ChangeTag::Equal, new_token.text);
+                old_cursor = old_token.end;
+                new_cursor = new_token.end;
+            }
+            ChangeTag::Delete => {
+                // INVARIANT: similar supplies an old index for Delete.
+                let old_token = old_tokens[change
+                    .old_index
+                    .expect("INVARIANT: delete word change has an old index")];
+                if old_full_change[old_token.line] {
+                    push_owned_change(
+                        &mut changes,
+                        ChangeTag::Delete,
+                        &old[old_cursor..old_token.start],
+                    );
+                } else if let Some(next_new) =
+                    next_new_indices[position].map(|index| new_tokens[index])
+                    && new_cursor < next_new.start
+                {
+                    // New-side delimiter belongs before the whole replacement
+                    // run, including its leading deletions (`foo,[-bar-]{+baz+}`).
+                    push_owned_change(
+                        &mut changes,
+                        ChangeTag::Equal,
+                        &new[new_cursor..next_new.start],
+                    );
+                    new_cursor = next_new.start;
+                }
+                push_owned_change(&mut changes, ChangeTag::Delete, old_token.text);
+                old_cursor = old_token.end;
+            }
+            ChangeTag::Insert => {
+                // INVARIANT: similar supplies a new index for Insert.
+                let new_token = new_tokens[change
+                    .new_index
+                    .expect("INVARIANT: insert word change has a new index")];
+                let gap_tag = if new_full_change[new_token.line] {
+                    ChangeTag::Insert
+                } else {
+                    ChangeTag::Equal
+                };
+                push_owned_change(&mut changes, gap_tag, &new[new_cursor..new_token.start]);
+                push_owned_change(&mut changes, ChangeTag::Insert, new_token.text);
+                new_cursor = new_token.end;
+            }
+        }
+    }
+    push_owned_change(&mut changes, ChangeTag::Equal, &new[new_cursor..]);
+    changes
+}
+
 /// Word-diff `old` vs `new` and render the body in the chosen mode (ending with
 /// a trailing newline). Newlines always break lines and close any open marker.
-fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> String {
-    let old_toks = word_tokens(old);
-    let new_toks = word_tokens(new);
-    let diff = TextDiff::from_slices(&old_toks, &new_toks);
-    let changes: Vec<(ChangeTag, &str)> = normalize_word_changes(
-        diff.iter_all_changes()
-            .map(|change| (change.tag(), change.value()))
-            .collect(),
-    );
+fn render_word_diff(
+    old: &str,
+    new: &str,
+    mode: WordDiffMode,
+    color: bool,
+    regex: Option<&regex::Regex>,
+) -> String {
+    if let Some(regex) = regex {
+        let owned_changes = regex_word_changes(old, new, regex);
+        let changes = owned_changes
+            .iter()
+            .map(|(tag, text)| (*tag, text.as_str()))
+            .collect::<Vec<_>>();
+        render_word_changes(&changes, mode, color)
+    } else {
+        let old_toks = word_tokens(old);
+        let new_toks = word_tokens(new);
+        let diff = TextDiff::from_slices(&old_toks, &new_toks);
+        let changes = normalize_word_changes(
+            diff.iter_all_changes()
+                .map(|change| (change.tag(), change.value()))
+                .collect(),
+        );
+        render_word_changes(&changes, mode, color)
+    }
+}
 
+fn render_word_changes(changes: &[(ChangeTag, &str)], mode: WordDiffMode, color: bool) -> String {
     if mode == WordDiffMode::Porcelain {
-        return render_word_porcelain(&changes);
+        return render_word_porcelain(changes);
     }
 
     // Plain / color: emit a running line per output line; removed-word runs are
@@ -990,7 +1435,9 @@ fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> St
             ChangeTag::Equal => out.push_str(&text),
             ChangeTag::Delete => {
                 if color {
-                    out.push_str(&text.red().to_string());
+                    out.push_str("\x1b[31m");
+                    out.push_str(&text);
+                    out.push_str("\x1b[0m");
                 } else {
                     out.push_str("[-");
                     out.push_str(&text);
@@ -999,7 +1446,9 @@ fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> St
             }
             ChangeTag::Insert => {
                 if color {
-                    out.push_str(&text.green().to_string());
+                    out.push_str("\x1b[32m");
+                    out.push_str(&text);
+                    out.push_str("\x1b[0m");
                 } else {
                     out.push_str("{+");
                     out.push_str(&text);
@@ -1009,7 +1458,7 @@ fn render_word_diff(old: &str, new: &str, mode: WordDiffMode, color: bool) -> St
         }
         run.clear();
     };
-    for &(tag, token) in &changes {
+    for &(tag, token) in changes {
         if token == "\n" {
             flush(&mut out, &mut run, run_tag);
             out.push('\n');
@@ -1296,11 +1745,356 @@ async fn resolve_positional_revisions(args: &mut DiffArgs) -> Result<(), DiffErr
     Ok(())
 }
 
-fn validate_diff_algorithm(args: &DiffArgs) -> Result<(), DiffError> {
-    match args.algorithm.as_deref().unwrap_or("histogram") {
-        "histogram" => Ok(()),
-        unsupported => Err(DiffError::UnsupportedAlgorithm(unsupported.to_string())),
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffAlgorithmEvent {
+    Named(String),
+    Patience,
+    Histogram,
+    Anchored(String),
+}
+
+/// Preserve selector order that `clap`'s final-state fields cannot express.
+/// Git retains anchors across named/Myers/Histogram selectors, clears them only
+/// for the `--patience` shorthand, and reactivates the retained set if a later
+/// `--anchored` selects patience again.
+pub(crate) fn record_algorithm_selector_events(args: &mut DiffArgs, argv: &[String]) {
+    args.algorithm_events.clear();
+    let Some(diff_idx) = argv.iter().position(|arg| arg == "diff") else {
+        return;
+    };
+    let mut idx = diff_idx + 1;
+    while idx < argv.len() {
+        let arg = &argv[idx];
+        if arg == "--" {
+            break;
+        }
+        if let Some(value) = arg.strip_prefix("--algorithm=") {
+            args.algorithm_events
+                .push(DiffAlgorithmEvent::Named(value.to_string()));
+            idx += 1;
+            continue;
+        }
+        if arg == "--algorithm" {
+            if let Some(value) = argv.get(idx + 1) {
+                args.algorithm_events
+                    .push(DiffAlgorithmEvent::Named(value.clone()));
+            }
+            idx += 2;
+            continue;
+        }
+        if let Some(value) = arg.strip_prefix("--anchored=") {
+            args.algorithm_events
+                .push(DiffAlgorithmEvent::Anchored(value.to_string()));
+            idx += 1;
+            continue;
+        }
+        if arg == "--anchored" {
+            if let Some(value) = argv.get(idx + 1) {
+                args.algorithm_events
+                    .push(DiffAlgorithmEvent::Anchored(value.clone()));
+            }
+            idx += 2;
+            continue;
+        }
+        match arg.as_str() {
+            "--patience" => args.algorithm_events.push(DiffAlgorithmEvent::Patience),
+            "--histogram" => args.algorithm_events.push(DiffAlgorithmEvent::Histogram),
+            _ => {}
+        }
+        idx += 1;
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DiffAlgorithm {
+    Myers,
+    MyersMinimal,
+    Patience,
+    Histogram,
+    Anchored(Vec<String>),
+}
+
+impl DiffAlgorithm {
+    fn backend(&self) -> Algorithm {
+        match self {
+            Self::Myers | Self::MyersMinimal => Algorithm::Myers,
+            Self::Patience | Self::Anchored(_) => Algorithm::Patience,
+            Self::Histogram => Algorithm::Histogram,
+        }
+    }
+
+    /// git_internal already renders Myers with the same dependency backend.
+    /// Other algorithms must replace that initial body in the post-pass.
+    fn needs_backend_rediff(&self) -> bool {
+        matches!(self, Self::Patience | Self::Histogram | Self::Anchored(_))
+    }
+}
+
+fn named_diff_algorithm(value: &str) -> Result<DiffAlgorithm, DiffError> {
+    match value {
+        "myers" => Ok(DiffAlgorithm::Myers),
+        "myersMinimal" => Ok(DiffAlgorithm::MyersMinimal),
+        "patience" => Ok(DiffAlgorithm::Patience),
+        "histogram" => Ok(DiffAlgorithm::Histogram),
+        value => Err(DiffError::InvalidAlgorithm(value.to_string())),
+    }
+}
+
+fn resolve_diff_algorithm(args: &DiffArgs) -> Result<DiffAlgorithm, DiffError> {
+    let selected = if args.algorithm_events.is_empty() {
+        if !args.anchored.is_empty() {
+            DiffAlgorithm::Anchored(args.anchored.clone())
+        } else if args.patience {
+            DiffAlgorithm::Patience
+        } else if args.histogram {
+            DiffAlgorithm::Histogram
+        } else {
+            match args.algorithm.as_deref() {
+                None => DiffAlgorithm::Myers,
+                Some(value) => named_diff_algorithm(value)?,
+            }
+        }
+    } else {
+        let mut selected = DiffAlgorithm::Myers;
+        let mut anchors = Vec::new();
+        for event in &args.algorithm_events {
+            match event {
+                DiffAlgorithmEvent::Named(value) => selected = named_diff_algorithm(value)?,
+                DiffAlgorithmEvent::Patience => {
+                    anchors.clear();
+                    selected = DiffAlgorithm::Patience;
+                }
+                DiffAlgorithmEvent::Histogram => selected = DiffAlgorithm::Histogram,
+                DiffAlgorithmEvent::Anchored(value) => {
+                    anchors.push(value.clone());
+                    selected = DiffAlgorithm::Patience;
+                }
+            }
+        }
+        if selected == DiffAlgorithm::Patience && !anchors.is_empty() {
+            DiffAlgorithm::Anchored(anchors)
+        } else {
+            selected
+        }
+    };
+    Ok(if args.minimal && selected == DiffAlgorithm::Myers {
+        DiffAlgorithm::MyersMinimal
+    } else {
+        selected
+    })
+}
+
+#[derive(Debug)]
+struct DiffFilter {
+    include: HashSet<char>,
+    exclude: HashSet<char>,
+    all_or_none: bool,
+}
+
+fn parse_diff_filter(raw: Option<&str>) -> Result<Option<DiffFilter>, DiffError> {
+    let Some(raw) = raw else {
+        return Ok(None);
+    };
+    if raw.is_empty() {
+        return Err(DiffError::InvalidDiffFilter(raw.to_string()));
+    }
+    let mut include = HashSet::new();
+    let mut exclude = HashSet::new();
+    let mut all_or_none = false;
+    for value in raw.chars() {
+        if value == '*' {
+            all_or_none = true;
+            continue;
+        }
+        let normalized = value.to_ascii_uppercase();
+        if !matches!(
+            normalized,
+            'A' | 'C' | 'D' | 'M' | 'R' | 'T' | 'U' | 'X' | 'B'
+        ) {
+            return Err(DiffError::InvalidDiffFilter(raw.to_string()));
+        }
+        if value.is_ascii_lowercase() {
+            exclude.insert(normalized);
+        } else if value.is_ascii_uppercase() {
+            include.insert(normalized);
+        } else {
+            return Err(DiffError::InvalidDiffFilter(raw.to_string()));
+        }
+    }
+    Ok(Some(DiffFilter {
+        include,
+        exclude,
+        all_or_none,
+    }))
+}
+
+fn apply_diff_filter(files: &mut Vec<DiffFileStat>, filter: &DiffFilter) {
+    let matches = |file: &DiffFileStat| {
+        let status = diff_status_code(file);
+        !filter.exclude.contains(&status)
+            && (filter.include.is_empty() || filter.include.contains(&status))
+    };
+    if filter.all_or_none {
+        // Git's `*` is a true all-or-none selector: once any record matches the
+        // other criteria, the original set is retained in full (even records
+        // named by a lowercase exclusion).
+        if !files.iter().any(matches) {
+            files.clear();
+        }
+    } else {
+        files.retain(matches);
+    }
+}
+
+#[derive(Debug)]
+enum DiffPickaxe {
+    StringCount(Vec<u8>),
+    DiffRegex(regex::Regex),
+}
+
+fn parse_diff_pickaxe(args: &DiffArgs) -> Result<Option<DiffPickaxe>, DiffError> {
+    if let Some(string) = &args.pickaxe_string {
+        return Ok(Some(DiffPickaxe::StringCount(string.as_bytes().to_vec())));
+    }
+    let Some(pattern) = &args.pickaxe_regex else {
+        return Ok(None);
+    };
+    regex::Regex::new(pattern)
+        .map(DiffPickaxe::DiffRegex)
+        .map(Some)
+        .map_err(|error| DiffError::InvalidPickaxeRegex {
+            pattern: pattern.clone(),
+            detail: error.to_string(),
+        })
+}
+
+/// Count non-overlapping byte-string occurrences in linear time. Git's `-S`
+/// compares occurrence counts, not merely presence, and must also work for
+/// binary files whose content is not valid UTF-8.
+fn count_literal_occurrences(haystack: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || haystack.len() < needle.len() {
+        return 0;
+    }
+
+    let mut prefix = vec![0usize; needle.len()];
+    let mut matched = 0usize;
+    for idx in 1..needle.len() {
+        while matched > 0 && needle[idx] != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if needle[idx] == needle[matched] {
+            matched += 1;
+            prefix[idx] = matched;
+        }
+    }
+
+    let mut count = 0usize;
+    matched = 0;
+    for &byte in haystack {
+        while matched > 0 && byte != needle[matched] {
+            matched = prefix[matched - 1];
+        }
+        if byte == needle[matched] {
+            matched += 1;
+            if matched == needle.len() {
+                count += 1;
+                // `str::matches`/Git pickaxe count non-overlapping matches.
+                matched = 0;
+            }
+        }
+    }
+    count
+}
+
+/// Match `-G` only against added/removed hunk content. Header lines (`---`/`+++`)
+/// and `\ No newline at end of file` are deliberately excluded. Combined hunks
+/// carry one prefix column per parent; any `+`/`-` prefix marks a changed line.
+fn changed_diff_line_matches(raw_diff: &str, regex: &regex::Regex) -> bool {
+    let mut prefix_columns = 0usize;
+    for line in raw_diff.lines() {
+        let leading_ats = line.bytes().take_while(|byte| *byte == b'@').count();
+        if leading_ats >= 2 && line.as_bytes().get(leading_ats) == Some(&b' ') {
+            prefix_columns = leading_ats - 1;
+            continue;
+        }
+        if prefix_columns == 0 || line.len() < prefix_columns {
+            continue;
+        }
+        let prefixes = &line.as_bytes()[..prefix_columns];
+        if prefixes
+            .iter()
+            .all(|byte| matches!(byte, b' ' | b'+' | b'-'))
+            && prefixes.iter().any(|byte| matches!(byte, b'+' | b'-'))
+            && regex.is_match(&line[prefix_columns..])
+        {
+            return true;
+        }
+    }
+    false
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_pickaxe(
+    files: &mut Vec<DiffFileStat>,
+    pickaxe: Option<&DiffPickaxe>,
+    first_map: &HashMap<PathBuf, ObjectHash>,
+    second_map: &HashMap<PathBuf, ObjectHash>,
+    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    textconv_counts: &HashMap<String, (usize, usize)>,
+) -> Result<(), DiffError> {
+    let Some(pickaxe) = pickaxe else {
+        return Ok(());
+    };
+    if let DiffPickaxe::DiffRegex(regex) = pickaxe {
+        files.retain(|file| changed_diff_line_matches(&file.raw_diff, regex));
+        return Ok(());
+    }
+    let DiffPickaxe::StringCount(needle) = pickaxe else {
+        return Ok(());
+    };
+    if needle.is_empty() {
+        files.clear();
+        return Ok(());
+    }
+
+    let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Result<Vec<u8>, DiffError> {
+        let path = PathBuf::from(path);
+        let Some(hash) = map.get(&path) else {
+            return Ok(Vec::new());
+        };
+        if worktree_entries.get(&path) == Some(hash) {
+            read_worktree_blob_content(&path)
+        } else {
+            load_repo_blob_content(hash)
+        }
+    };
+
+    let mut keep = Vec::with_capacity(files.len());
+    for file in files.iter() {
+        if let Some((old, new)) = textconv_counts.get(&file.path) {
+            keep.push(old != new);
+            continue;
+        }
+        let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
+        let old_hash = first_map.get(&PathBuf::from(old_path));
+        let new_hash = second_map.get(&PathBuf::from(&file.path));
+        if old_hash == new_hash {
+            keep.push(false);
+            continue;
+        }
+        let old = load(old_path, first_map)?;
+        let new = load(&file.path, second_map)?;
+        keep.push(
+            count_literal_occurrences(&old, needle) != count_literal_occurrences(&new, needle),
+        );
+    }
+    let mut index = 0usize;
+    files.retain(|_| {
+        let retain = keep[index];
+        index += 1;
+        retain
+    });
+    Ok(())
 }
 
 fn emit_worktree_scan_progress(args: &DiffArgs, output: &OutputConfig) {
@@ -1333,6 +2127,8 @@ async fn run_diff(
     args: &DiffArgs,
     output: &OutputConfig,
     config: &ResolvedDiffConfig,
+    pickaxe: Option<&DiffPickaxe>,
+    diff_algorithm: &DiffAlgorithm,
 ) -> Result<DiffOutput, DiffError> {
     util::require_repo().map_err(|_| DiffError::NotInRepo)?;
     tracing::debug!("diff args: {:?}", args);
@@ -1347,10 +2143,14 @@ async fn run_diff(
     let paths: Vec<PathBuf> = pathspecs.plain_positive_prefixes().unwrap_or_default();
     let diff_pathspecs = paths.clone();
     let worktree_entries = new_side.worktree_entries.clone();
-    // Separate copy for the external-diff pass (the one above is moved into the
-    // diff closure below). Lets the GIT_EXTERNAL_DIFF protocol report a zero hash
-    // for a new side that is the live working tree.
+    // Separate copy for content post-passes (the one above is moved into the diff
+    // closure below). Directional worktree identity for raw/external metadata is
+    // carried explicitly below so same-content mode changes cannot zero both sides.
     let ext_worktree_entries = new_side.worktree_entries.clone();
+    let old_modes = old_side.modes;
+    let new_modes = new_side.modes;
+    let old_is_worktree = old_side.is_worktree;
+    let new_is_worktree = new_side.is_worktree;
     // `Rc` so the `-U<n>` post-pass can read the blob content the diff closure
     // cached (keyed by hash) without re-loading it from the object store/disk.
     let worktree_cache: Rc<RefCell<HashMap<ObjectHash, Vec<u8>>>> =
@@ -1364,10 +2164,23 @@ async fn run_diff(
     // `-R`/`--reverse`: swap the two sides so the diff is computed new->old. The
     // loader resolves blobs by hash (content-addressed) and the worktree check
     // above stays correct regardless of which side a blob lands on.
-    let (first_blobs, second_blobs, old_label, new_label) = if args.reverse {
+    let (
+        first_blobs,
+        second_blobs,
+        first_modes,
+        second_modes,
+        first_is_worktree,
+        second_is_worktree,
+        old_label,
+        new_label,
+    ) = if args.reverse {
         (
             new_side.blobs,
             old_side.blobs,
+            new_modes,
+            old_modes,
+            new_is_worktree,
+            old_is_worktree,
             new_side.label,
             old_side.label,
         )
@@ -1375,6 +2188,10 @@ async fn run_diff(
         (
             old_side.blobs,
             new_side.blobs,
+            old_modes,
+            new_modes,
+            old_is_worktree,
+            new_is_worktree,
             old_side.label,
             new_side.label,
         )
@@ -1454,6 +2271,13 @@ async fn run_diff(
     }
 
     let mut files: Vec<DiffFileStat> = diff_output.iter().map(parse_diff_item).collect();
+    append_mode_only_changes(
+        &mut files,
+        &first_map,
+        &second_map,
+        &first_modes,
+        &second_modes,
+    );
     if args.old.is_none() && args.new.is_none() && !args.staged {
         apply_unmerged_worktree_diff(&mut files, &index, &diff_pathspecs)?;
     }
@@ -1485,6 +2309,9 @@ async fn run_diff(
     //     +/- counts (so stat/name/numstat/JSON all reflect the result).
     //   * `--ignore-blank-lines` re-diffs ignoring blank-only changes (drops files
     //     whose only change is blank lines, recomputes counts).
+    //   * Patience/Histogram replaces git_internal's initial Myers body and
+    //     recomputes +/- counts; the same backend flows through the two filtered
+    //     paths above, rename/textconv bodies, and forced-text rendering.
     //   * `-U<n>` (when `n != 3`, git_internal's hard-coded default) regenerates
     //     hunk bodies at `n` context lines; +/- lines are unchanged so counts are
     //     untouched — only the surrounding context (and re-parsed `hunks`) change.
@@ -1493,7 +2320,7 @@ async fn run_diff(
     // `--ignore-blank-lines` COMPOSES with a whitespace flag: the diff and the
     // blank classification both run through the normalizer (matching Git).
     let regen_context = config.context;
-    let ws_normalize: Option<fn(&str) -> String> = if args.ignore_all_space {
+    let requested_ws_normalize: Option<fn(&str) -> String> = if args.ignore_all_space {
         Some(normalize_ignore_all_space)
     } else if args.ignore_space_change {
         Some(normalize_ignore_space_change)
@@ -1504,7 +2331,16 @@ async fn run_diff(
     } else {
         None
     };
-    let rediffs = ws_normalize.is_some() || args.ignore_blank_lines;
+    // `--check` ignores comparison filters but still honors an explicitly
+    // selected diff backend because ambiguous repeated lines can change which
+    // physical lines are classified as additions.
+    let ws_normalize = if args.check {
+        None
+    } else {
+        requested_ws_normalize
+    };
+    let ignore_blank = !args.check && args.ignore_blank_lines;
+    let rediffs = ws_normalize.is_some() || ignore_blank || diff_algorithm.needs_backend_rediff();
 
     // `--relative` restricts WHICH files are diffed; apply that restriction now —
     // before rename detection — so a rename pair is only formed when BOTH sides
@@ -1523,20 +2359,18 @@ async fn run_diff(
     if let Some(threshold) = config.rename_threshold {
         // `--check` scans added lines for whitespace errors and ignores the
         // whitespace-ignore flags, so the rename body must stay unfiltered.
-        let (rn_ws, rn_blank) = if args.check {
-            (None, false)
-        } else {
-            (ws_normalize, args.ignore_blank_lines)
-        };
         let inexact_rename_skipped = apply_rename_detection(
             &mut files,
             &first_map,
             &second_map,
+            &first_modes,
+            &second_modes,
             &ext_worktree_entries,
             threshold,
             regen_context,
-            rn_ws,
-            rn_blank,
+            ws_normalize,
+            ignore_blank,
+            diff_algorithm,
         );
         if inexact_rename_skipped {
             crate::utils::error::emit_legacy_stderr(
@@ -1545,57 +2379,74 @@ async fn run_diff(
         }
     }
 
+    populate_diff_metadata(
+        &mut files,
+        &first_map,
+        &second_map,
+        &first_modes,
+        &second_modes,
+        first_is_worktree,
+        second_is_worktree,
+    );
+    for file in &mut files {
+        apply_mode_metadata_to_patch(file);
+    }
+
     // Textconv (`--textconv`, on by default unless `--no-textconv`): re-diff the
     // output of each file's `diff.<driver>.textconv` command instead of the raw
     // bytes. Skipped under `--check` (it scans raw added lines) and when an
     // external driver is active (that takes precedence). The post-pass below then
     // leaves textconv'd files alone.
-    let textconv_paths: std::collections::HashSet<String> =
-        if !args.no_textconv && !args.check && external_command.is_none() {
-            let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
-            // Per file: the (old-side, new-side) textconv command. A rename's
-            // old side is at `rename_from` and may resolve a different driver
-            // than the new side (Git resolves textconv per blob/path), so each
-            // side is looked up independently.
-            let mut path_commands: HashMap<String, (Option<String>, Option<String>)> =
-                HashMap::new();
-            for file in &files {
-                let new_path = PathBuf::from(&file.path);
-                let old_path = file
-                    .rename_from
-                    .as_deref()
-                    .map(PathBuf::from)
-                    .unwrap_or_else(|| new_path.clone());
-                let new_driver = attributes::diff_driver_for_path(&new_path);
-                let new_command =
-                    resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
-                let old_command = if old_path == new_path {
-                    new_command.clone()
-                } else {
-                    let old_driver = attributes::diff_driver_for_path(&old_path);
-                    resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
-                };
-                if old_command.is_some() || new_command.is_some() {
-                    path_commands.insert(file.path.clone(), (old_command, new_command));
-                }
-            }
-            if path_commands.is_empty() {
-                std::collections::HashSet::new()
+    let textconv_outcome = if !args.no_textconv && !args.check && external_command.is_none() {
+        let mut command_cache: HashMap<String, Option<String>> = HashMap::new();
+        // Per file: the (old-side, new-side) textconv command. A rename's
+        // old side is at `rename_from` and may resolve a different driver
+        // than the new side (Git resolves textconv per blob/path), so each
+        // side is looked up independently.
+        let mut path_commands: HashMap<String, (Option<String>, Option<String>)> = HashMap::new();
+        for file in &files {
+            let new_path = PathBuf::from(&file.path);
+            let old_path = file
+                .rename_from
+                .as_deref()
+                .map(PathBuf::from)
+                .unwrap_or_else(|| new_path.clone());
+            let new_driver = attributes::diff_driver_for_path(&new_path);
+            let new_command =
+                resolve_textconv_command(new_driver.as_deref(), &mut command_cache).await;
+            let old_command = if old_path == new_path {
+                new_command.clone()
             } else {
-                apply_textconv(
-                    &mut files,
-                    &path_commands,
-                    &first_map,
-                    &second_map,
-                    &ext_worktree_entries,
-                    regen_context,
-                    ws_normalize,
-                    args.ignore_blank_lines,
-                )?
+                let old_driver = attributes::diff_driver_for_path(&old_path);
+                resolve_textconv_command(old_driver.as_deref(), &mut command_cache).await
+            };
+            if old_command.is_some() || new_command.is_some() {
+                path_commands.insert(file.path.clone(), (old_command, new_command));
             }
+        }
+        if path_commands.is_empty() {
+            TextconvOutcome::default()
         } else {
-            std::collections::HashSet::new()
-        };
+            apply_textconv(
+                &mut files,
+                &path_commands,
+                &first_map,
+                &second_map,
+                &ext_worktree_entries,
+                regen_context,
+                ws_normalize,
+                ignore_blank,
+                diff_algorithm,
+                match pickaxe {
+                    Some(DiffPickaxe::StringCount(needle)) => Some(needle.as_slice()),
+                    _ => None,
+                },
+            )?
+        }
+    } else {
+        TextconvOutcome::default()
+    };
+    let textconv_paths = &textconv_outcome.paths;
 
     // Binary detection: a file whose content carries a NUL byte is shown as
     // `Binary files … differ` (or, with `--binary`, a `GIT binary patch`) instead
@@ -1609,7 +2460,7 @@ async fn run_diff(
             &first_map,
             &second_map,
             &ext_worktree_entries,
-            &textconv_paths,
+            textconv_paths,
             args.binary,
         )?;
     } else if args.text && !args.check && external_command.is_none() {
@@ -1621,17 +2472,18 @@ async fn run_diff(
             &second_map,
             &ext_worktree_entries,
             regen_context,
+            diff_algorithm,
         )?;
     }
 
-    // `--binary` implies `--full-index`: rewrite EVERY file's `index` line to full
-    // object ids (binary files were already given full ids above; this covers the
-    // text files in the same diff).
-    if args.binary && external_command.is_none() {
+    // `--binary` implies `--full-index`: rewrite every applicable `index` line
+    // to full object ids. Binary-patch entries already carry full ids; ordinary
+    // binary markers still need rewriting when `--full-index` is explicit.
+    if (args.binary || args.full_index) && external_command.is_none() {
         for file in files.iter_mut() {
             // Binary files were already given full ids (with the correct
             // blank-line terminator) in `apply_binary_detection`; don't re-process.
-            if file.binary.is_some() {
+            if args.binary && file.binary.is_some() {
                 continue;
             }
             let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
@@ -1655,12 +2507,10 @@ async fn run_diff(
         }
     }
 
-    // `--check` (whitespace-error scan) ignores the whitespace-ignore flags and
-    // operates on git_internal's original diff — matching Git, where
-    // `diff --check -w`/`-b`/`--ignore-space-at-eol` still reports trailing-
-    // whitespace errors. It replaces the patch output, so the post-pass (which
-    // only rewrites the patch/stat/counts) is skipped entirely when `--check`.
-    if external_command.is_none() && !args.check && (rediffs || regen_context != 3) {
+    // `--check` ignores whitespace/blank-line filters, matching Git, but an
+    // explicitly selected Patience/Histogram backend still regenerates the
+    // body before the added-line scan.
+    if external_command.is_none() && (rediffs || (!args.check && regen_context != 3)) {
         let blob_text = |map: &HashMap<PathBuf, ObjectHash>, path: &Path| -> String {
             let Some(hash) = map.get(path) else {
                 return String::new();
@@ -1692,33 +2542,49 @@ async fn run_diff(
                 let new_text = blob_text(&second_map, &path);
                 // `--ignore-blank-lines` composes with a whitespace normalizer when
                 // both are given (matching `git diff -w --ignore-blank-lines`).
-                let body = if args.ignore_blank_lines {
+                let body = if ignore_blank {
                     match ws_normalize {
                         Some(normalize) => compute_unified_hunks_ignore_blank_normalized(
                             &old_text,
                             &new_text,
                             regen_context,
+                            diff_algorithm,
                             normalize,
                         ),
-                        None => {
-                            compute_unified_hunks_ignore_blank(&old_text, &new_text, regen_context)
-                        }
+                        None => compute_unified_hunks_ignore_blank(
+                            &old_text,
+                            &new_text,
+                            regen_context,
+                            diff_algorithm,
+                        ),
                     }
                 } else if let Some(normalize) = ws_normalize {
-                    compute_unified_hunks_normalized(&old_text, &new_text, regen_context, normalize)
+                    compute_unified_hunks_normalized(
+                        &old_text,
+                        &new_text,
+                        regen_context,
+                        diff_algorithm,
+                        normalize,
+                    )
                 } else {
-                    compute_unified_hunks(&old_text, &new_text, regen_context)
+                    compute_unified_hunks(&old_text, &new_text, regen_context, diff_algorithm)
                 };
                 // No change survives the rule. Git still reports an added/deleted
-                // filepair (header, zero counts, no hunk) even when its only content
-                // is blank lines — only a modification disappears entirely.
+                // filepair or mode change (header, zero counts, no hunk) even when
+                // its only content is blank lines — only a content-only
+                // modification disappears entirely.
                 if body.trim().is_empty() {
                     // `file.status` is parsed only from the pre-hunk header lines
                     // (`parse_diff_status` stops at the first `@@`), so a body line
                     // that merely contains "new file mode" cannot misclassify a
                     // modification as an add/delete.
-                    let is_add_or_delete = file.status == "added" || file.status == "deleted";
-                    if !is_add_or_delete {
+                    let keep_header = file.status == "added"
+                        || file.status == "deleted"
+                        || matches!(
+                            (file.old_mode, file.new_mode),
+                            (Some(old), Some(new)) if old != new
+                        );
+                    if !keep_header {
                         return false;
                     }
                     file.insertions = 0;
@@ -1755,10 +2621,24 @@ async fn run_diff(
                     &old_text,
                     &new_text,
                     regen_context,
+                    diff_algorithm,
                 );
                 file.hunks = parse_diff_hunks(&file.raw_diff);
             }
         }
+    }
+
+    apply_pickaxe(
+        &mut files,
+        pickaxe,
+        &first_map,
+        &second_map,
+        &ext_worktree_entries,
+        &textconv_outcome.pickaxe_counts,
+    )?;
+
+    if let Some(filter) = parse_diff_filter(args.diff_filter.as_deref())? {
+        apply_diff_filter(&mut files, &filter);
     }
 
     // Apply the external diff driver LAST so its verbatim output is never touched
@@ -1773,7 +2653,8 @@ async fn run_diff(
             command,
             &first_map,
             &second_map,
-            &ext_worktree_entries,
+            first_is_worktree,
+            second_is_worktree,
         )?;
         true
     } else {
@@ -1862,11 +2743,135 @@ fn filter_diff_files_by_pathspec(files: &mut Vec<DiffFileStat>, pathspecs: &Path
     });
 }
 
+fn append_mode_only_changes(
+    files: &mut Vec<DiffFileStat>,
+    old_blobs: &HashMap<PathBuf, ObjectHash>,
+    new_blobs: &HashMap<PathBuf, ObjectHash>,
+    old_modes: &HashMap<PathBuf, u32>,
+    new_modes: &HashMap<PathBuf, u32>,
+) {
+    let existing: HashSet<PathBuf> = files.iter().map(|file| PathBuf::from(&file.path)).collect();
+    for (path, old_hash) in old_blobs {
+        let Some(new_hash) = new_blobs.get(path) else {
+            continue;
+        };
+        let (Some(old_mode), Some(new_mode)) = (old_modes.get(path), new_modes.get(path)) else {
+            continue;
+        };
+        if old_hash != new_hash || old_mode == new_mode || existing.contains(path) {
+            continue;
+        }
+        let display = path.to_string_lossy();
+        files.push(DiffFileStat {
+            path: display.to_string(),
+            status: "modified".to_string(),
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            raw_diff: format!(
+                "diff --git a/{display} b/{display}\nold mode {old_mode:06o}\nnew mode {new_mode:06o}\n"
+            ),
+            rename_from: None,
+            similarity: None,
+            binary: None,
+            check_trailing_blank_start: None,
+            old_id: Some(*old_hash),
+            new_id: Some(*new_hash),
+            old_mode: Some(*old_mode),
+            new_mode: Some(*new_mode),
+        });
+    }
+    files.sort_by(|left, right| left.path.cmp(&right.path));
+}
+
+fn populate_diff_metadata(
+    files: &mut [DiffFileStat],
+    old_blobs: &HashMap<PathBuf, ObjectHash>,
+    new_blobs: &HashMap<PathBuf, ObjectHash>,
+    old_modes: &HashMap<PathBuf, u32>,
+    new_modes: &HashMap<PathBuf, u32>,
+    old_is_worktree: bool,
+    new_is_worktree: bool,
+) {
+    for file in files {
+        if file.raw_diff.starts_with("diff --cc ") {
+            continue;
+        }
+        let old_path = PathBuf::from(file.rename_from.as_deref().unwrap_or(&file.path));
+        let new_path = PathBuf::from(&file.path);
+        file.old_id = (!old_is_worktree)
+            .then(|| old_blobs.get(&old_path).copied())
+            .flatten();
+        file.new_id = (!new_is_worktree)
+            .then(|| new_blobs.get(&new_path).copied())
+            .flatten();
+        file.old_mode = old_modes.get(&old_path).copied();
+        file.new_mode = new_modes.get(&new_path).copied();
+    }
+}
+
+/// Normalize built-in patch mode headers from the directional tree/index/worktree
+/// metadata. `git_internal` compares blob ids and can render `100644` even when
+/// the real filepair is executable; keeping that placeholder would make ordinary
+/// and `--full-index` patches disagree with `--raw` and external-diff metadata.
+fn apply_mode_metadata_to_patch(file: &mut DiffFileStat) {
+    if file.raw_diff.starts_with("diff --cc ") {
+        return;
+    }
+    let trailing_newline = file.raw_diff.ends_with('\n');
+    let mode_change = match (file.old_mode, file.new_mode) {
+        (Some(old), Some(new)) if old != new => Some((old, new)),
+        _ => None,
+    };
+    let mut output = Vec::new();
+    for (index, line) in file.raw_diff.lines().enumerate() {
+        if index == 1
+            && let Some((old, new)) = mode_change
+        {
+            output.push(format!("old mode {old:06o}"));
+            output.push(format!("new mode {new:06o}"));
+        }
+        if line.starts_with("old mode ") || line.starts_with("new mode ") {
+            continue;
+        }
+        if line.starts_with("new file mode ")
+            && let Some(mode) = file.new_mode
+        {
+            output.push(format!("new file mode {mode:06o}"));
+            continue;
+        }
+        if line.starts_with("deleted file mode ")
+            && let Some(mode) = file.old_mode
+        {
+            output.push(format!("deleted file mode {mode:06o}"));
+            continue;
+        }
+        if let Some(ids) = line
+            .strip_prefix("index ")
+            .and_then(|rest| rest.split_whitespace().next())
+        {
+            let rewritten = match (file.old_mode, file.new_mode) {
+                (Some(old), Some(new)) if old == new => format!("index {ids} {new:06o}"),
+                _ => format!("index {ids}"),
+            };
+            output.push(rewritten);
+            continue;
+        }
+        output.push(line.to_string());
+    }
+    file.raw_diff = output.join("\n");
+    if trailing_newline {
+        file.raw_diff.push('\n');
+    }
+}
+
 #[derive(Debug)]
 struct DiffSide {
     label: String,
     blobs: Vec<(PathBuf, ObjectHash)>,
+    modes: HashMap<PathBuf, u32>,
     worktree_entries: HashMap<PathBuf, ObjectHash>,
+    is_worktree: bool,
 }
 
 /// diff needs to print hashes even if the files have not been staged yet.
@@ -2054,12 +3059,36 @@ fn get_worktree_diff_files(index: &Index) -> Result<Vec<PathBuf>, DiffError> {
 /// Unlike `get_files_blobs`, this uses the hash already recorded in the index
 /// rather than reading the current file on disk, which is essential for
 /// producing a correct working-directory diff (index vs working tree).
-fn get_index_blobs(index: &Index, policy: IgnorePolicy) -> Vec<(PathBuf, ObjectHash)> {
-    index
+fn get_index_side(
+    index: &Index,
+    policy: IgnorePolicy,
+) -> (Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>) {
+    let entries = index
         .tracked_entries(0)
+        .into_iter()
+        .filter(|entry| !ignore::should_ignore(&PathBuf::from(&entry.name), policy, index));
+    let mut blobs = Vec::new();
+    let mut modes = HashMap::new();
+    for entry in entries {
+        let path = PathBuf::from(&entry.name);
+        blobs.push((path.clone(), entry.hash));
+        modes.insert(path, entry.mode);
+    }
+    (blobs, modes)
+}
+
+fn get_worktree_modes(files: &[PathBuf]) -> Result<HashMap<PathBuf, u32>, DiffError> {
+    files
         .iter()
-        .filter(|entry| !ignore::should_ignore(&PathBuf::from(&entry.name), policy, index))
-        .map(|entry| (PathBuf::from(&entry.name), entry.hash))
+        .map(|path| {
+            let absolute = util::workdir_to_absolute(path);
+            let metadata =
+                std::fs::symlink_metadata(&absolute).map_err(|error| DiffError::FileRead {
+                    path: absolute.display().to_string(),
+                    detail: error.to_string(),
+                })?;
+            Ok((path.clone(), index_mode_from_metadata(&metadata)))
+        })
         .collect()
 }
 
@@ -2073,47 +3102,66 @@ async fn resolve_diff_side(
         let commit_hash = get_target_commit(source)
             .await
             .map_err(|_| DiffError::InvalidRevision(source.clone()))?;
+        let (blobs, modes) = get_commit_entries(&commit_hash).await?;
         return Ok(DiffSide {
             label: source.clone(),
-            blobs: get_commit_blobs(&commit_hash).await?,
+            blobs,
+            modes,
             worktree_entries: HashMap::new(),
+            is_worktree: false,
         });
     }
 
     if is_new {
         if staged {
+            let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
             Ok(DiffSide {
                 label: "index".to_string(),
-                blobs: get_index_blobs(index, IgnorePolicy::Respect),
+                blobs,
+                modes,
                 worktree_entries: HashMap::new(),
+                is_worktree: false,
             })
         } else {
             let files = get_worktree_diff_files(index)?;
             let blobs = get_files_blobs(&files, index, IgnorePolicy::Respect)?;
+            let modes = get_worktree_modes(&files)?;
             Ok(DiffSide {
                 label: "working tree".to_string(),
                 worktree_entries: blobs.iter().cloned().collect(),
                 blobs,
+                modes,
+                is_worktree: true,
             })
         }
     } else if staged {
         match Head::current_commit().await {
-            Some(commit_hash) => Ok(DiffSide {
-                label: "HEAD".to_string(),
-                blobs: get_commit_blobs(&commit_hash).await?,
-                worktree_entries: HashMap::new(),
-            }),
+            Some(commit_hash) => {
+                let (blobs, modes) = get_commit_entries(&commit_hash).await?;
+                Ok(DiffSide {
+                    label: "HEAD".to_string(),
+                    blobs,
+                    modes,
+                    worktree_entries: HashMap::new(),
+                    is_worktree: false,
+                })
+            }
             None => Ok(DiffSide {
                 label: "HEAD".to_string(),
                 blobs: Vec::new(),
+                modes: HashMap::new(),
                 worktree_entries: HashMap::new(),
+                is_worktree: false,
             }),
         }
     } else {
+        let (blobs, modes) = get_index_side(index, IgnorePolicy::Respect);
         Ok(DiffSide {
             label: "index".to_string(),
-            blobs: get_index_blobs(index, IgnorePolicy::Respect),
+            blobs,
+            modes,
             worktree_entries: HashMap::new(),
+            is_worktree: false,
         })
     }
 }
@@ -2121,6 +3169,14 @@ async fn resolve_diff_side(
 async fn get_commit_blobs(
     commit_hash: &ObjectHash,
 ) -> Result<Vec<(PathBuf, ObjectHash)>, DiffError> {
+    get_commit_entries(commit_hash)
+        .await
+        .map(|(blobs, _)| blobs)
+}
+
+async fn get_commit_entries(
+    commit_hash: &ObjectHash,
+) -> Result<(Vec<(PathBuf, ObjectHash)>, HashMap<PathBuf, u32>), DiffError> {
     let commit = load_object::<Commit>(commit_hash).map_err(|e| DiffError::ObjectLoad {
         kind: "commit",
         object_id: commit_hash.to_string(),
@@ -2131,7 +3187,53 @@ async fn get_commit_blobs(
         object_id: commit.tree_id.to_string(),
         detail: e.to_string(),
     })?;
-    Ok(tree.get_plain_items())
+    let mut blobs = Vec::new();
+    let mut modes = HashMap::new();
+    collect_tree_entries(&tree, Path::new(""), &mut blobs, &mut modes)?;
+    Ok((blobs, modes))
+}
+
+fn collect_tree_entries(
+    tree: &Tree,
+    prefix: &Path,
+    blobs: &mut Vec<(PathBuf, ObjectHash)>,
+    modes: &mut HashMap<PathBuf, u32>,
+) -> Result<(), DiffError> {
+    for item in &tree.tree_items {
+        let item_path = prefix.join(&item.name);
+        match item.mode {
+            TreeItemMode::Tree => {
+                let subtree =
+                    load_object::<Tree>(&item.id).map_err(|error| DiffError::ObjectLoad {
+                        kind: "tree",
+                        object_id: item.id.to_string(),
+                        detail: error.to_string(),
+                    })?;
+                collect_tree_entries(&subtree, &item_path, blobs, modes)?;
+            }
+            TreeItemMode::Commit => {
+                crate::utils::error::emit_legacy_stderr(format!(
+                    "Warning: Submodule '{}' is not supported yet; skipping checkout entry",
+                    item_path.display()
+                ));
+            }
+            mode => {
+                blobs.push((item_path.clone(), item.id));
+                modes.insert(item_path, tree_mode_to_index_mode(mode));
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tree_mode_to_index_mode(mode: TreeItemMode) -> u32 {
+    match mode {
+        TreeItemMode::Blob => 0o100644,
+        TreeItemMode::BlobExecutable => 0o100755,
+        TreeItemMode::Link => 0o120000,
+        TreeItemMode::Commit => 0o160000,
+        TreeItemMode::Tree => 0o040000,
+    }
 }
 
 /// Render a Git-style `--stat` block for the changes between two commits'
@@ -2263,6 +3365,10 @@ fn build_unmerged_diff_file(entry: &UnmergedEntry) -> Result<DiffFileStat, DiffE
         similarity: None,
         binary: None,
         check_trailing_blank_start: None,
+        old_id: None,
+        new_id: None,
+        old_mode: None,
+        new_mode: None,
     })
 }
 
@@ -2364,16 +3470,18 @@ fn line_count(text: &str) -> usize {
 }
 
 /// Whether the textual patch body is shown for this invocation. The
-/// `--stat`/`--numstat`/`--shortstat`/`--name-only`/`--name-status`/`--summary`/
+/// `--stat`/`--compact-summary`/`--numstat`/`--shortstat`/`--raw`/name/summary/
 /// `-s`/`--check` modes render from the internal diff and bypass external
 /// drivers (matching Git, which never runs `diff.external` for those modes).
 fn patch_body_is_shown(args: &DiffArgs) -> bool {
     !(args.stat
+        || args.compact_summary
         || args.numstat
         || args.shortstat
         || args.name_only
         || args.name_status
         || args.summary
+        || args.raw
         || args.no_patch
         || args.check)
 }
@@ -2505,19 +3613,37 @@ fn similarity_score(old: &[u8], new: &[u8]) -> u32 {
 
 /// Detect renames among the deleted + added files and fold each matched pair into
 /// a single rename entry (`-M`). Exact (same blob id) pairs are matched first,
-/// then the best inexact pairs whose similarity meets the threshold. Each side is
-/// used at most once.
+/// then the best inexact pairs whose similarity meets the threshold. Candidates
+/// must retain their file type (regular file, symlink, and so on), and each side
+/// is used at most once.
 #[allow(clippy::too_many_arguments)]
 fn apply_rename_detection(
     files: &mut Vec<DiffFileStat>,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
+    first_modes: &HashMap<PathBuf, u32>,
+    second_modes: &HashMap<PathBuf, u32>,
     worktree_entries: &HashMap<PathBuf, ObjectHash>,
     threshold: u32,
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
+    diff_algorithm: &DiffAlgorithm,
 ) -> bool {
+    let same_file_type = |old_path: &str, new_path: &str| {
+        let old_type = first_modes
+            .get(&PathBuf::from(old_path))
+            .map(|mode| mode & 0o170000);
+        let new_type = second_modes
+            .get(&PathBuf::from(new_path))
+            .map(|mode| mode & 0o170000);
+        match (old_type, new_type) {
+            (Some(old), Some(new)) => old == new,
+            // Missing mode metadata should not disable otherwise valid rename
+            // detection; populated tree, index, and worktree sides have modes.
+            _ => true,
+        }
+    };
     let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Option<Vec<u8>> {
         let pb = PathBuf::from(path);
         let hash = map.get(&pb)?;
@@ -2559,10 +3685,16 @@ fn apply_rename_detection(
         let Some(dh) = first_map.get(&PathBuf::from(&files[di].path)) else {
             continue;
         };
-        let Some(ai) = added_by_hash
-            .get_mut(&dh.to_string())
-            .and_then(VecDeque::pop_front)
+        let Some(candidates) = added_by_hash.get_mut(&dh.to_string()) else {
+            continue;
+        };
+        let Some(position) = candidates
+            .iter()
+            .position(|&ai| same_file_type(&files[di].path, &files[ai].path))
         else {
+            continue;
+        };
+        let Some(ai) = candidates.remove(position) else {
             continue;
         };
         pairs.push((di, ai, 60000));
@@ -2614,6 +3746,9 @@ fn apply_rename_detection(
             };
             for &ai in &added {
                 if used_add[ai] {
+                    continue;
+                }
+                if !same_file_type(&files[di].path, &files[ai].path) {
                     continue;
                 }
                 let Some(new) = new_contents.get(&ai) else {
@@ -2670,6 +3805,7 @@ fn apply_rename_detection(
             context,
             ws_normalize,
             ignore_blank,
+            diff_algorithm,
         );
         // Insert at the added entry's position so output order stays stable.
         renames.insert(*ai, entry);
@@ -2710,6 +3846,7 @@ fn build_rename_entry(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
+    diff_algorithm: &DiffAlgorithm,
 ) -> DiffFileStat {
     let mut raw = format!(
         "diff --git a/{old_path} b/{new_path}\nsimilarity index {percent}%\nrename from {old_path}\nrename to {new_path}\n"
@@ -2726,14 +3863,29 @@ fn build_rename_entry(
         let hunks = if ignore_blank {
             match ws_normalize {
                 Some(normalize) => compute_unified_hunks_ignore_blank_normalized(
-                    &old_text, &new_text, context, normalize,
+                    &old_text,
+                    &new_text,
+                    context,
+                    diff_algorithm,
+                    normalize,
                 ),
-                None => compute_unified_hunks_ignore_blank(&old_text, &new_text, context),
+                None => compute_unified_hunks_ignore_blank(
+                    &old_text,
+                    &new_text,
+                    context,
+                    diff_algorithm,
+                ),
             }
         } else if let Some(normalize) = ws_normalize {
-            compute_unified_hunks_normalized(&old_text, &new_text, context, normalize)
+            compute_unified_hunks_normalized(
+                &old_text,
+                &new_text,
+                context,
+                diff_algorithm,
+                normalize,
+            )
         } else {
-            compute_unified_hunks(&old_text, &new_text, context)
+            compute_unified_hunks(&old_text, &new_text, context, diff_algorithm)
         };
         // A rename that differs only in ignored whitespace/blank lines has an
         // empty body: emit just the rename headers (no `index`/`---`/`+++`).
@@ -2763,6 +3915,10 @@ fn build_rename_entry(
         similarity: Some(percent),
         binary: None,
         check_trailing_blank_start: None,
+        old_id: None,
+        new_id: None,
+        old_mode: None,
+        new_mode: None,
     }
 }
 
@@ -2831,10 +3987,19 @@ async fn resolve_textconv_command(
 /// patch header (including a rename's `similarity`/`rename from`/`to`, whose old
 /// side lives at `rename_from` and may resolve a DIFFERENT driver than the new
 /// side). A side with no command is diffed raw. A modification whose converted
-/// content is unchanged is dropped (like a whitespace-only change);
-/// created/deleted/renamed files keep their header. Returns the set of textconv'd
-/// paths so the later context/whitespace post-pass skips them. Blob read failures
-/// surface as errors (not empty content).
+/// content is unchanged is dropped (like a whitespace-only change), unless its
+/// mode changed; created/deleted/renamed/mode-changed files keep their header.
+/// Returns the set of textconv'd paths so the later context/whitespace post-pass
+/// skips them. When `pickaxe_needle` is present, the old/new occurrence counts
+/// are computed while the converted strings already exist and retained without
+/// keeping either potentially-large string alive or executing a command again.
+/// Blob read failures surface as errors (not empty content).
+#[derive(Default)]
+struct TextconvOutcome {
+    paths: HashSet<String>,
+    pickaxe_counts: HashMap<String, (usize, usize)>,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn apply_textconv(
     files: &mut Vec<DiffFileStat>,
@@ -2845,7 +4010,9 @@ fn apply_textconv(
     context: usize,
     ws_normalize: Option<fn(&str) -> String>,
     ignore_blank: bool,
-) -> Result<std::collections::HashSet<String>, DiffError> {
+    diff_algorithm: &DiffAlgorithm,
+    pickaxe_needle: Option<&[u8]>,
+) -> Result<TextconvOutcome, DiffError> {
     // `None` = the side is absent from its map (a created/deleted side) and must
     // stay raw-empty — NOT fed through textconv (a converter that emits text for
     // empty input would fabricate hunks). `Some` = a present blob; a mapped blob
@@ -2874,13 +4041,19 @@ fn apply_textconv(
     let regen = |old: &str, new: &str| -> String {
         if ignore_blank {
             match ws_normalize {
-                Some(n) => compute_unified_hunks_ignore_blank_normalized(old, new, context, n),
-                None => compute_unified_hunks_ignore_blank(old, new, context),
+                Some(n) => compute_unified_hunks_ignore_blank_normalized(
+                    old,
+                    new,
+                    context,
+                    diff_algorithm,
+                    n,
+                ),
+                None => compute_unified_hunks_ignore_blank(old, new, context, diff_algorithm),
             }
         } else if let Some(n) = ws_normalize {
-            compute_unified_hunks_normalized(old, new, context, n)
+            compute_unified_hunks_normalized(old, new, context, diff_algorithm, n)
         } else {
-            compute_unified_hunks(old, new, context)
+            compute_unified_hunks(old, new, context, diff_algorithm)
         }
     };
 
@@ -2918,6 +4091,23 @@ fn apply_textconv(
         converted.insert(file.path.clone(), (old_text, new_text));
     }
 
+    let pickaxe_counts = pickaxe_needle
+        .map(|needle| {
+            converted
+                .iter()
+                .map(|(path, (old, new))| {
+                    (
+                        path.clone(),
+                        (
+                            count_literal_occurrences(old.as_bytes(), needle),
+                            count_literal_occurrences(new.as_bytes(), needle),
+                        ),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+
     // Pass 2: splice the re-diffed body (no fallible work).
     let mut done = std::collections::HashSet::new();
     files.retain_mut(|file| {
@@ -2937,7 +4127,12 @@ fn apply_textconv(
             }
             // Converted content is identical: drop a pure modification, but keep a
             // created/deleted/renamed entry (header only, zero counts).
-            let keep_header = matches!(file.status.as_str(), "added" | "deleted" | "renamed");
+            let mode_changed = matches!(
+                (file.old_mode, file.new_mode),
+                (Some(old), Some(new)) if old != new
+            );
+            let keep_header =
+                matches!(file.status.as_str(), "added" | "deleted" | "renamed") || mode_changed;
             if !keep_header {
                 return false;
             }
@@ -2973,8 +4168,12 @@ fn apply_textconv(
             if !raw.ends_with('\n') {
                 raw.push('\n');
             }
+            let index_mode = match (file.old_mode, file.new_mode) {
+                (Some(old), Some(new)) if old == new => format!(" {new:06o}"),
+                _ => String::new(),
+            };
             raw.push_str(&format!(
-                "index {}..{} 100644\n--- a/{old_path}\n+++ b/{}\n",
+                "index {}..{}{index_mode}\n--- a/{old_path}\n+++ b/{}\n",
                 abbrev(first_map, &old_path),
                 abbrev(second_map, &file.path),
                 file.path,
@@ -2985,7 +4184,10 @@ fn apply_textconv(
         file.hunks = parse_diff_hunks(&file.raw_diff);
         true
     });
-    Ok(done)
+    Ok(TextconvOutcome {
+        paths: done,
+        pickaxe_counts,
+    })
 }
 
 /// zlib-deflate `data` (for `--binary` literal chunks). Uses `flate2` at the
@@ -3072,6 +4274,7 @@ fn force_text_for_bare_binary(
     second_map: &HashMap<PathBuf, ObjectHash>,
     worktree_entries: &HashMap<PathBuf, ObjectHash>,
     context: usize,
+    diff_algorithm: &DiffAlgorithm,
 ) -> Result<(), DiffError> {
     let load = |path: &str, map: &HashMap<PathBuf, ObjectHash>| -> Result<Vec<u8>, DiffError> {
         let pb = PathBuf::from(path);
@@ -3097,7 +4300,7 @@ fn force_text_for_bare_binary(
         let old_path = file.rename_from.as_deref().unwrap_or(&file.path);
         let old_text = String::from_utf8_lossy(&load(old_path, first_map)?).into_owned();
         let new_text = String::from_utf8_lossy(&load(&file.path, second_map)?).into_owned();
-        let hunks = compute_unified_hunks(&old_text, &new_text, context);
+        let hunks = compute_unified_hunks(&old_text, &new_text, context, diff_algorithm);
         if hunks.trim().is_empty() {
             continue;
         }
@@ -3265,8 +4468,8 @@ fn apply_binary_detection(
 /// diff driver (`diff.external`), following Git's `GIT_EXTERNAL_DIFF` protocol:
 /// the command is invoked as `cmd path old-file old-hex old-mode new-file
 /// new-hex new-mode` and its stdout becomes that file's diff. A missing side
-/// uses `/dev/null` with `.` for its hex and mode; a new side that is the live
-/// working tree reports an all-zero hash (uncommitted), matching Git. The
+/// uses `/dev/null` with `.` for its hex and mode; whichever directional side is
+/// the live working tree reports an all-zero hash (including under `-R`), matching Git. The
 /// command is run through the shell so a `diff.external` value carrying its own
 /// arguments works.
 fn apply_external_diff(
@@ -3274,7 +4477,8 @@ fn apply_external_diff(
     command: &str,
     first_map: &HashMap<PathBuf, ObjectHash>,
     second_map: &HashMap<PathBuf, ObjectHash>,
-    worktree_entries: &HashMap<PathBuf, ObjectHash>,
+    first_is_worktree: bool,
+    second_is_worktree: bool,
 ) -> Result<(), DiffError> {
     use std::io::Write as _;
 
@@ -3329,12 +4533,6 @@ fn apply_external_diff(
         Ok((arg, hex, mode, Some(tmp)))
     };
 
-    // A side reads from the working tree iff its blob id matches the worktree
-    // entry — which can be EITHER side once `-R` swaps them.
-    let side_is_worktree = |path: &Path, hash: Option<&ObjectHash>| -> bool {
-        hash.is_some_and(|h| worktree_entries.get(path) == Some(h))
-    };
-
     let total = files.len();
     for (index, file) in files.iter_mut().enumerate() {
         let path = PathBuf::from(&file.path);
@@ -3345,20 +4543,24 @@ fn apply_external_diff(
             .as_deref()
             .map(PathBuf::from)
             .unwrap_or_else(|| path.clone());
-        let (old_mode, new_mode) = external_diff_modes(&file.raw_diff);
+        let (fallback_old_mode, fallback_new_mode) = external_diff_modes(&file.raw_diff);
+        let old_mode = file
+            .old_mode
+            .map(|mode| format!("{mode:06o}"))
+            .unwrap_or(fallback_old_mode);
+        let new_mode = file
+            .new_mode
+            .map(|mode| format!("{mode:06o}"))
+            .unwrap_or(fallback_new_mode);
 
         let (old_file, old_hex, old_mode_arg, _old_tmp) = materialize(
             first_map.get(&old_path),
-            side_is_worktree(&old_path, first_map.get(&old_path)),
+            first_is_worktree,
             &old_path,
             &old_mode,
         )?;
-        let (new_file, new_hex, new_mode_arg, _new_tmp) = materialize(
-            second_map.get(&path),
-            side_is_worktree(&path, second_map.get(&path)),
-            &path,
-            &new_mode,
-        )?;
+        let (new_file, new_hex, new_mode_arg, _new_tmp) =
+            materialize(second_map.get(&path), second_is_worktree, &path, &new_mode)?;
 
         let result = std::process::Command::new("sh")
             .arg("-c")
@@ -3575,7 +4777,9 @@ fn render_diff_output(
     // when --quiet is set (quiet only suppresses stdout, not file writes).
     // `-z` NUL-terminates each record; `--name-status` then separates the
     // status and path with a NUL instead of a tab.
-    let rendered = if args.name_only {
+    let rendered = if args.raw {
+        format_diff_raw(result, args.null)
+    } else if args.name_only {
         join_diff_records(result.files.iter().map(|file| file.path.clone()), args.null)
     } else if args.name_status {
         let field_sep = if args.null { '\0' } else { '\t' };
@@ -3591,12 +4795,7 @@ fn render_diff_output(
                         sep = field_sep,
                     )
                 } else {
-                    format!(
-                        "{}{}{}",
-                        diff_status_letter(&file.status),
-                        field_sep,
-                        file.path
-                    )
+                    format!("{}{}{}", diff_status_code(file), field_sep, file.path)
                 }
             }),
             args.null,
@@ -3624,8 +4823,8 @@ fn render_diff_output(
             }),
             args.null,
         )
-    } else if args.stat {
-        format_diff_stat_output(result)
+    } else if args.stat || args.compact_summary {
+        format_diff_stat_output_with_compact(result, args.compact_summary)
     } else if args.shortstat {
         format_diff_shortstat_output(result)
     } else if args.summary {
@@ -3675,8 +4874,10 @@ fn render_diff_output(
         || args.name_status
         || args.numstat
         || args.stat
+        || args.compact_summary
         || args.shortstat
         || args.summary
+        || args.raw
         || word_diff_active(args)
         || result.external_diff_applied
         || result.binary_patch
@@ -3696,7 +4897,7 @@ fn render_diff_output(
     };
     // `-z` records carry their own NUL terminators, and external-driver output is
     // emitted byte-for-byte, so neither gets an appended trailing newline.
-    let z_records = args.null && (args.name_only || args.name_status || args.numstat);
+    let z_records = args.null && (args.name_only || args.name_status || args.numstat || args.raw);
     // The verbatim (no trailing-newline) write path applies only when the PATCH
     // body is actually rendered — `--binary --stat`/`--numstat` still get the
     // normal trailing newline even though `binary_patch` is set.
@@ -3733,9 +4934,8 @@ fn diff_exit_result(args: &DiffArgs, result: &DiffOutput) -> CliResult<()> {
     }
 }
 
-/// Render `--summary`: one line per created file, deleted file, or detected
-/// rename; plain content modifications produce no line, matching
-/// `git diff --summary`. Mode-only changes are not surfaced.
+/// Render `--summary`: one line per created/deleted file, detected rename, or
+/// mode change; plain content-only modifications produce no line.
 fn format_diff_summary(result: &DiffOutput) -> String {
     result
         .files
@@ -3747,11 +4947,31 @@ fn format_diff_summary(result: &DiffOutput) -> String {
 
 fn summary_line(file: &DiffFileStat) -> Option<String> {
     if file.status == "renamed" {
-        return Some(format!(
+        let mut summary = format!(
             " rename {} ({}%)",
             rename_display(file.rename_from.as_deref().unwrap_or(""), &file.path),
             file.similarity.unwrap_or(0),
-        ));
+        );
+        if let (Some(old), Some(new)) = (file.old_mode, file.new_mode)
+            && old != new
+        {
+            summary.push_str(&format!(
+                "\n mode change {old:06o} => {new:06o} {}",
+                file.path
+            ));
+        }
+        return Some(summary);
+    }
+    if let (None, Some(new)) = (file.old_mode, file.new_mode) {
+        return Some(format!(" create mode {new:06o} {}", file.path));
+    }
+    if let (Some(old), None) = (file.old_mode, file.new_mode) {
+        return Some(format!(" delete mode {old:06o} {}", file.path));
+    }
+    if let (Some(old), Some(new)) = (file.old_mode, file.new_mode)
+        && old != new
+    {
+        return Some(format!(" mode change {old:06o} => {new:06o} {}", file.path));
     }
     let find = |prefix: &str| {
         file.raw_diff
@@ -3768,12 +4988,80 @@ fn summary_line(file: &DiffFileStat) -> Option<String> {
     None
 }
 
-fn diff_status_letter(status: &str) -> &'static str {
-    match status {
-        "added" => "A",
-        "deleted" => "D",
-        _ => "M",
+fn diff_status_code(file: &DiffFileStat) -> char {
+    if file.raw_diff.starts_with("diff --cc ") {
+        return 'U';
     }
+    if file.status == "renamed" {
+        return 'R';
+    }
+    if file.status == "added" {
+        return 'A';
+    }
+    if file.status == "deleted" {
+        return 'D';
+    }
+    if let (Some(old), Some(new)) = (file.old_mode, file.new_mode)
+        && old & 0o170000 != new & 0o170000
+    {
+        return 'T';
+    }
+    'M'
+}
+
+fn abbreviated_raw_id(id: Option<ObjectHash>) -> String {
+    id.map(|hash| {
+        let full = hash.to_string();
+        full.get(..7).unwrap_or(&full).to_string()
+    })
+    .unwrap_or_else(|| "0000000".to_string())
+}
+
+fn raw_mode(mode: Option<u32>) -> String {
+    mode.map(|mode| format!("{mode:06o}"))
+        .unwrap_or_else(|| "000000".to_string())
+}
+
+fn format_diff_raw(result: &DiffOutput, null: bool) -> String {
+    let mut output = String::new();
+    for file in &result.files {
+        let status = diff_status_code(file);
+        let status_field = if status == 'R' {
+            format!("R{:03}", file.similarity.unwrap_or(0))
+        } else {
+            status.to_string()
+        };
+        let metadata = format!(
+            ":{} {} {} {} {status_field}",
+            raw_mode(file.old_mode),
+            raw_mode(file.new_mode),
+            abbreviated_raw_id(file.old_id),
+            abbreviated_raw_id(file.new_id),
+        );
+        if null {
+            output.push_str(&metadata);
+            output.push('\0');
+            if status == 'R' {
+                output.push_str(file.rename_from.as_deref().unwrap_or(""));
+                output.push('\0');
+            }
+            output.push_str(&file.path);
+            output.push('\0');
+        } else if status == 'R' {
+            let _ = writeln!(
+                output,
+                "{metadata}\t{}\t{}",
+                file.rename_from.as_deref().unwrap_or(""),
+                file.path
+            );
+        } else {
+            let _ = writeln!(output, "{metadata}\t{}", file.path);
+        }
+    }
+    if !null {
+        output.pop();
+    }
+    output
 }
 
 /// Render a rename path pair the way Git's `pprint_rename` does for `--stat` /
@@ -3832,10 +5120,11 @@ fn rewrite_unified_diff_context(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: &DiffAlgorithm,
 ) -> String {
     splice_unified_body(
         raw_diff,
-        &compute_unified_hunks(old_text, new_text, context),
+        &compute_unified_hunks(old_text, new_text, context, diff_algorithm),
     )
 }
 
@@ -3873,20 +5162,363 @@ enum UnifiedEditLine<'a> {
     Insert(usize, &'a str),
 }
 
+#[derive(Debug, Clone, Copy)]
+enum IndexedLineChange {
+    Equal { new_index: usize },
+    Delete { old_index: usize },
+    Insert { new_index: usize },
+}
+
+impl IndexedLineChange {
+    fn tag(self) -> ChangeTag {
+        match self {
+            Self::Equal { .. } => ChangeTag::Equal,
+            Self::Delete { .. } => ChangeTag::Delete,
+            Self::Insert { .. } => ChangeTag::Insert,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PatienceCandidate {
+    old_index: usize,
+    new_index: usize,
+    previous: Option<usize>,
+}
+
+fn unique_line_positions<'a>(
+    lines: &[&'a str],
+    range: Range<usize>,
+) -> HashMap<&'a str, Option<usize>> {
+    let mut positions = HashMap::with_capacity(range.len());
+    for index in range {
+        positions
+            .entry(lines[index])
+            .and_modify(|position| *position = None)
+            .or_insert(Some(index));
+    }
+    positions
+}
+
+/// Split Git-style raw records while preserving each line terminator. Anchored
+/// comparison and prefix matching use these records; emission strips the
+/// terminator to match the existing unified-hunk assembler.
+fn raw_anchor_records(text: &str) -> Vec<&str> {
+    if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_inclusive('\n').collect()
+    }
+}
+
+/// Git's anchored mode is patience diff with an anchor-aware LIS. All lines
+/// unique on both sides remain candidates; an anchored candidate locks its LIS
+/// position so a later candidate cannot displace it. This is the key behavior
+/// that prevents a qualifying line from surfacing as delete+insert.
+fn anchored_patience_sequence(
+    old: &[&str],
+    old_range: Range<usize>,
+    new: &[&str],
+    new_range: Range<usize>,
+    anchor_lines: &[&str],
+    anchors: &[String],
+) -> Vec<(usize, usize)> {
+    let old_unique = unique_line_positions(old, old_range.clone());
+    let new_unique = unique_line_positions(new, new_range);
+    let mut candidates = Vec::new();
+    for old_index in old_range {
+        let line = old[old_index];
+        if old_unique.get(line).copied().flatten() != Some(old_index) {
+            continue;
+        }
+        let Some(new_index) = new_unique.get(line).copied().flatten() else {
+            continue;
+        };
+        candidates.push(PatienceCandidate {
+            old_index,
+            new_index,
+            previous: None,
+        });
+    }
+
+    let mut sequence: Vec<usize> = Vec::with_capacity(candidates.len());
+    let mut longest = 0usize;
+    let mut locked_anchor: Option<usize> = None;
+    for candidate_index in 0..candidates.len() {
+        let new_index = candidates[candidate_index].new_index;
+        let insert_at =
+            sequence[..longest].partition_point(|index| candidates[*index].new_index < new_index);
+        candidates[candidate_index].previous = insert_at
+            .checked_sub(1)
+            .and_then(|index| sequence.get(index).copied());
+        if locked_anchor.is_some_and(|locked| insert_at <= locked) {
+            continue;
+        }
+        if insert_at == sequence.len() {
+            sequence.push(candidate_index);
+        } else {
+            sequence[insert_at] = candidate_index;
+        }
+
+        let is_anchor = anchor_lines
+            .get(new_index)
+            .is_some_and(|line| anchors.iter().any(|prefix| line.starts_with(prefix)));
+        if is_anchor {
+            locked_anchor = Some(insert_at);
+            longest = insert_at + 1;
+        } else if insert_at == longest {
+            longest += 1;
+        }
+    }
+
+    let Some(mut candidate_index) = longest
+        .checked_sub(1)
+        .and_then(|index| sequence.get(index).copied())
+    else {
+        return Vec::new();
+    };
+    let mut result = Vec::with_capacity(longest);
+    loop {
+        let candidate = candidates[candidate_index];
+        result.push((candidate.old_index, candidate.new_index));
+        let Some(previous) = candidate.previous else {
+            break;
+        };
+        candidate_index = previous;
+    }
+    result.reverse();
+    result
+}
+
+fn append_similar_range(
+    old: &[&str],
+    old_range: Range<usize>,
+    new: &[&str],
+    new_range: Range<usize>,
+    algorithm: Algorithm,
+    out: &mut Vec<IndexedLineChange>,
+) {
+    let diff = TextDiff::configure()
+        .algorithm(algorithm)
+        .diff_slices(&old[old_range.clone()], &new[new_range.clone()]);
+    let mut old_index = old_range.start;
+    let mut new_index = new_range.start;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            ChangeTag::Equal => {
+                out.push(IndexedLineChange::Equal { new_index });
+                old_index += 1;
+                new_index += 1;
+            }
+            ChangeTag::Delete => {
+                out.push(IndexedLineChange::Delete { old_index });
+                old_index += 1;
+            }
+            ChangeTag::Insert => {
+                out.push(IndexedLineChange::Insert { new_index });
+                new_index += 1;
+            }
+        }
+    }
+}
+
+fn anchored_diff_range(
+    old: &[&str],
+    old_range: Range<usize>,
+    new: &[&str],
+    new_range: Range<usize>,
+    anchor_lines: &[&str],
+    anchors: &[String],
+    out: &mut Vec<IndexedLineChange>,
+) {
+    enum Task {
+        Diff(Range<usize>, Range<usize>),
+        Equal(Range<usize>, Range<usize>),
+    }
+
+    let mut stack = vec![Task::Diff(old_range, new_range)];
+    while let Some(task) = stack.pop() {
+        let (old_range, new_range) = match task {
+            Task::Diff(old_range, new_range) => (old_range, new_range),
+            Task::Equal(old_range, new_range) => {
+                out.extend(
+                    old_range
+                        .zip(new_range)
+                        .map(|(_, new_index)| IndexedLineChange::Equal { new_index }),
+                );
+                continue;
+            }
+        };
+
+        if old_range.is_empty() {
+            out.extend(new_range.map(|new_index| IndexedLineChange::Insert { new_index }));
+            continue;
+        }
+        if new_range.is_empty() {
+            out.extend(old_range.map(|old_index| IndexedLineChange::Delete { old_index }));
+            continue;
+        }
+
+        let sequence = anchored_patience_sequence(
+            old,
+            old_range.clone(),
+            new,
+            new_range.clone(),
+            anchor_lines,
+            anchors,
+        );
+        if sequence.is_empty() {
+            append_similar_range(old, old_range, new, new_range, Algorithm::Myers, out);
+            continue;
+        }
+
+        // Build the recursive walk as ordered tasks, then push them in reverse.
+        // This preserves Git's patience recursion exactly without exposing the
+        // process to stack exhaustion on adversarially nested inputs.
+        let mut tasks = Vec::with_capacity(sequence.len().saturating_mul(3).saturating_add(2));
+        let mut old_current = old_range.start;
+        let mut new_current = new_range.start;
+        for (anchor_old, anchor_new) in sequence {
+            let mut common_old = anchor_old;
+            let mut common_new = anchor_new;
+            while common_old > old_current
+                && common_new > new_current
+                && old[common_old - 1] == new[common_new - 1]
+            {
+                common_old -= 1;
+                common_new -= 1;
+            }
+
+            let prefix_old = old_current;
+            let prefix_new = new_current;
+            while old_current < common_old
+                && new_current < common_new
+                && old[old_current] == new[new_current]
+            {
+                old_current += 1;
+                new_current += 1;
+            }
+            if old_current > prefix_old {
+                tasks.push(Task::Equal(
+                    prefix_old..old_current,
+                    prefix_new..new_current,
+                ));
+            }
+            if old_current < common_old || new_current < common_new {
+                tasks.push(Task::Diff(old_current..common_old, new_current..common_new));
+            }
+            tasks.push(Task::Equal(
+                common_old..anchor_old + 1,
+                common_new..anchor_new + 1,
+            ));
+            old_current = anchor_old + 1;
+            new_current = anchor_new + 1;
+        }
+
+        let prefix_old = old_current;
+        let prefix_new = new_current;
+        while old_current < old_range.end
+            && new_current < new_range.end
+            && old[old_current] == new[new_current]
+        {
+            old_current += 1;
+            new_current += 1;
+        }
+        if old_current > prefix_old {
+            tasks.push(Task::Equal(
+                prefix_old..old_current,
+                prefix_new..new_current,
+            ));
+        }
+        if old_current < old_range.end || new_current < new_range.end {
+            tasks.push(Task::Diff(
+                old_current..old_range.end,
+                new_current..new_range.end,
+            ));
+        }
+        stack.extend(tasks.into_iter().rev());
+    }
+}
+
+fn anchored_indexed_changes(
+    old: &[&str],
+    new: &[&str],
+    anchor_lines: &[&str],
+    anchors: &[String],
+) -> Vec<IndexedLineChange> {
+    let mut changes = Vec::with_capacity(old.len() + new.len());
+    anchored_diff_range(
+        old,
+        0..old.len(),
+        new,
+        0..new.len(),
+        anchor_lines,
+        anchors,
+        &mut changes,
+    );
+    changes
+}
+
+fn materialize_indexed_changes<'a>(
+    changes: &[IndexedLineChange],
+    old_lines: &[&'a str],
+    new_lines: &[&'a str],
+) -> Vec<(ChangeTag, &'a str)> {
+    changes
+        .iter()
+        .map(|change| {
+            let line = match *change {
+                IndexedLineChange::Delete { old_index } => old_lines[old_index],
+                IndexedLineChange::Insert { new_index } => new_lines[new_index],
+                // Context comes from the post-image, matching Git and the
+                // normalized non-anchored path below.
+                IndexedLineChange::Equal { new_index } => new_lines[new_index],
+            };
+            (change.tag(), line)
+        })
+        .collect()
+}
+
 /// Compute the unified-diff hunk body (the `@@ … @@` blocks, no file header)
 /// for `old_text` vs `new_text` at `context` lines of surrounding context.
-/// Myers line diff with a rolling-context assembler — a context-parameterized
-/// copy of git_internal's `compute_unified_diff` so the output matches its
-/// default (3-context) layout that is already validated against real Git.
-fn compute_unified_hunks(old_text: &str, new_text: &str, context: usize) -> String {
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_lines(old_text, new_text);
-    let changes: Vec<(ChangeTag, &str)> = diff
-        .iter_all_changes()
-        .map(|c| (c.tag(), c.value().trim_end_matches(['\r', '\n'])))
-        .collect();
-    assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+/// Selected line diff with a rolling-context assembler — a context-parameterized
+/// copy of git_internal's `compute_unified_diff`. Myers matches git_internal's
+/// initial body; Patience/Histogram/Anchored replace it with their selected
+/// anchors.
+fn compute_unified_hunks(
+    old_text: &str,
+    new_text: &str,
+    context: usize,
+    diff_algorithm: &DiffAlgorithm,
+) -> String {
+    match diff_algorithm {
+        DiffAlgorithm::Anchored(anchors) => {
+            let old_records = raw_anchor_records(old_text);
+            let new_records = raw_anchor_records(new_text);
+            let old_lines: Vec<&str> = old_records
+                .iter()
+                .map(|line| line.trim_end_matches(['\r', '\n']))
+                .collect();
+            let new_lines: Vec<&str> = new_records
+                .iter()
+                .map(|line| line.trim_end_matches(['\r', '\n']))
+                .collect();
+            let indexed =
+                anchored_indexed_changes(&old_records, &new_records, &new_records, anchors);
+            let changes = materialize_indexed_changes(&indexed, &old_lines, &new_lines);
+            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+        }
+        _ => {
+            let diff = TextDiff::configure()
+                .algorithm(diff_algorithm.backend())
+                .diff_lines(old_text, new_text);
+            let changes: Vec<(ChangeTag, &str)> = diff
+                .iter_all_changes()
+                .map(|c| (c.tag(), c.value().trim_end_matches(['\r', '\n'])))
+                .collect();
+            assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
+        }
+    }
 }
 
 /// Normalizer for `-w` / `--ignore-all-space`: drop every whitespace character
@@ -3948,6 +5580,7 @@ fn compute_unified_hunks_normalized(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: &DiffAlgorithm,
     normalize: fn(&str) -> String,
 ) -> String {
     let old_lines: Vec<&str> = old_text.lines().collect();
@@ -3957,25 +5590,36 @@ fn compute_unified_hunks_normalized(
     // `diff_slices` compares `&[&str]` elements; borrow the normalized strings.
     let old_norm_ref: Vec<&str> = old_norm.iter().map(String::as_str).collect();
     let new_norm_ref: Vec<&str> = new_norm.iter().map(String::as_str).collect();
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_slices(&old_norm_ref, &new_norm_ref);
-    let mut changes: Vec<(ChangeTag, &str)> = Vec::with_capacity(old_lines.len() + new_lines.len());
-    for change in diff.iter_all_changes() {
-        let tag = change.tag();
-        let text = match tag {
-            ChangeTag::Delete => change.old_index().map(|i| old_lines[i]).unwrap_or(""),
-            ChangeTag::Insert => change.new_index().map(|i| new_lines[i]).unwrap_or(""),
-            // Context: both sides are equal under `normalize`; Git emits the
-            // post-image (new) line, falling back to the old side.
-            ChangeTag::Equal => change
-                .new_index()
-                .map(|i| new_lines[i])
-                .or_else(|| change.old_index().map(|i| old_lines[i]))
-                .unwrap_or(""),
-        };
-        changes.push((tag, text));
-    }
+    let changes: Vec<(ChangeTag, &str)> = match diff_algorithm {
+        DiffAlgorithm::Anchored(anchors) => {
+            let anchor_lines = raw_anchor_records(new_text);
+            let indexed =
+                anchored_indexed_changes(&old_norm_ref, &new_norm_ref, &anchor_lines, anchors);
+            materialize_indexed_changes(&indexed, &old_lines, &new_lines)
+        }
+        _ => {
+            let diff = TextDiff::configure()
+                .algorithm(diff_algorithm.backend())
+                .diff_slices(&old_norm_ref, &new_norm_ref);
+            let mut changes = Vec::with_capacity(old_lines.len() + new_lines.len());
+            for change in diff.iter_all_changes() {
+                let tag = change.tag();
+                let text = match tag {
+                    ChangeTag::Delete => change.old_index().map(|i| old_lines[i]).unwrap_or(""),
+                    ChangeTag::Insert => change.new_index().map(|i| new_lines[i]).unwrap_or(""),
+                    // Context: both sides are equal under `normalize`; Git emits
+                    // the post-image (new) line, falling back to the old side.
+                    ChangeTag::Equal => change
+                        .new_index()
+                        .map(|i| new_lines[i])
+                        .or_else(|| change.old_index().map(|i| old_lines[i]))
+                        .unwrap_or(""),
+                };
+                changes.push((tag, text));
+            }
+            changes
+        }
+    };
     assemble_unified_hunks(&changes, context, old_text.len() + new_text.len())
 }
 
@@ -4023,8 +5667,13 @@ struct DiffChangeGroup {
 /// line. For files whose final line lacks a trailing newline this may diverge from
 /// Git — exactly as `libra diff` / `-w` / `-U<n>` already do. The flag is faithful
 /// for all newline-terminated files (the domain Libra models).
-fn compute_unified_hunks_ignore_blank(old_text: &str, new_text: &str, context: usize) -> String {
-    compute_unified_hunks_ignore_blank_inner(old_text, new_text, context, None)
+fn compute_unified_hunks_ignore_blank(
+    old_text: &str,
+    new_text: &str,
+    context: usize,
+    diff_algorithm: &DiffAlgorithm,
+) -> String {
+    compute_unified_hunks_ignore_blank_inner(old_text, new_text, context, diff_algorithm, None)
 }
 
 /// `--ignore-blank-lines` composed with a whitespace normalizer (see
@@ -4033,15 +5682,23 @@ fn compute_unified_hunks_ignore_blank_normalized(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: &DiffAlgorithm,
     normalize: fn(&str) -> String,
 ) -> String {
-    compute_unified_hunks_ignore_blank_inner(old_text, new_text, context, Some(normalize))
+    compute_unified_hunks_ignore_blank_inner(
+        old_text,
+        new_text,
+        context,
+        diff_algorithm,
+        Some(normalize),
+    )
 }
 
 fn compute_unified_hunks_ignore_blank_inner(
     old_text: &str,
     new_text: &str,
     context: usize,
+    diff_algorithm: &DiffAlgorithm,
     normalize: Option<fn(&str) -> String>,
 ) -> String {
     // Raw records: split on '\n' WITHOUT trimming '\r', so a `\r`-only CRLF blank
@@ -4082,9 +5739,24 @@ fn compute_unified_hunks_ignore_blank_inner(
     let cmp_new = to_cmp(new_recs);
     let old_ref: Vec<&str> = cmp_old.iter().map(String::as_str).collect();
     let new_ref: Vec<&str> = cmp_new.iter().map(String::as_str).collect();
-    let diff = TextDiff::configure()
-        .algorithm(Algorithm::Myers)
-        .diff_slices(&old_ref, &new_ref);
+    let indexed_changes = match diff_algorithm {
+        DiffAlgorithm::Anchored(anchors) => {
+            let anchor_lines = raw_anchor_records(new_text);
+            anchored_indexed_changes(&old_ref, &new_ref, &anchor_lines, anchors)
+        }
+        _ => {
+            let mut changes = Vec::with_capacity(old_ref.len() + new_ref.len());
+            append_similar_range(
+                &old_ref,
+                0..old_ref.len(),
+                &new_ref,
+                0..new_ref.len(),
+                diff_algorithm.backend(),
+                &mut changes,
+            );
+            changes
+        }
+    };
 
     // Build change groups (maximal runs of insert/delete), tracking 0-based old/new
     // positions exactly as Git records i1/i2/chg1/chg2.
@@ -4092,7 +5764,7 @@ fn compute_unified_hunks_ignore_blank_inner(
     let mut old_pos = 0usize;
     let mut new_pos = 0usize;
     let mut cur: Option<DiffChangeGroup> = None;
-    for change in diff.iter_all_changes() {
+    for change in indexed_changes {
         match change.tag() {
             ChangeTag::Equal => {
                 if let Some(g) = cur.take() {
@@ -4492,11 +6164,18 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         new: None,
         staged: true,
         pathspec: Vec::new(),
-        algorithm: Some("histogram".to_string()),
+        algorithm: None,
+        minimal: false,
+        patience: false,
+        histogram: false,
+        anchored: Vec::new(),
+        algorithm_events: Vec::new(),
         output: None,
         name_only: false,
         name_status: false,
         word_diff: None,
+        color_words: None,
+        word_diff_regex: None,
         numstat: false,
         stat: false,
         unified: None,
@@ -4507,6 +6186,11 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         after_dashdash: Vec::new(),
         ignore_blank_lines: false,
         summary: false,
+        raw: false,
+        compact_summary: false,
+        diff_filter: None,
+        pickaxe_string: None,
+        pickaxe_regex: None,
         shortstat: false,
         exit_code: false,
         no_patch: false,
@@ -4515,6 +6199,9 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         reverse: false,
         text: false,
         binary: false,
+        full_index: false,
+        src_prefix: None,
+        dst_prefix: None,
         // Git's commit-verbose helper always renders the built-in staged diff;
         // `diff.external` must not replace the editor template or stderr patch.
         no_ext_diff: true,
@@ -4530,7 +6217,14 @@ pub(crate) async fn staged_diff_text() -> Result<String, DiffError> {
         ext_diff: false,
     };
     let config = resolve_diff_config(&args).await?;
-    let mut result = run_diff(&args, &OutputConfig::default(), &config).await?;
+    let mut result = run_diff(
+        &args,
+        &OutputConfig::default(),
+        &config,
+        None,
+        &DiffAlgorithm::Myers,
+    )
+    .await?;
     apply_diff_prefixes(&mut result, &config.prefixes);
     Ok(format_unified_diff(&result))
 }
@@ -4604,6 +6298,10 @@ fn format_diff_shortstat_output(result: &DiffOutput) -> String {
 }
 
 fn format_diff_stat_output(result: &DiffOutput) -> String {
+    format_diff_stat_output_with_compact(result, false)
+}
+
+fn format_diff_stat_output_with_compact(result: &DiffOutput, compact: bool) -> String {
     if result.files.is_empty() {
         return String::new();
     }
@@ -4612,11 +6310,16 @@ fn format_diff_stat_output(result: &DiffOutput) -> String {
         .files
         .iter()
         .map(|file| {
-            let name = if file.status == "renamed" {
+            let mut name = if file.status == "renamed" {
                 rename_display(file.rename_from.as_deref().unwrap_or(""), &file.path)
             } else {
                 file.path.clone()
             };
+            if compact && let Some(summary) = compact_summary_label(file) {
+                name.push_str(" (");
+                name.push_str(&summary);
+                name.push(')');
+            }
             // Binary files show `Bin <old> -> <new> bytes` instead of a graph; an
             // UNCHANGED binary (an exact rename, which keeps a header-only body
             // with no `Binary files`/`GIT binary patch`) shows a bare `Bin`,
@@ -4661,6 +6364,40 @@ fn format_diff_stat_output(result: &DiffOutput) -> String {
     lines.join("\n")
 }
 
+fn compact_summary_label(file: &DiffFileStat) -> Option<String> {
+    let mode_suffix = |mode: u32| {
+        if mode & 0o170000 == 0o120000 {
+            Some("+l")
+        } else if mode & 0o111 != 0 {
+            Some("+x")
+        } else {
+            None
+        }
+    };
+    match (file.old_mode, file.new_mode) {
+        (None, Some(new)) => Some(match mode_suffix(new) {
+            Some(suffix) => format!("new {suffix}"),
+            None => "new".to_string(),
+        }),
+        (Some(_), None) => Some("gone".to_string()),
+        (Some(old), Some(new)) if old != new => {
+            let old_link = old & 0o170000 == 0o120000;
+            let new_link = new & 0o170000 == 0o120000;
+            let old_exec = old & 0o111 != 0;
+            let new_exec = new & 0o111 != 0;
+            let mut changes = Vec::new();
+            if old_link != new_link {
+                changes.push(if new_link { "+l" } else { "-l" });
+            }
+            if old_exec != new_exec {
+                changes.push(if new_exec { "+x" } else { "-x" });
+            }
+            (!changes.is_empty()).then(|| changes.join(" "))
+        }
+        _ => None,
+    }
+}
+
 fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
     let status = parse_diff_status(&item.data);
     let (insertions, deletions) = count_hunk_line_changes(&item.data);
@@ -4676,6 +6413,10 @@ fn parse_diff_item(item: &git_internal::diff::DiffItem) -> DiffFileStat {
         similarity: None,
         binary: None,
         check_trailing_blank_start: None,
+        old_id: None,
+        new_id: None,
+        old_mode: None,
+        new_mode: None,
     }
 }
 
@@ -4838,6 +6579,82 @@ mod test {
     use super::*;
     use crate::utils::test;
 
+    #[test]
+    fn regex_word_diff_matches_git_delimiter_and_whole_line_semantics() {
+        let regex = regex::Regex::new("[A-Za-z]+").expect("test regex is valid");
+        assert_eq!(
+            render_word_diff(
+                "foo.bar\n",
+                "foo,baz\n",
+                WordDiffMode::Plain,
+                false,
+                Some(&regex),
+            ),
+            "foo,[-bar-]{+baz+}\n"
+        );
+        assert_eq!(
+            render_word_diff("foo.bar\n", "\n", WordDiffMode::Plain, false, Some(&regex),),
+            "[-foo.bar-]\n"
+        );
+        assert_eq!(
+            render_word_diff("\n", "foo.bar\n", WordDiffMode::Plain, false, Some(&regex),),
+            "{+foo.bar+}\n"
+        );
+        assert_eq!(
+            render_word_diff(
+                "foo...bar\n",
+                "foo+++bar\n",
+                WordDiffMode::Plain,
+                false,
+                Some(&regex),
+            ),
+            "foo+++bar\n"
+        );
+        assert_eq!(
+            render_word_diff(
+                "foo.bar\n",
+                "foo,baz\n",
+                WordDiffMode::Porcelain,
+                false,
+                Some(&regex),
+            ),
+            " foo,\n-bar\n+baz\n~\n"
+        );
+    }
+
+    #[test]
+    fn regex_word_tokens_truncate_cross_newline_match() {
+        let regex = regex::Regex::new("(?s)foo.*baz").expect("test regex is valid");
+        let tokens = regex_word_tokens("foo\nbar\nbaz", &regex);
+        assert_eq!(
+            tokens.iter().map(|token| token.text).collect::<Vec<_>>(),
+            vec!["foo", "\n", "\n"]
+        );
+    }
+
+    #[test]
+    fn word_diff_regex_resolution_preserves_none_and_explicit_precedence() {
+        let disabled =
+            DiffArgs::try_parse_from(["diff", "--word-diff=none", "--word-diff-regex=[A-Za-z]+"])
+                .expect("valid word diff arguments");
+        let disabled = resolve_word_diff_options(&disabled).expect("valid word regex");
+        assert!(disabled.mode.is_none());
+
+        let explicit = DiffArgs::try_parse_from([
+            "diff",
+            "--color-words=[0-9]+",
+            "--word-diff-regex=[A-Za-z]+",
+        ])
+        .expect("valid word diff arguments");
+        let explicit = resolve_word_diff_options(&explicit).expect("valid word regex");
+        assert!(matches!(explicit.mode, Some(WordDiffMode::Color)));
+        assert_eq!(
+            explicit.regex.as_ref().map(regex::Regex::as_str),
+            Some("[A-Za-z]+")
+        );
+        assert!(explicit.force_auto_color);
+    }
+
     #[tokio::test]
     async fn preview_object_count_is_rejected_before_batch_sizing() {
         let temp = tempfile::tempdir().expect("create preview-count fixture");
@@ -4894,6 +6711,136 @@ mod test {
         let _ = parse_rename_score(&format!("{}%", "9".repeat(64))).unwrap();
     }
 
+    fn filter_fixture(path: &str, status: &str) -> DiffFileStat {
+        DiffFileStat {
+            path: path.to_string(),
+            status: status.to_string(),
+            insertions: 0,
+            deletions: 0,
+            hunks: Vec::new(),
+            raw_diff: String::new(),
+            rename_from: None,
+            similarity: None,
+            binary: None,
+            check_trailing_blank_start: None,
+            old_id: None,
+            new_id: None,
+            old_mode: None,
+            new_mode: None,
+        }
+    }
+
+    #[test]
+    fn diff_filter_parsing_and_all_or_none_match_git_semantics() {
+        let filter = parse_diff_filter(Some("ad*"))
+            .expect("valid filter")
+            .unwrap();
+        assert!(filter.exclude.contains(&'A'));
+        assert!(filter.exclude.contains(&'D'));
+        assert!(filter.all_or_none);
+
+        let mut files = vec![
+            filter_fixture("added", "added"),
+            filter_fixture("deleted", "deleted"),
+            filter_fixture("modified", "modified"),
+        ];
+        apply_diff_filter(&mut files, &filter);
+        assert_eq!(files.len(), 3, "`*` retains the original set after a match");
+
+        let filter = parse_diff_filter(Some("T*"))
+            .expect("valid filter")
+            .unwrap();
+        apply_diff_filter(&mut files, &filter);
+        assert!(files.is_empty(), "no T means the all-or-none set is empty");
+        assert!(matches!(
+            parse_diff_filter(Some("Q")),
+            Err(DiffError::InvalidDiffFilter(value)) if value == "Q"
+        ));
+        assert!(matches!(
+            parse_diff_filter(Some("")),
+            Err(DiffError::InvalidDiffFilter(value)) if value.is_empty()
+        ));
+    }
+
+    #[test]
+    fn pickaxe_literal_count_is_non_overlapping_and_byte_safe() {
+        assert_eq!(count_literal_occurrences(b"aaaa", b"aa"), 2);
+        assert_eq!(count_literal_occurrences(b"ababa", b"aba"), 1);
+        assert_eq!(
+            count_literal_occurrences(b"a\0needle\xffneedle", b"needle"),
+            2
+        );
+        assert_eq!(count_literal_occurrences(b"anything", b""), 0);
+    }
+
+    #[test]
+    fn pickaxe_regex_matches_only_changed_hunk_content() {
+        let patch = "diff --git a/file b/file\n--- a/file\n+++ b/file\n@@ -1,2 +1,2 @@\n context needle\n-old\n+changed needle\n";
+        assert!(changed_diff_line_matches(
+            patch,
+            &regex::Regex::new("changed needle").expect("valid regex")
+        ));
+        assert!(!changed_diff_line_matches(
+            patch,
+            &regex::Regex::new("a/file|context needle").expect("valid regex")
+        ));
+
+        let combined = "diff --cc conflict\n@@@ -1,1 -1,1 +1,1 @@@\n -handler_v7\n++handler_v8\n";
+        assert!(changed_diff_line_matches(
+            combined,
+            &regex::Regex::new("handler_v[0-9]").expect("valid regex")
+        ));
+    }
+
+    #[test]
+    fn pickaxe_arguments_conflict_and_invalid_regex_is_rejected() {
+        let args = DiffArgs::try_parse_from(["diff", "-G", "["]).expect("clap accepts regex");
+        assert!(matches!(
+            parse_diff_pickaxe(&args),
+            Err(DiffError::InvalidPickaxeRegex { pattern, .. }) if pattern == "["
+        ));
+        assert!(
+            DiffArgs::try_parse_from(["diff", "-S", "needle", "-G", "needle"]).is_err(),
+            "-S and -G are mutually exclusive"
+        );
+    }
+
+    #[test]
+    fn compact_summary_labels_mode_metadata() {
+        let mut created = filter_fixture("created", "added");
+        created.new_mode = Some(0o100755);
+        assert_eq!(compact_summary_label(&created).as_deref(), Some("new +x"));
+
+        let mut type_change = filter_fixture("link", "modified");
+        type_change.old_mode = Some(0o100644);
+        type_change.new_mode = Some(0o120000);
+        assert_eq!(compact_summary_label(&type_change).as_deref(), Some("+l"));
+        assert_eq!(diff_status_code(&type_change), 'T');
+
+        type_change.raw_diff =
+            "diff --git a/link b/link\nindex 1111111..2222222 100644\n--- a/link\n+++ b/link\n"
+                .to_string();
+        apply_mode_metadata_to_patch(&mut type_change);
+        assert!(
+            type_change
+                .raw_diff
+                .contains("old mode 100644\nnew mode 120000")
+        );
+        assert!(type_change.raw_diff.contains("index 1111111..2222222\n"));
+
+        let mut executable = filter_fixture("script", "modified");
+        executable.old_mode = Some(0o100755);
+        executable.new_mode = Some(0o100755);
+        executable.raw_diff =
+            "diff --git a/script b/script\nindex 1111111..2222222 100644\n".to_string();
+        apply_mode_metadata_to_patch(&mut executable);
+        assert!(
+            executable
+                .raw_diff
+                .contains("index 1111111..2222222 100755")
+        );
+    }
+
     #[test]
     fn inexact_rename_detection_obeys_git_default_limit() {
         assert!(!inexact_rename_detection_exceeds_limit(1000, 1000));
@@ -4918,6 +6865,10 @@ mod test {
                 similarity: None,
                 binary: None,
                 check_trailing_blank_start: None,
+                old_id: None,
+                new_id: None,
+                old_mode: None,
+                new_mode: None,
             }],
             total_insertions: 1,
             total_deletions: 1,
@@ -4952,13 +6903,175 @@ mod test {
     }
 
     #[test]
+    fn test_diff_algorithms_use_selected_line_anchors() {
+        let old = "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n";
+        let new = "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n";
+        let myers = compute_unified_hunks(old, new, 3, &DiffAlgorithm::Myers);
+        let minimal = compute_unified_hunks(old, new, 3, &DiffAlgorithm::MyersMinimal);
+        let patience = compute_unified_hunks(old, new, 3, &DiffAlgorithm::Patience);
+        let histogram = compute_unified_hunks(old, new, 3, &DiffAlgorithm::Histogram);
+
+        assert_eq!(minimal, myers, "minimal uses the no-deadline Myers backend");
+        assert_ne!(patience, myers, "patience must use its own anchors");
+        assert!(
+            !histogram.is_empty() && DiffAlgorithm::Histogram.backend() == Algorithm::Histogram,
+            "histogram must select the histogram backend"
+        );
+    }
+
+    #[test]
+    fn anchored_patience_locks_qualifying_crossing_line() {
+        let old = ["ANCHOR", "b", "c"];
+        let new = ["b", "c", "ANCHOR"];
+
+        assert_eq!(
+            anchored_patience_sequence(&old, 0..old.len(), &new, 0..new.len(), &new, &[]),
+            vec![(1, 0), (2, 1)],
+            "ordinary patience chooses the longest b/c sequence"
+        );
+        assert_eq!(
+            anchored_patience_sequence(
+                &old,
+                0..old.len(),
+                &new,
+                0..new.len(),
+                &new,
+                &["ANCH".to_string()],
+            ),
+            vec![(0, 2)],
+            "the qualifying unique line locks its LIS position"
+        );
+
+        let anchored = compute_unified_hunks(
+            "ANCHOR\nb\nc\n",
+            "b\nc\nANCHOR\n",
+            3,
+            &DiffAlgorithm::Anchored(vec!["ANCH".to_string()]),
+        );
+        assert!(
+            anchored.lines().any(|line| line == " ANCHOR"),
+            "the anchor must be context, not delete+insert:\n{anchored}"
+        );
+        assert!(!anchored.lines().any(|line| line == "-ANCHOR"));
+        assert!(!anchored.lines().any(|line| line == "+ANCHOR"));
+
+        let crlf_anchored = compute_unified_hunks(
+            "ANCHOR\r\nb\r\nc\r\n",
+            "b\r\nc\r\nANCHOR\r\n",
+            3,
+            &DiffAlgorithm::Anchored(vec!["ANCHOR\r\n".to_string()]),
+        );
+        assert!(
+            crlf_anchored.lines().any(|line| line == " ANCHOR"),
+            "anchor prefixes are matched against the raw CRLF record:\n{crlf_anchored}"
+        );
+        let crlf_change = compute_unified_hunks(
+            "a\r\n",
+            "a\n",
+            3,
+            &DiffAlgorithm::Anchored(vec!["a".to_string()]),
+        );
+        assert!(
+            crlf_change.lines().any(|line| line == "-a")
+                && crlf_change.lines().any(|line| line == "+a"),
+            "raw record comparison must preserve a CRLF-to-LF change:\n{crlf_change}"
+        );
+
+        let duplicate_old = ["ANCHOR", "ANCHOR", "b", "c"];
+        let duplicate_new = ["b", "c", "ANCHOR", "ANCHOR"];
+        assert_eq!(
+            anchored_patience_sequence(
+                &duplicate_old,
+                0..duplicate_old.len(),
+                &duplicate_new,
+                0..duplicate_new.len(),
+                &duplicate_new,
+                &["ANCH".to_string()],
+            ),
+            vec![(2, 0), (3, 1)],
+            "a matching prefix cannot anchor a line repeated on either side"
+        );
+
+        let no_unique_old = "x\nx\na\n";
+        let no_unique_new = "x\nx\nb\n";
+        assert_eq!(
+            compute_unified_hunks(
+                no_unique_old,
+                no_unique_new,
+                3,
+                &DiffAlgorithm::Anchored(vec!["x".to_string()]),
+            ),
+            compute_unified_hunks(no_unique_old, no_unique_new, 3, &DiffAlgorithm::Myers),
+            "a range without a unique common candidate falls back to Myers"
+        );
+    }
+
+    #[test]
+    fn anchored_selector_events_match_git_retention_and_clear_rules() {
+        let resolve = |tail: &[&str]| {
+            let mut parse_argv = vec!["diff"];
+            parse_argv.extend_from_slice(tail);
+            let mut args = DiffArgs::try_parse_from(parse_argv).expect("selectors should parse");
+            let mut raw_argv = vec!["libra".to_string(), "diff".to_string()];
+            raw_argv.extend(tail.iter().map(|value| value.to_string()));
+            record_algorithm_selector_events(&mut args, &raw_argv);
+            resolve_diff_algorithm(&args).expect("selectors should resolve")
+        };
+
+        assert_eq!(
+            resolve(&["--anchored=A", "--histogram", "--anchored", "B",]),
+            DiffAlgorithm::Anchored(vec!["A".to_string(), "B".to_string()]),
+            "histogram leaves earlier anchors dormant for later reactivation"
+        );
+        assert_eq!(
+            resolve(&["--anchored=A", "--patience", "--anchored=B"]),
+            DiffAlgorithm::Anchored(vec!["B".to_string()]),
+            "the patience shorthand clears retained anchors"
+        );
+        assert_eq!(
+            resolve(&["--anchored=A", "--algorithm=myers"]),
+            DiffAlgorithm::Myers,
+            "a later named Myers selector wins"
+        );
+        assert_eq!(
+            resolve(&["--anchored=A", "--algorithm=patience"]),
+            DiffAlgorithm::Anchored(vec!["A".to_string()]),
+            "named patience retains and reactivates existing anchors"
+        );
+        assert_eq!(
+            resolve(&["--algorithm=histogram", "--anchored=A", "--minimal"]),
+            DiffAlgorithm::Anchored(vec!["A".to_string()]),
+            "minimal does not replace an anchored selection"
+        );
+    }
+
+    #[test]
+    fn anchored_uses_git_patience_tie_break_without_a_matching_prefix() {
+        let old = ["b", "a"];
+        let new = ["a", "b"];
+        let tags: Vec<ChangeTag> =
+            anchored_indexed_changes(&old, &new, &new, &["never".to_string()])
+                .into_iter()
+                .map(IndexedLineChange::tag)
+                .collect();
+
+        // Upstream xpatience replaces the length-1 LIS tail when it encounters
+        // `a`, so `a` is the common line. `similar` chooses the other valid tie;
+        // anchored mode intentionally follows Git's ordering.
+        assert_eq!(
+            tags,
+            vec![ChangeTag::Delete, ChangeTag::Equal, ChangeTag::Insert]
+        );
+    }
+
+    #[test]
     fn test_ignore_blank_lines_far_blank_is_suppressed() {
         // `a..h` -> `a,<blank>,b..g,H`. The blank (old~1) and h->H (old-8) are
         // distance 7 apart > 2*ctx(6), so they do NOT merge: the blank-only hunk
         // is suppressed and only the content hunk survives (Git: `@@ -5,4 +6,4 @@`).
         let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
         let new = "a\n\nb\nc\nd\ne\nf\ng\nH\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers);
         assert_eq!(
             hunk_count(&body),
             1,
@@ -4989,7 +7102,7 @@ mod test {
         // extends to d (Git: `@@ -1,4 +1,5 @@`).
         let old = "a\nb\nc\nd\n";
         let new = "A\nb\n\nc\nd\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 2);
+        let body = compute_unified_hunks_ignore_blank(old, new, 2, &DiffAlgorithm::Myers);
         assert_eq!(hunk_count(&body), 1, "single merged hunk:\n{body}");
         assert!(
             body.contains("@@ -1,4 +1,5 @@"),
@@ -5013,7 +7126,7 @@ mod test {
         // them (Git: `@@ -1,8 +1,9 @@`).
         let old = "a\nb\nc\nd\ne\nf\ng\nh\n";
         let new = "A\nb\nc\n\nd\ne\nf\ng\nH\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers);
         assert_eq!(
             hunk_count(&body),
             1,
@@ -5044,7 +7157,7 @@ mod test {
         // context (Git: `@@ -1,4 +1,4 @@`, no blank).
         let old = "a\nb\nc\nd\ne\nf\n";
         let new = "A\nb\nc\nd\ne\n\nf\n";
-        let body = compute_unified_hunks_ignore_blank(old, new, 3);
+        let body = compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers);
         assert_eq!(hunk_count(&body), 1, "only the content hunk:\n{body}");
         assert!(
             body.contains("@@ -1,4 +1,4 @@"),
@@ -5060,13 +7173,14 @@ mod test {
     fn test_ignore_blank_lines_drops_blank_only_and_keeps_ws() {
         // A change that is only an added blank line -> empty body (file drops out).
         assert!(
-            compute_unified_hunks_ignore_blank("x\ny\n", "x\n\ny\n", 3)
+            compute_unified_hunks_ignore_blank("x\ny\n", "x\n\ny\n", 3, &DiffAlgorithm::Myers,)
                 .trim()
                 .is_empty(),
             "blank-only change yields no hunks"
         );
         // A whitespace-only added line is NOT blank -> a hunk survives.
-        let ws = compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3);
+        let ws =
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, &DiffAlgorithm::Myers);
         assert!(
             !ws.trim().is_empty(),
             "whitespace-only line is not blank: {ws}"
@@ -5081,7 +7195,8 @@ mod test {
     fn test_ignore_blank_lines_crlf_empty_is_not_blank() {
         // A `\r`-only (CRLF) empty line is NOT blank to Git's xdl_blankline without
         // a whitespace flag (size <= 1 means LF-only), so its insertion is shown.
-        let body = compute_unified_hunks_ignore_blank("a\nb\n", "a\n\r\nb\n", 3);
+        let body =
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n\r\nb\n", 3, &DiffAlgorithm::Myers);
         // `split('\n')` (unlike `lines()`) keeps the `\r`, so the emitted `+\r` line
         // is visible verbatim.
         assert!(
@@ -5098,6 +7213,7 @@ mod test {
             "a\nb\n",
             "a\n  \nb\n",
             3,
+            &DiffAlgorithm::Myers,
             normalize_ignore_all_space,
         );
         assert!(
@@ -5105,7 +7221,8 @@ mod test {
             "-w makes the whitespace-only line blank, so it is suppressed:\n{composed}"
         );
         // Without the normalizer, a whitespace-only line is NOT blank -> shown.
-        let plain = compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3);
+        let plain =
+            compute_unified_hunks_ignore_blank("a\nb\n", "a\n  \nb\n", 3, &DiffAlgorithm::Myers);
         assert!(
             plain.lines().any(|l| l == "+  "),
             "without -w the whitespace-only line is shown:\n{plain}"
@@ -5121,7 +7238,7 @@ mod test {
         let old = "a\nc\nd\ne\ne\nf\ng\nf\ng\nc\ne\nf\n";
         let new = "a\nc\n\nd\n\ne\ne\nf\ng\nf\ng\nc\ne\nf\n";
         assert!(
-            compute_unified_hunks_ignore_blank(old, new, 3)
+            compute_unified_hunks_ignore_blank(old, new, 3, &DiffAlgorithm::Myers)
                 .trim()
                 .is_empty(),
             "blank-only inserts (even adjacent) with no real change produce no hunks"
@@ -5170,7 +7287,7 @@ mod test {
             assert!(args.err().unwrap().kind() == clap::error::ErrorKind::MissingRequiredArgument);
         }
         {
-            // --algorithm arg is parsed separately from execution-time support.
+            // --algorithm selects a real backend.
             let args = DiffArgs::try_parse_from([
                 "diff",
                 "--old",
@@ -5183,26 +7300,49 @@ mod test {
             ])
             .unwrap();
             assert_eq!(args.algorithm, Some("myers".to_string()));
+            assert_eq!(resolve_diff_algorithm(&args).unwrap(), DiffAlgorithm::Myers);
         }
         {
-            // --algorithm defaults to the only currently supported backend.
+            // Git-compatible default: Myers.
             let args = DiffArgs::try_parse_from(["diff", "--old", "old", "target paths"]).unwrap();
-            assert_eq!(args.algorithm, Some("histogram".to_string()));
+            assert_eq!(args.algorithm, None);
+            assert_eq!(resolve_diff_algorithm(&args).unwrap(), DiffAlgorithm::Myers);
         }
         {
             let args = DiffArgs::try_parse_from([
                 "diff",
-                "--old",
-                "old",
-                "--new",
-                "new",
+                "--minimal",
+                "--patience",
+                "--histogram",
                 "--algorithm",
-                "myers",
-                "target paths",
+                "patience",
             ])
             .unwrap();
-            let err = validate_diff_algorithm(&args).expect_err("myers is not wired yet");
-            assert!(matches!(err, DiffError::UnsupportedAlgorithm(value) if value == "myers"));
+            assert_eq!(
+                resolve_diff_algorithm(&args).unwrap(),
+                DiffAlgorithm::Patience
+            );
+            assert!(
+                args.minimal,
+                "--minimal remains an independent quality request"
+            );
+            assert!(!args.patience && !args.histogram, "last selector wins");
+        }
+        {
+            let args = DiffArgs::try_parse_from(["diff", "--minimal"]).unwrap();
+            assert_eq!(
+                resolve_diff_algorithm(&args).unwrap(),
+                DiffAlgorithm::MyersMinimal
+            );
+        }
+        {
+            let args = DiffArgs::try_parse_from(["diff", "--algorithm", "bogus"]).unwrap();
+            let err = resolve_diff_algorithm(&args).expect_err("invalid backend must fail closed");
+            assert_eq!(
+                err.to_string(),
+                "invalid diff algorithm 'bogus'; expected myers, myersMinimal, patience, or histogram"
+            );
+            assert!(matches!(err, DiffError::InvalidAlgorithm(value) if value == "bogus"));
         }
     }
 

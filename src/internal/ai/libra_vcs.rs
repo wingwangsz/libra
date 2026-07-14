@@ -378,6 +378,8 @@ fn diff_arg_safety(args: &[String], idx: usize) -> (ArgSafety, usize) {
             | "--no-color"
             | "--patch"
             | "-p"
+            | "--word-diff"
+            | "--color-words"
             | "--no-ext-diff"
             | "--no-textconv"
             | "--histogram"
@@ -385,14 +387,30 @@ fn diff_arg_safety(args: &[String], idx: usize) -> (ArgSafety, usize) {
             | "--minimal"
     ) || arg.starts_with("--stat=")
         || arg.starts_with("--color=")
+        || arg.starts_with("--word-diff=")
+        || arg.starts_with("--word-diff-regex=")
+        || arg.starts_with("--color-words=")
+        || arg.starts_with("--algorithm=")
+        || arg.starts_with("--anchored=")
         || arg.starts_with("--diff-filter=")
         || arg.starts_with("--submodule=")
         || arg.starts_with("--relative=")
+        || (arg.len() > 2 && (arg.starts_with("-S") || arg.starts_with("-G")))
         || !arg.starts_with('-')
     {
         return (ArgSafety::Allow, idx + 1);
     }
-    if matches!(arg, "--diff-filter" | "--submodule" | "--relative") && args.get(idx + 1).is_some()
+    if matches!(
+        arg,
+        "--algorithm"
+            | "--anchored"
+            | "--diff-filter"
+            | "--submodule"
+            | "--relative"
+            | "--word-diff-regex"
+            | "-S"
+            | "-G"
+    ) && args.get(idx + 1).is_some()
     {
         return (ArgSafety::Allow, idx + 2);
     }

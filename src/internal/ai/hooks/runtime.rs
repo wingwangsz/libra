@@ -957,8 +957,12 @@ async fn write_committed_checkpoint(
     now: i64,
 ) -> Result<()> {
     use crate::internal::ai::{
+        coverage_gate,
         history::{self, CheckpointCommitParams, CheckpointScope, HistoryManager},
-        observed_agents::{AgentKind, AgentSessionCtx, RedactedBytes, Redactor, agent_for},
+        observed_agents::{
+            AgentKind, RedactedBytes, Redactor, TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource,
+            agent_for, normalize_claude_transcript, resolve_transcript_source,
+        },
     };
 
     let redacted_prompt = event.prompt.as_deref();
@@ -980,10 +984,10 @@ async fn write_committed_checkpoint(
     // the adapter's extraction capabilities can derive metadata from them
     // after the redacted blob is produced.
     let mut transcript_raw_for_extraction: Option<Vec<u8>> = None;
-    let transcript_redacted = match AgentKind::from_db_str(agent_kind) {
+    let mut transcript_redacted = match AgentKind::from_db_str(agent_kind) {
         Some(kind) => {
             let adapter = agent_for(kind);
-            let ctx = AgentSessionCtx {
+            let seam_ctx = crate::internal::ai::observed_agents::AgentSessionCtx {
                 session_id: libra_session_id.to_string(),
                 provider_session_id: envelope.session_id.clone(),
                 working_dir: std::path::PathBuf::from(&envelope.cwd),
@@ -992,40 +996,339 @@ async fn write_committed_checkpoint(
                     .as_ref()
                     .map(std::path::PathBuf::from),
             };
-            // Security gate (entire.md §8.1 / §13 P0): `transcript_path` comes
-            // from the untrusted hook envelope. Only read + persist it when it
-            // resolves inside the provider's own home-relative transcript root
-            // (e.g. `~/.claude`); a forged path pointing at an arbitrary file
-            // must never be copied into the syncable traces blob.
-            let trusted = ctx
-                .transcript_path
-                .as_deref()
-                .is_some_and(|path| transcript_path_within_provider_root(adapter, path));
-            if !trusted {
-                prompt_fallback()
-            } else {
-                match adapter.read_transcript(&ctx) {
-                    Ok(Some(raw)) if !raw.is_empty() => {
-                        let (redacted, report) = Redactor::new_default().redact(&raw);
-                        merge_redaction_report_into(&mut report_value, &report);
-                        transcript_raw_for_extraction = Some(raw);
-                        redacted
-                    }
-                    Ok(_) => prompt_fallback(),
-                    Err(err) => {
-                        tracing::warn!(
-                            agent_kind,
-                            error = %format!("{err:#}"),
-                            "failed to read agent transcript for checkpoint; \
-                             falling back to the redacted prompt"
-                        );
-                        prompt_fallback()
+            // DR-04a (ADR-DR-02): resolve the unified `TranscriptSource` seam
+            // instead of reading `transcript_path` directly. `File` sources are
+            // opened once inside the resolver (after the provider-root security
+            // precheck) and read from the held descriptor, so a post-auth path
+            // swap cannot change the bytes; `Bytes` sources (OpenCode export,
+            // DR-04b) carry an `ExportAuthorized` tag the writer binds to this
+            // session. A forged path outside the provider root resolves to
+            // `None` and falls back to the redacted prompt (fail-closed gate).
+            let raw = match resolve_transcript_source(adapter, &seam_ctx) {
+                Ok(Some(TranscriptSource::File { mut file, .. })) => {
+                    Some(file.read_bounded(TRANSCRIPT_READ_HARD_CAP_BYTES))
+                }
+                Ok(Some(TranscriptSource::Bytes { bytes, auth })) => {
+                    // Only trust export bytes whose tag is bound to BOTH the
+                    // session being written and these exact bytes (SHA-256
+                    // recheck); anything else is treated as no source.
+                    if auth.matches(agent_kind, libra_session_id, &bytes) {
+                        Some(Ok(bytes))
+                    } else {
+                        Some(Ok(Vec::new()))
                     }
                 }
+                Ok(None) => None,
+                Err(err) => {
+                    tracing::warn!(
+                        agent_kind,
+                        error = %format!("{err:#}"),
+                        "failed to resolve agent transcript source for checkpoint; \
+                         falling back to the redacted prompt"
+                    );
+                    None
+                }
+            };
+            match raw {
+                Some(Ok(raw)) if !raw.is_empty() => {
+                    let (redacted, report) = Redactor::new_default().redact(&raw);
+                    merge_redaction_report_into(&mut report_value, &report);
+                    transcript_raw_for_extraction = Some(raw);
+                    redacted
+                }
+                Some(Err(err)) => {
+                    tracing::warn!(
+                        agent_kind,
+                        error = %format!("{err:#}"),
+                        "failed to read agent transcript for checkpoint; \
+                         falling back to the redacted prompt"
+                    );
+                    prompt_fallback()
+                }
+                Some(Ok(_)) | None => prompt_fallback(),
             }
         }
         None => prompt_fallback(),
     };
+
+    // DR-05c-0 live coverage gate (plan-20260713 ADR-DR-09/10). Providers
+    // with a coverage-v1 normalizer (Claude first) reserve their logical
+    // turns BEFORE any object is built:
+    // - every turn already covered by equivalent-or-better content → the
+    //   whole write is a no-op (no duplicate checkpoint on repeated events);
+    // - a reservation failure (DB gate unavailable) fails the write CLOSED —
+    //   no ungated append;
+    // - reserved claims commit inside the ref-CAS transaction below.
+    // Providers without a normalizer keep the legacy ungated path.
+    let mut live_reservation: Option<(String, i64, Vec<coverage_gate::ReservedTurnClaim>)> = None;
+    if agent_kind == "claude_code"
+        && let Some(raw) = transcript_raw_for_extraction.as_deref()
+    {
+        let mut turns = normalize_claude_transcript(raw);
+        // coverage-v1 §1 pipeline order: typed normalize → typed-field
+        // redact → canonicalize/digest. Claims must never hash (or store
+        // digests of) unredacted content.
+        crate::internal::ai::observed_agents::coverage::redact_turns(&mut turns);
+        if !turns.is_empty() {
+            let owner = format!("live:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+            let now_ms = Utc::now().timestamp_millis();
+            let outcome = coverage_gate::reserve_live_turn_claims(
+                conn,
+                libra_session_id,
+                &turns,
+                &owner,
+                now_ms,
+            )
+            .await
+            .context("coverage gate reservation failed; checkpoint write aborted (fail-closed)")?;
+            if outcome.reserved.is_empty() && outcome.skipped_inflight > 0 {
+                bail!(
+                    "coverage gate reservation is held by another live writer for {} turn(s); \
+                     checkpoint was not appended; retry after that writer finishes or its lease expires",
+                    outcome.skipped_inflight
+                );
+            }
+            if outcome.is_noop() {
+                tracing::info!(
+                    session_id = %libra_session_id,
+                    skipped_covered = outcome.skipped_covered,
+                    skipped_inflight = outcome.skipped_inflight,
+                    conflicted = outcome.conflicted,
+                    "coverage gate: every turn already covered; skipping checkpoint append"
+                );
+                return Ok(());
+            }
+            live_reservation = Some((owner, now_ms, outcome.reserved));
+        }
+    }
+
+    // DR-04b (M3): OpenCode has no on-disk transcript — content arrives via
+    // the trusted, sandboxed `opencode export` bridge, converged through the
+    // per-session export job (ADR-DR-11) and gated per turn like every other
+    // path. Bridge unavailability (untrusted binary, no bwrap) degrades to
+    // the legacy metadata-only capture with a warning — never an unsandboxed
+    // or ungated content write.
+    let mut claim_channel: &'static str = "live";
+    let mut export_release: Option<(String, i64, i64)> = None;
+    if agent_kind == "opencode" {
+        use crate::internal::ai::{
+            export_job::{self, IdleOutcome},
+            observed_agents::{
+                coverage, normalize_opencode_export,
+                opencode_export::{
+                    ExportLimits, authorized_sandboxed_export, trusted_opencode_binary,
+                },
+            },
+        };
+        let owner = format!("export:{}:{}", std::process::id(), uuid::Uuid::new_v4());
+        let now_ms = Utc::now().timestamp_millis();
+        match export_job::observe_idle(conn, "opencode", &envelope.session_id, &owner, now_ms).await
+        {
+            Err(err) => {
+                // ADR-DR-10 fail-closed: a job/DB/schema failure is a GATE
+                // failure — never proceed to an ungated append. (Only
+                // trusted-binary/sandbox/export failures degrade to the
+                // metadata-only capture below.)
+                return Err(err.context(
+                    "opencode export job gate unavailable; checkpoint write aborted (fail-closed)",
+                ));
+            }
+            Ok(IdleOutcome::RecordedOnly) => {
+                tracing::info!(
+                    session_id = %libra_session_id,
+                    "opencode idle recorded; an in-flight export runner will cover it"
+                );
+                return Ok(());
+            }
+            Ok(IdleOutcome::Runner {
+                fence_token,
+                target_generation,
+                ..
+            }) => {
+                let bridge = async {
+                    let binary = trusted_opencode_binary().await?;
+                    authorized_sandboxed_export(
+                        &binary,
+                        &envelope.session_id,
+                        libra_session_id,
+                        ExportLimits::default(),
+                    )
+                    .await
+                }
+                .await;
+                match bridge {
+                    Err(err) => {
+                        tracing::warn!(
+                            error = %format!("{err:#}"),
+                            "opencode export bridge unavailable; metadata-only capture"
+                        );
+                        if let Err(release_err) = export_job::release(
+                            conn,
+                            "opencode",
+                            &envelope.session_id,
+                            &owner,
+                            fence_token,
+                            "failed",
+                            Some("LBR-AGENT-005"),
+                            Utc::now().timestamp_millis(),
+                        )
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %format!("{release_err:#}"),
+                                session_id = %libra_session_id,
+                                "failed to release unsuccessful opencode export job"
+                            );
+                        }
+                    }
+                    Ok(TranscriptSource::File { .. }) => {
+                        // INVARIANT: the bridge only constructs Bytes.
+                        return Err(anyhow!(
+                            "opencode export bridge returned a File source (internal invariant)"
+                        ));
+                    }
+                    Ok(TranscriptSource::Bytes { bytes, auth }) => {
+                        // ADR-DR-02 Bytes trust boundary: verify the digest-
+                        // bound tag FOR REAL before any normalization or
+                        // persistence — a mismatch fails the write closed.
+                        if !auth.matches("opencode", libra_session_id, &bytes) {
+                            let _ = export_job::release(
+                                conn,
+                                "opencode",
+                                &envelope.session_id,
+                                &owner,
+                                fence_token,
+                                "failed",
+                                Some("LBR-AGENT-005"),
+                                Utc::now().timestamp_millis(),
+                            )
+                            .await;
+                            return Err(anyhow!(
+                                "opencode export authorization mismatch; write aborted (fail-closed)"
+                            ));
+                        }
+                        let mut turns = normalize_opencode_export(&bytes);
+                        coverage::redact_turns(&mut turns);
+                        let outcome = match coverage_gate::reserve_turn_claims_for_channel(
+                            conn,
+                            libra_session_id,
+                            &turns,
+                            &owner,
+                            now_ms,
+                            "export",
+                        )
+                        .await
+                        {
+                            Ok(outcome) => outcome,
+                            Err(err) => {
+                                // Fail-closed: no ungated append; job released
+                                // dirty so the next idle retries.
+                                if let Err(release_err) = export_job::release(
+                                    conn,
+                                    "opencode",
+                                    &envelope.session_id,
+                                    &owner,
+                                    fence_token,
+                                    "dirty",
+                                    None,
+                                    Utc::now().timestamp_millis(),
+                                )
+                                .await
+                                {
+                                    tracing::warn!(
+                                        error = %format!("{release_err:#}"),
+                                        session_id = %libra_session_id,
+                                        "failed to release opencode export job after coverage error"
+                                    );
+                                }
+                                return Err(err.context(
+                                    "coverage gate reservation failed; export capture aborted \
+                                     (fail-closed)",
+                                ));
+                            }
+                        };
+                        // Codex M3 R2 P1-2: a purely in-flight skip (another
+                        // writer holds the claim lease for every turn, nothing
+                        // reserved here) must NOT mark this export generation
+                        // clean. If that writer then crashes, its claim lease
+                        // expires and only a DIRTY job lets a later idle
+                        // retry — advancing to clean would silently drop the
+                        // transcript. Mirror the live path: release dirty
+                        // WITHOUT advancing processed, so acquisition re-fires.
+                        if outcome.is_inflight_only_skip() {
+                            tracing::warn!(
+                                session_id = %libra_session_id,
+                                skipped_inflight = outcome.skipped_inflight,
+                                "opencode export: coverage held by another in-flight writer; \
+                                 releasing dirty for retry"
+                            );
+                            let done_ms = Utc::now().timestamp_millis();
+                            if let Err(job_err) = export_job::release(
+                                conn,
+                                "opencode",
+                                &envelope.session_id,
+                                &owner,
+                                fence_token,
+                                "dirty",
+                                None,
+                                done_ms,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %format!("{job_err:#}"),
+                                    session_id = %libra_session_id,
+                                    "failed to release opencode export job after in-flight skip"
+                                );
+                            }
+                            return Ok(());
+                        }
+                        if outcome.is_noop() {
+                            tracing::info!(
+                                session_id = %libra_session_id,
+                                skipped_covered = outcome.skipped_covered,
+                                skipped_inflight = outcome.skipped_inflight,
+                                conflicted = outcome.conflicted,
+                                "opencode export: every turn already covered; no append"
+                            );
+                            // Honest release even on no-op: another idle may
+                            // have landed during the export — the outcome of
+                            // advance decides idle vs dirty (ADR-DR-11).
+                            let done_ms = Utc::now().timestamp_millis();
+                            if let Err(job_err) = export_job::advance_and_release(
+                                conn,
+                                "opencode",
+                                &envelope.session_id,
+                                &owner,
+                                fence_token,
+                                target_generation,
+                                done_ms,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %format!("{job_err:#}"),
+                                    session_id = %libra_session_id,
+                                    "failed to settle no-op opencode export job"
+                                );
+                            }
+                            return Ok(());
+                        }
+                        // Whole-blob baseline for the checkpoint: the export
+                        // bytes through the generic redactor (same contract
+                        // as the live Claude blob — ADR-DR-04/DR-12).
+                        let (redacted, report) = Redactor::new_default().redact(&bytes);
+                        merge_redaction_report_into(&mut report_value, &report);
+                        transcript_raw_for_extraction = Some(bytes);
+                        transcript_redacted = redacted;
+                        claim_channel = "export";
+                        live_reservation = Some((owner.clone(), now_ms, outcome.reserved));
+                        export_release = Some((owner, fence_token, target_generation));
+                    }
+                }
+            }
+        }
+    }
 
     // Build metadata.json (external schema v2 — v1 fields plus `model`;
     // strictly additive so v1 readers keep working). `model` mirrors the
@@ -1165,6 +1468,23 @@ async fn write_committed_checkpoint(
             }
         };
 
+    // DR-05c-0: reserved claims + the catalog row commit INSIDE the ref-CAS
+    // transaction (ADR-DR-10) — ref, catalog, revisions and claim advances
+    // are atomic; a fence violation rolls all of them back.
+    let claim_plan =
+        live_reservation.map(
+            |(owner, now_ms, claims)| coverage_gate::LiveClaimCommitPlan {
+                source_channel: claim_channel,
+                session_id: libra_session_id.to_string(),
+                checkpoint_id: checkpoint_id.clone(),
+                owner,
+                parent_commit: parent_commit.clone(),
+                created_at: now,
+                now_ms,
+                claims,
+            },
+        );
+
     // Stages (a)–(c): blobs, trees, commit, ref CAS.
     write_span.record("stage", "append");
     let written = manager
@@ -1179,6 +1499,9 @@ async fn write_committed_checkpoint(
             transcript_redacted: &transcript_redacted,
             lifecycle_events_jsonl: &lifecycle_events_redacted,
             redaction_report_json: &redaction_report_redacted,
+            txn_extra: claim_plan
+                .as_ref()
+                .map(|plan| plan as &dyn history::TracesTxnExtra),
         })
         .await
         .context("failed to append checkpoint commit on traces")?;
@@ -1202,23 +1525,29 @@ async fn write_committed_checkpoint(
         );
     }
 
-    // Stage (d), idempotent.
+    // Stage (d), idempotent. The gated path already inserted the catalog
+    // row inside the ref-CAS transaction (ADR-DR-10); only the legacy
+    // (ungated) path inserts it here.
     write_span.record("stage", "catalog");
-    let inserted = insert_agent_checkpoint_row_idempotent(
-        conn,
-        &AgentCheckpointRow {
-            checkpoint_id: &checkpoint_id,
-            session_id: libra_session_id,
-            parent_commit: parent_commit.as_deref(),
-            tree_oid: &written.tree_oid.to_string(),
-            metadata_blob_oid: &written.metadata_blob_oid.to_string(),
-            traces_commit: &written.commit_hash.to_string(),
-            created_at: now,
-        },
-    )
-    .await?;
-    if !inserted {
-        write_span.record("stage", "catalog_deduped");
+    if claim_plan.is_some() {
+        write_span.record("stage", "catalog_in_txn");
+    } else {
+        let inserted = insert_agent_checkpoint_row_idempotent(
+            conn,
+            &AgentCheckpointRow {
+                checkpoint_id: &checkpoint_id,
+                session_id: libra_session_id,
+                parent_commit: parent_commit.as_deref(),
+                tree_oid: &written.tree_oid.to_string(),
+                metadata_blob_oid: &written.metadata_blob_oid.to_string(),
+                traces_commit: &written.commit_hash.to_string(),
+                created_at: now,
+            },
+        )
+        .await?;
+        if !inserted {
+            write_span.record("stage", "catalog_deduped");
+        }
     }
 
     // Stage (d) complete — release the window guard (best-effort; an
@@ -1233,6 +1562,31 @@ async fn write_committed_checkpoint(
         );
     }
     write_span.record("stage", "done");
+
+    // DR-04b: the export runner advances its processed generation and
+    // releases the lease HONESTLY — `dirty` when more idles arrived during
+    // the run (the next idle picks them up; no unbounded loop on the hook
+    // path), `idle` when clean; a fenced-out runner touches nothing.
+    if let Some((owner, fence_token, target_generation)) = export_release {
+        let done_ms = Utc::now().timestamp_millis();
+        if let Err(job_err) = crate::internal::ai::export_job::advance_and_release(
+            conn,
+            "opencode",
+            &envelope.session_id,
+            &owner,
+            fence_token,
+            target_generation,
+            done_ms,
+        )
+        .await
+        {
+            tracing::warn!(
+                error = %format!("{job_err:#}"),
+                session_id = %libra_session_id,
+                "failed to settle completed opencode export job"
+            );
+        }
+    }
 
     // Suppress the unused-warning for redaction_matches; reserved for a
     // Phase 3 enhancement that adds per-rule counters to metadata.
@@ -1424,6 +1778,9 @@ async fn write_subagent_checkpoint(
             transcript_redacted: &transcript_redacted,
             lifecycle_events_jsonl: &lifecycle_events_redacted,
             redaction_report_json: &redaction_report_redacted,
+            // Subagent boundary checkpoints are not per-turn content and
+            // stay outside the coverage gate (plan-20260713 ADR-DR-05).
+            txn_extra: None,
         })
         .await
         .context("failed to append subagent checkpoint commit on traces")?;
@@ -1895,53 +2252,10 @@ fn checkpoint_model_field(model: Option<&serde_json::Value>) -> String {
 /// its `bytes_scanned` / `bytes_redacted` counters so the stored report stays
 /// consistent with the stored (redacted) transcript blob. A non-object
 /// `report` (only possible from a malformed input string) is left untouched.
-/// Decide whether `path` may be read into a checkpoint transcript blob.
 ///
-/// The transcript path originates from the (untrusted) hook envelope, so a
-/// forged payload could otherwise point it at any file the Libra process can
-/// read and have the contents copied into the syncable `traces` blob
-/// (entire.md §8.1 / §13 P0). Constrain it: after symlink canonicalization,
-/// `path` must live under one of the adapter's home-relative roots (e.g.
-/// `~/.claude` for Claude Code, `~/.gemini` for Gemini). Non-existent paths,
-/// an unresolvable home directory, or a path outside every root all return
-/// `false` so the caller falls back to the already-redacted prompt.
-/// `LIBRA_TEST_HOME` overrides the home directory for tests, mirroring the
-/// vault module.
-fn transcript_path_within_provider_root(
-    adapter: &dyn crate::internal::ai::observed_agents::ObservedAgent,
-    path: &std::path::Path,
-) -> bool {
-    let home = std::env::var_os("LIBRA_TEST_HOME")
-        .map(std::path::PathBuf::from)
-        .or_else(dirs::home_dir);
-    let Some(home) = home else {
-        return false;
-    };
-    let Ok(canonical_path) = path.canonicalize() else {
-        return false;
-    };
-    adapter.protected_dirs().iter().any(|dir| {
-        // Codex relocates its whole home via `$CODEX_HOME` and every other
-        // part of the codex chain honors it (`resolve_codex_home` in
-        // providers/codex/settings.rs). The trust gate must resolve the
-        // same root, or sessions under a relocated CODEX_HOME are silently
-        // captured with empty transcripts (found by the A6.5 real-CLI
-        // smoke, which isolates CODEX_HOME). Only an absolute override is
-        // honored, mirroring `resolve_codex_home`'s validation.
-        let root = if *dir == ".codex" {
-            match std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from) {
-                Some(path) if path.is_absolute() => path,
-                _ => home.join(dir),
-            }
-        } else {
-            home.join(dir)
-        };
-        root.canonicalize()
-            .map(|root| canonical_path.starts_with(root))
-            .unwrap_or(false)
-    })
-}
-
+/// (DR-04a) The provider-root trust gate that used to live here moved to
+/// `observed_agents::transcript_source::transcript_path_within_provider_root`,
+/// the single source of truth behind the `TranscriptSource` seam.
 fn merge_redaction_report_into(
     report: &mut serde_json::Value,
     extra: &crate::internal::ai::observed_agents::RedactionReport,
@@ -3340,11 +3654,15 @@ mod tests {
             std::env::set_var("LIBRA_TEST_HOME", home.path());
             std::env::set_var("CODEX_HOME", codex_home.path());
         }
-        let trusted = transcript_path_within_provider_root(adapter, &rollout);
+        let trusted = crate::internal::ai::observed_agents::transcript_path_within_provider_root(
+            adapter, &rollout,
+        );
         unsafe {
             std::env::remove_var("CODEX_HOME");
         }
-        let untrusted = transcript_path_within_provider_root(adapter, &rollout);
+        let untrusted = crate::internal::ai::observed_agents::transcript_path_within_provider_root(
+            adapter, &rollout,
+        );
         unsafe {
             match prior_codex {
                 Some(value) => std::env::set_var("CODEX_HOME", value),

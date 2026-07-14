@@ -1,0 +1,92 @@
+# `libra am`
+
+Apply one or more plain-text `format-patch` mail files as commits. The files
+are processed in the order given, preserving each mail's subject/body, author,
+and `Date:` metadata while using the current Libra identity as committer.
+
+## Synopsis
+
+```text
+libra am <patch>...
+libra am --continue
+libra am --skip
+libra am --abort
+```
+
+## Behavior
+
+A new series requires a local branch with an existing commit and no staged or
+tracked working-tree changes. Unrelated untracked files are preserved, but any
+existing non-index path that a mail would touch—including an ignored path—is
+rejected before sequencer state is saved. The aggregate mail input is limited
+to 64 MiB and 10,000 files.
+
+The minimal mail parser accepts UTF-8, single-part messages with `7bit`, `8bit`,
+`binary`, quoted-printable, or base64 transfer encoding. It reads `From:`,
+`Date:`, and `Subject:`, removes a leading `[PATCH ...]` subject marker, honors
+the standard in-body `From:` override, and extracts the text `diff --git`
+section after the `---` separator. UTF-8/US-ASCII RFC 2047 `B` and `Q` encoded
+words are decoded.
+
+Every target is checked against absolute paths, empty/`.`/`..` components, NUL
+bytes, `.libra/`, and existing symlink path components. All files in one mail are test-applied before
+the first write. File replacements use atomic rename and content patches retain
+the existing permission bits.
+
+Sequencer state is saved before worktree writes. Each successful commit moves
+the branch, writes its reflog, and advances or clears the `am` position in one
+SQLite transaction. Resume and skip reject a branch whose tip moved outside
+the sequencer. If interruption occurs after state is saved but before the
+current mail writes anything—including between two commits—`--continue`
+retries that mail. `--abort` resets the original branch tip, index, and tracked
+worktree, and also removes a new-file target left by an interruption before it
+was staged.
+
+## Conflict recovery
+
+This minimal version does not synthesize three-way conflict markers. When a
+patch does not apply, it leaves the current branch tip unchanged and keeps the
+series resumable:
+
+1. resolve the affected paths manually;
+2. stage only paths named by the current patch with `libra add`;
+3. run `libra am --continue`.
+
+Use `--skip` to discard the current patch and continue with the next one, or
+`--abort` to discard the entire series and restore the pre-`am` state.
+
+## Options
+
+| Option | Meaning |
+|---|---|
+| `--continue` | Commit the fully staged resolution and continue. Unstaged current-patch paths, unrelated tracked changes, unresolved index entries, an empty resolution, or staged unrelated paths are rejected. A pristine recovery state retries the current mail. |
+| `--skip` | Reset the current patch and continue with the remaining mails. |
+| `--abort` | Restore the original branch tip, index, and tracked worktree and clear the sequencer. |
+| `--json` / `--machine` | Emit the action, applied source files/subjects/commit IDs, and optional restored HEAD in the standard envelope. |
+
+## Examples
+
+```bash
+# Generate and replay a series
+libra format-patch -o outgoing origin/main..HEAD
+libra switch target
+libra am outgoing/0001-*.patch outgoing/0002-*.patch
+
+# Resolve a stopped patch
+$EDITOR src/lib.rs
+libra add src/lib.rs
+libra am --continue
+
+# Cancel the complete series
+libra am --abort
+```
+
+## Current limitations
+
+This is the P2-01 minimal surface, not full Git `am` parity. It does not accept
+stdin, mbox files containing multiple messages, MIME multipart/attached
+patches, binary patches, rename-only or mode-only patches, or Git's wider flag
+set (`-3`/`--3way`, `--signoff`, `--keep`, `--scissors`, and others). Existing
+file permissions are retained for content patches, but mail mode changes are
+not applied. Applypatch/commit hooks are not run. `mailinfo` is not yet exposed
+as a separate command.

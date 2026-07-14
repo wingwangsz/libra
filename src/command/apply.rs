@@ -8,22 +8,86 @@
 //! temp-file + rename) is a documented future extension.
 
 use std::{
+    collections::{HashMap, HashSet},
     fs,
     io::{self, Read},
-    path::{Path, PathBuf},
+    path::{Component, Path, PathBuf},
 };
 
 use clap::Parser;
 use serde::Serialize;
 
 use crate::utils::{
+    atomic_write::write_atomic,
     error::{CliError, CliResult, StableErrorCode},
     output::{OutputConfig, emit_json_data},
     util,
 };
 
 /// Hard cap on a patch input, matching the grit-gap plan's default.
-const MAX_PATCH_BYTES: usize = 64 * 1024 * 1024;
+pub(crate) const MAX_PATCH_BYTES: usize = 64 * 1024 * 1024;
+
+/// A fully validated patch result. No worktree write happens while this value
+/// is built, so a malformed or non-applicable multi-file patch fails before
+/// touching its first target.
+#[derive(Debug)]
+pub(crate) struct PreparedPatch {
+    files: Vec<PreparedFile>,
+}
+
+#[derive(Debug)]
+struct PreparedFile {
+    target: String,
+    absolute: PathBuf,
+    content: Option<String>,
+    permissions: Option<fs::Permissions>,
+}
+
+#[derive(Debug)]
+pub(crate) enum PatchPreparationError {
+    Invalid(String),
+    DoesNotApply(String),
+}
+
+impl PreparedPatch {
+    pub(crate) fn targets(&self) -> Vec<String> {
+        self.files.iter().map(|file| file.target.clone()).collect()
+    }
+
+    /// Materialize every prepared result. Each replacement is atomic; callers
+    /// that need multi-file rollback must persist sequencer state before this
+    /// method and restore the current HEAD/index on failure.
+    pub(crate) fn write(self) -> Result<(), String> {
+        for file in self.files {
+            match file.content {
+                Some(content) => {
+                    write_atomic(&file.absolute, content.as_bytes(), false).map_err(|error| {
+                        format!("failed to write patched file '{}': {error}", file.target)
+                    })?;
+                    if let Some(permissions) = file.permissions {
+                        fs::set_permissions(&file.absolute, permissions).map_err(|error| {
+                            format!(
+                                "failed to restore permissions on patched file '{}': {error}",
+                                file.target
+                            )
+                        })?;
+                    }
+                }
+                None => match fs::remove_file(&file.absolute) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                    Err(error) => {
+                        return Err(format!(
+                            "failed to remove patched file '{}': {error}",
+                            file.target
+                        ));
+                    }
+                },
+            }
+        }
+        Ok(())
+    }
+}
 
 /// `--help` examples (cross-cutting EXAMPLES contract, `_general.md`).
 pub const APPLY_EXAMPLES: &str = "\
@@ -89,37 +153,15 @@ pub async fn execute_safe(args: ApplyArgs, output: &OutputConfig) -> CliResult<(
     let patch_text = read_patch(&args.patches).map_err(error)?;
     let workdir = util::working_dir();
 
-    let mut files = Vec::new();
-    let mut applies = true;
-    for section in split_file_patches(&patch_text) {
-        let patch = diffy::Patch::from_str(&section)
-            .map_err(|err| error(format!("malformed patch: {err}")))?;
-        let target = patch_target(&patch, args.strip).map_err(error)?;
-        let absolute = resolve_safe(&target, &workdir).map_err(error)?;
-        files.push(target.clone());
-
-        let is_new_file = patch.original() == Some("/dev/null");
-        let is_deletion = patch.modified() == Some("/dev/null");
-        let base = if is_new_file {
-            String::new()
-        } else {
-            match fs::read_to_string(&absolute) {
-                Ok(content) => content,
-                // A missing or unreadable target means the patch does not apply.
-                Err(_) => {
-                    applies = false;
-                    continue;
-                }
-            }
-        };
-        match diffy::apply(&base, &patch) {
-            // A deletion patch must reduce the file to nothing; a non-empty
-            // result means the file did not match the patch's full extent.
-            Ok(result) if is_deletion && !result.is_empty() => applies = false,
-            Ok(_) => {}
-            Err(_) => applies = false,
+    let prepared = prepare_patch(&patch_text, args.strip, &workdir);
+    let (applies, files) = match prepared {
+        Ok(prepared) => (true, prepared.targets()),
+        Err(PatchPreparationError::DoesNotApply(_)) => {
+            let files = patch_targets(&patch_text, args.strip).map_err(error)?;
+            (false, files)
         }
-    }
+        Err(PatchPreparationError::Invalid(message)) => return Err(error(message)),
+    };
 
     if output.is_json() {
         emit_json_data("apply", &ApplyOutput { applies, files }, output)?;
@@ -132,6 +174,119 @@ pub async fn execute_safe(args: ApplyArgs, output: &OutputConfig) -> CliResult<(
         // working tree was never touched.
         Err(CliError::silent_exit(1))
     }
+}
+
+/// Parse and test-apply a unified diff against `workdir`, returning the final
+/// contents for a later write. File sections targeting the same path are
+/// applied in order against the preceding section's in-memory result.
+pub(crate) fn prepare_patch(
+    patch_text: &str,
+    strip: u32,
+    workdir: &Path,
+) -> Result<PreparedPatch, PatchPreparationError> {
+    let mut order = Vec::new();
+    let mut results: HashMap<String, (PathBuf, Option<String>, Option<fs::Permissions>)> =
+        HashMap::new();
+
+    for section in split_file_patches(patch_text) {
+        let patch = diffy::Patch::from_str(&section)
+            .map_err(|error| PatchPreparationError::Invalid(format!("malformed patch: {error}")))?;
+        let target = patch_target(&patch, strip).map_err(PatchPreparationError::Invalid)?;
+        let absolute =
+            validate_patch_target(&target, workdir).map_err(PatchPreparationError::Invalid)?;
+
+        let is_new_file = patch.original() == Some("/dev/null");
+        let is_deletion = patch.modified() == Some("/dev/null");
+        let (base, permissions) = match results.get(&target) {
+            Some((_, Some(content), permissions)) => (content.clone(), permissions.clone()),
+            Some((_, None, permissions)) if is_new_file => (String::new(), permissions.clone()),
+            Some((_, None, _)) => {
+                return Err(PatchPreparationError::DoesNotApply(format!(
+                    "patch target '{target}' was deleted by an earlier section"
+                )));
+            }
+            None if is_new_file => match fs::symlink_metadata(&absolute) {
+                Ok(_) => {
+                    return Err(PatchPreparationError::DoesNotApply(format!(
+                        "new-file patch target '{target}' already exists"
+                    )));
+                }
+                Err(error) if error.kind() == io::ErrorKind::NotFound => (String::new(), None),
+                Err(error) => {
+                    return Err(PatchPreparationError::Invalid(format!(
+                        "cannot inspect patch target '{target}': {error}"
+                    )));
+                }
+            },
+            None => {
+                let permissions = fs::symlink_metadata(&absolute)
+                    .map_err(|error| {
+                        PatchPreparationError::DoesNotApply(format!(
+                            "cannot inspect patch target '{target}': {error}"
+                        ))
+                    })?
+                    .permissions();
+                let content = fs::read_to_string(&absolute).map_err(|error| {
+                    PatchPreparationError::DoesNotApply(format!(
+                        "cannot read patch target '{target}': {error}"
+                    ))
+                })?;
+                (content, Some(permissions))
+            }
+        };
+
+        let result = diffy::apply(&base, &patch).map_err(|_| {
+            PatchPreparationError::DoesNotApply(format!("patch does not apply to '{target}'"))
+        })?;
+        if is_deletion && !result.is_empty() {
+            return Err(PatchPreparationError::DoesNotApply(format!(
+                "deletion patch did not remove all content from '{target}'"
+            )));
+        }
+
+        if !results.contains_key(&target) {
+            order.push(target.clone());
+        }
+        results.insert(
+            target,
+            (
+                absolute,
+                if is_deletion { None } else { Some(result) },
+                permissions,
+            ),
+        );
+    }
+
+    let files = order
+        .into_iter()
+        .filter_map(|target| {
+            results
+                .remove(&target)
+                .map(|(absolute, content, permissions)| PreparedFile {
+                    target,
+                    absolute,
+                    content,
+                    permissions,
+                })
+        })
+        .collect();
+    Ok(PreparedPatch { files })
+}
+
+/// Return every safe target named by a patch without reading the worktree.
+pub(crate) fn patch_targets(patch_text: &str, strip: u32) -> Result<Vec<String>, String> {
+    let mut targets = Vec::new();
+    let mut seen = HashSet::new();
+    for section in split_file_patches(patch_text) {
+        let patch = diffy::Patch::from_str(&section)
+            .map_err(|error| format!("malformed patch: {error}"))?;
+        let target = patch_target(&patch, strip)?;
+        resolve_safe(&target, &util::working_dir())?;
+        if seen.insert(target.clone()) {
+            targets.push(target);
+        }
+    }
+    Ok(targets)
 }
 
 /// Read the patch from the given files (concatenated) or from stdin, enforcing
@@ -232,22 +387,82 @@ fn resolve_safe(target: &str, workdir: &Path) -> Result<PathBuf, String> {
     if target.is_empty() || target.contains('\0') {
         return Err(format!("invalid target path '{target}'"));
     }
-    if Path::new(target).is_absolute() || target.split('/').any(|c| c == "..") {
+    let target_path = Path::new(target);
+    if target_path.is_absolute()
+        || target
+            .split('/')
+            .any(|component| component.is_empty() || matches!(component, "." | ".."))
+        || target_path.components().any(|component| {
+            matches!(
+                component,
+                Component::Prefix(_)
+                    | Component::RootDir
+                    | Component::ParentDir
+                    | Component::CurDir
+            )
+        })
+    {
         return Err(format!(
-            "refusing to patch outside the working tree: '{target}'"
+            "refusing non-canonical or outside-worktree patch path: '{target}'"
         ));
     }
-    if target == util::ROOT_DIR || target.starts_with(&format!("{}/", util::ROOT_DIR)) {
+    let targets_internal_storage = target_path.components().next().is_some_and(|component| {
+        matches!(
+            component,
+            Component::Normal(name)
+                if name
+                    .to_str()
+                    .is_some_and(|name| name.eq_ignore_ascii_case(util::ROOT_DIR))
+        )
+    });
+    if targets_internal_storage {
         return Err(format!(
             "refusing to patch inside {}: '{target}'",
             util::ROOT_DIR
         ));
     }
-    let absolute = workdir.join(target);
+    let absolute = workdir.join(target_path);
     if !util::is_sub_path(&absolute, workdir) {
         return Err(format!(
             "refusing to patch outside the working tree: '{target}'"
         ));
     }
     Ok(absolute)
+}
+
+/// Validate a previously parsed target against the current worktree path
+/// topology. Sequencer cleanup re-runs this because an ancestor can be replaced
+/// with a symlink while an operation is stopped.
+pub(crate) fn validate_patch_target(target: &str, workdir: &Path) -> Result<PathBuf, String> {
+    let absolute = resolve_safe(target, workdir)?;
+    reject_symlink_components(target, workdir)?;
+    Ok(absolute)
+}
+
+/// Refuse existing symlinks in a patch path. Lexical containment alone is not
+/// sufficient for a writing caller because `dir/link/file` could otherwise
+/// escape the worktree through `link`.
+fn reject_symlink_components(target: &str, workdir: &Path) -> Result<(), String> {
+    let mut current = workdir.to_path_buf();
+    for component in Path::new(target).components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(format!(
+                    "refusing symlink patch path '{}': '{}' is a symlink",
+                    target,
+                    current.display()
+                ));
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => break,
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect patch path '{}': {error}",
+                    current.display()
+                ));
+            }
+        }
+    }
+    Ok(())
 }
