@@ -189,6 +189,7 @@ Windows 构建用户请查看 [Windows 构建指南](docs/installation/windows.m
 MIT 许可证 — 详情见 [LICENSE](LICENSE)。
 
 Copyright (c) 2025-2026 Web3 Infrastructure Foundation.
+
 Copyright (c) 2026 GitMono Limited.
 
 ---

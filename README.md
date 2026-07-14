@@ -189,6 +189,7 @@ For detailed contribution guidelines, see [docs/development/contributing.md](doc
 MIT License — see [LICENSE](LICENSE) for details.
 
 Copyright (c) 2025-2026 Web3 Infrastructure Foundation.
+
 Copyright (c) 2026 GitMono Limited.
 
 ---
