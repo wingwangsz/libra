@@ -1116,9 +1116,8 @@ async fn write_committed_checkpoint(
             observed_agents::{
                 coverage, normalize_opencode_export,
                 opencode_export::{
-                    ExportLimits, run_export_subprocess_sandboxed, trusted_opencode_binary,
+                    ExportLimits, authorized_sandboxed_export, trusted_opencode_binary,
                 },
-                transcript_source::ExportAuthorized,
             },
         };
         let owner = format!("export:{}:{}", std::process::id(), uuid::Uuid::new_v4());
@@ -1126,10 +1125,13 @@ async fn write_committed_checkpoint(
         match export_job::observe_idle(conn, "opencode", &envelope.session_id, &owner, now_ms).await
         {
             Err(err) => {
-                tracing::warn!(
-                    error = %format!("{err:#}"),
-                    "opencode export job unavailable; falling back to metadata-only capture"
-                );
+                // ADR-DR-10 fail-closed: a job/DB/schema failure is a GATE
+                // failure — never proceed to an ungated append. (Only
+                // trusted-binary/sandbox/export failures degrade to the
+                // metadata-only capture below.)
+                return Err(err.context(
+                    "opencode export job gate unavailable; checkpoint write aborted (fail-closed)",
+                ));
             }
             Ok(IdleOutcome::RecordedOnly) => {
                 tracing::info!(
@@ -1145,9 +1147,10 @@ async fn write_committed_checkpoint(
             }) => {
                 let bridge = async {
                     let binary = trusted_opencode_binary().await?;
-                    run_export_subprocess_sandboxed(
+                    authorized_sandboxed_export(
                         &binary,
                         &envelope.session_id,
+                        libra_session_id,
                         ExportLimits::default(),
                     )
                     .await
@@ -1171,11 +1174,32 @@ async fn write_committed_checkpoint(
                         )
                         .await;
                     }
-                    Ok(bytes) => {
-                        // Digest-bound authorization tag (ADR-DR-02): minted
-                        // here, re-verified like every Bytes source.
-                        let auth = ExportAuthorized::issue("opencode", libra_session_id, &bytes);
-                        debug_assert!(auth.matches("opencode", libra_session_id, &bytes));
+                    Ok(TranscriptSource::File { .. }) => {
+                        // INVARIANT: the bridge only constructs Bytes.
+                        return Err(anyhow!(
+                            "opencode export bridge returned a File source (internal invariant)"
+                        ));
+                    }
+                    Ok(TranscriptSource::Bytes { bytes, auth }) => {
+                        // ADR-DR-02 Bytes trust boundary: verify the digest-
+                        // bound tag FOR REAL before any normalization or
+                        // persistence — a mismatch fails the write closed.
+                        if !auth.matches("opencode", libra_session_id, &bytes) {
+                            let _ = export_job::release(
+                                conn,
+                                "opencode",
+                                &envelope.session_id,
+                                &owner,
+                                fence_token,
+                                "failed",
+                                Some("LBR-AGENT-005"),
+                                Utc::now().timestamp_millis(),
+                            )
+                            .await;
+                            return Err(anyhow!(
+                                "opencode export authorization mismatch; write aborted (fail-closed)"
+                            ));
+                        }
                         let mut turns = normalize_opencode_export(&bytes);
                         coverage::redact_turns(&mut turns);
                         let outcome = match coverage_gate::reserve_turn_claims_for_channel(
@@ -1217,8 +1241,11 @@ async fn write_committed_checkpoint(
                                 conflicted = outcome.conflicted,
                                 "opencode export: every turn already covered; no append"
                             );
+                            // Honest release even on no-op: another idle may
+                            // have landed during the export — the outcome of
+                            // advance decides idle vs dirty (ADR-DR-11).
                             let done_ms = Utc::now().timestamp_millis();
-                            let _ = export_job::advance_processed(
+                            let advance = export_job::advance_processed(
                                 conn,
                                 "opencode",
                                 &envelope.session_id,
@@ -1228,17 +1255,25 @@ async fn write_committed_checkpoint(
                                 done_ms,
                             )
                             .await;
-                            let _ = export_job::release(
-                                conn,
-                                "opencode",
-                                &envelope.session_id,
-                                &owner,
-                                fence_token,
-                                "idle",
-                                None,
-                                done_ms,
-                            )
-                            .await;
+                            let terminal = match advance {
+                                Ok(export_job::AdvanceOutcome::Clean) => Some("idle"),
+                                Ok(export_job::AdvanceOutcome::MoreWork { .. }) => Some("dirty"),
+                                Ok(export_job::AdvanceOutcome::FencedOut) => None,
+                                Err(_) => Some("dirty"),
+                            };
+                            if let Some(state) = terminal {
+                                let _ = export_job::release(
+                                    conn,
+                                    "opencode",
+                                    &envelope.session_id,
+                                    &owner,
+                                    fence_token,
+                                    state,
+                                    None,
+                                    done_ms,
+                                )
+                                .await;
+                            }
                             return Ok(());
                         }
                         // Whole-blob baseline for the checkpoint: the export

@@ -14,17 +14,20 @@
 //! - **Environment**: `env_clear()` plus a minimal allowlist (`HOME`,
 //!   `XDG_DATA_HOME`, `XDG_CONFIG_HOME`) so the exporter can find its own
 //!   session store but never a credential.
-//! - **Bounds** (GC-DR-04): stdout is stream-read with a hard byte cap
-//!   (default 16 MiB — over-cap kills the child and errors, never
-//!   truncates); the whole run sits under a wall-clock deadline (default
-//!   3 s — expiry kills the child). stderr is capped and redacted before it
-//!   can appear in any error text (GC-DR-13).
+//! - **Bounds** (GC-DR-04): the child's stdout is an inherited anonymous
+//!   FILE (probe-verified: the CLI truncates large exports into
+//!   backpressured pipes while exiting success), write-bounded at the byte
+//!   cap via `RLIMIT_FSIZE` (overflow terminates the child immediately —
+//!   never fills disk, never truncates silently) and re-checked on the file
+//!   size after exit; the whole run sits under a wall-clock deadline
+//!   (default 3 s — expiry kills the child). stderr is capped and redacted
+//!   before it can appear in any error text (GC-DR-13).
 //!
-//! Sandbox status: the plan's minimal offline profile
-//! (`SandboxEnforcement::Required`, network disabled, read-only store) is the
-//! remaining DR-04b hardening step — until it lands, callers MUST NOT wire
-//! this bridge into the live hook path; the trust gate + env_clear + bounds
-//! above are necessary but not yet the full task-card bar.
+//! Sandbox: the Required bwrap offline profile lives in
+//! [`run_export_subprocess_sandboxed`] — network unshared, host paths and
+//! HOME read-only, tmpfs `/tmp`, with ONE probe-verified exception: the
+//! opencode data dir is bound read-write because its WAL-mode SQLite store
+//! needs write access even for reads. Fail-closed without bwrap/non-Linux.
 
 use std::{path::PathBuf, time::Duration};
 
@@ -32,7 +35,8 @@ use anyhow::{Context, Result, anyhow, bail};
 use tokio::io::AsyncReadExt;
 
 use crate::internal::ai::observed_agents::{
-    Redactor,
+    Redactor, TranscriptSource,
+    transcript_source::ExportAuthorized,
     trust::{read_trust, revalidate_trust},
 };
 
@@ -108,6 +112,21 @@ fn sanitized_stderr(raw: &[u8]) -> String {
     String::from_utf8_lossy(redacted.as_ref()).into_owned()
 }
 
+/// Run the sandboxed export AND mint the digest-bound authorization in one
+/// step — the ONLY constructor of an export-authorized byte source (ADR-DR-02
+/// Bytes trust boundary). Callers receive an opaque [`TranscriptSource`] and
+/// must still re-verify via `ExportAuthorized::matches` before use.
+pub async fn authorized_sandboxed_export(
+    binary: &std::path::Path,
+    provider_session_id: &str,
+    libra_session_id: &str,
+    limits: ExportLimits,
+) -> Result<TranscriptSource> {
+    let bytes = run_export_subprocess_sandboxed(binary, provider_session_id, limits).await?;
+    let auth = ExportAuthorized::issue("opencode", libra_session_id, &bytes);
+    Ok(TranscriptSource::Bytes { bytes, auth })
+}
+
 /// Run `<binary> export <session_id>` under the module's bounds and return
 /// the raw export bytes. The caller (DR-04b wiring) tags them via
 /// `ExportAuthorized::issue` and feeds the seam — this function itself never
@@ -149,6 +168,26 @@ async fn run_bounded_exporter(
         .try_clone()
         .context("clone export stdout handle")?;
     let mut command = tokio::process::Command::new(program);
+    // GC-DR-04 write-time bound: cap the child's file writes at the byte cap
+    // (+1 so overflow is DETECTED, not silently truncated). The kernel
+    // delivers SIGXFSZ / EFBIG at the limit, terminating a runaway exporter
+    // immediately instead of letting it fill disk until the deadline.
+    #[cfg(unix)]
+    {
+        let fsize_limit = limits.max_bytes.saturating_add(1);
+        unsafe {
+            command.pre_exec(move || {
+                let lim = libc::rlimit {
+                    rlim_cur: fsize_limit,
+                    rlim_max: fsize_limit,
+                };
+                if libc::setrlimit(libc::RLIMIT_FSIZE, &lim) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+    }
     command
         .args(pre_args)
         .arg("export")

@@ -647,6 +647,15 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
         return turns;
     };
     let Some(messages) = document.get("messages").and_then(CanonValue::as_array) else {
+        // Valid JSON but structurally NOT an export document (missing or
+        // wrong-typed `messages`): poison, never "no work" — advancing the
+        // job on this would silently drop capture (Codex M3 R1 P1-5).
+        turns.push(NormalizedTurn {
+            logical_turn_key: ordinal_key(0),
+            ordinal: 0,
+            completeness: Completeness::Incomplete,
+            records: Vec::new(),
+        });
         return turns;
     };
 
@@ -677,19 +686,41 @@ pub fn normalize_opencode_export(data: &[u8]) -> Vec<NormalizedTurn> {
     }
 
     for message in messages {
+        // Structural validation: a message must be an object with an object
+        // `info` carrying a string `role`, and an array `parts`. Anything
+        // else poisons the enclosing turn instead of defaulting away
+        // (Codex M3 R1 P1-5).
+        let mut structural_violation = false;
         let info = message.get("info");
-        let role = info
-            .and_then(|i| i.get("role"))
-            .and_then(CanonValue::as_str)
-            .unwrap_or("");
-        let msg_id = info
-            .and_then(|i| i.get("id"))
-            .and_then(CanonValue::as_str)
-            .map(str::to_string);
-        let parts = message
-            .get("parts")
-            .and_then(CanonValue::as_array)
-            .unwrap_or(&[]);
+        if !matches!(message, CanonValue::Object(_)) || !matches!(info, Some(CanonValue::Object(_)))
+        {
+            structural_violation = true;
+        }
+        let role = match info.and_then(|i| i.get("role")) {
+            Some(CanonValue::Str(role)) => role.as_str(),
+            _ => {
+                structural_violation = true;
+                ""
+            }
+        };
+        let msg_id = match info.and_then(|i| i.get("id")) {
+            Some(CanonValue::Str(id)) => Some(id.clone()),
+            Some(CanonValue::Null) | None => None,
+            Some(_) => {
+                structural_violation = true;
+                None
+            }
+        };
+        let parts: &[CanonValue] = match message.get("parts") {
+            Some(CanonValue::Array(parts)) => parts,
+            _ => {
+                structural_violation = true;
+                &[]
+            }
+        };
+        if structural_violation {
+            current_or_open(&mut turns).completeness = Completeness::Incomplete;
+        }
 
         // Joined text parts with semantic type validation.
         let mut text_fragments: Vec<&str> = Vec::new();
