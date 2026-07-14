@@ -34,7 +34,7 @@ use std::{
 
 use anyhow::{Context, Result};
 
-use crate::internal::ai::observed_agents::ObservedAgent;
+use crate::internal::ai::observed_agents::{AgentSessionCtx, ObservedAgent};
 
 /// Default effective byte cap for a single transcript read (GC-DR-04). Matches
 /// the existing Claude adapter hard cap so DR-04a does not silently enlarge the
@@ -204,11 +204,19 @@ fn provider_root_relative_source_id(adapter: &dyn ObservedAgent, path: &Path) ->
 /// - `Err(_)` only on an unexpected I/O error opening a trusted, present path.
 pub fn resolve_transcript_source(
     adapter: &dyn ObservedAgent,
-    transcript_path: Option<&Path>,
+    ctx: &AgentSessionCtx,
 ) -> Result<Option<TranscriptSource>> {
-    let Some(path) = transcript_path else {
+    let Some(path) = ctx.transcript_path.as_deref() else {
         return Ok(None);
     };
+    // DR-01 (ADR-DR-02/07): the optional flush-wait side-effect hook runs
+    // BEFORE the safe open, so the handle sees a settled tail whenever the
+    // budget allows. Always non-fatal.
+    if let Some(preparer) = adapter.as_transcript_preparer()
+        && let Err(err) = preparer.prepare_transcript(ctx)
+    {
+        tracing::warn!(error = %format!("{err:#}"), "transcript preparer failed; continuing");
+    }
     if !transcript_path_within_provider_root(adapter, path) {
         // Untrusted path: never read it (fail-closed on the security gate).
         return Ok(None);
@@ -242,6 +250,15 @@ mod tests {
     /// RAII guard that points `LIBRA_TEST_HOME` at `path` and restores the
     /// prior value on drop. Env mutation is `unsafe` and the tests carry
     /// `#[serial]` so it cannot race other env readers.
+    fn test_ctx(path: Option<PathBuf>) -> AgentSessionCtx {
+        AgentSessionCtx {
+            session_id: "claude_code__t".to_string(),
+            provider_session_id: "t".to_string(),
+            working_dir: PathBuf::from("/tmp"),
+            transcript_path: path,
+        }
+    }
+
     struct HomeGuard {
         prior: Option<std::ffi::OsString>,
     }
@@ -275,7 +292,11 @@ mod tests {
     fn resolve_none_when_no_path() {
         let agent = ClaudeCodeObservedAgent::new();
         let adapter: &dyn ObservedAgent = &agent;
-        assert!(resolve_transcript_source(adapter, None).unwrap().is_none());
+        assert!(
+            resolve_transcript_source(adapter, &test_ctx(None))
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -290,7 +311,7 @@ mod tests {
         let agent = ClaudeCodeObservedAgent::new();
         let adapter: &dyn ObservedAgent = &agent;
         assert!(
-            resolve_transcript_source(adapter, Some(&outside))
+            resolve_transcript_source(adapter, &test_ctx(Some(outside.clone())))
                 .unwrap()
                 .is_none()
         );
@@ -304,7 +325,7 @@ mod tests {
         let path = make_claude_transcript(home.path(), "s.jsonl", b"hello");
         let agent = ClaudeCodeObservedAgent::new();
         let adapter: &dyn ObservedAgent = &agent;
-        let src = resolve_transcript_source(adapter, Some(&path))
+        let src = resolve_transcript_source(adapter, &test_ctx(Some(path.clone())))
             .unwrap()
             .expect("trusted path yields a File source");
         match src {
@@ -339,7 +360,7 @@ mod tests {
         let path = make_claude_transcript(home.path(), "s.jsonl", b"ORIGINAL");
         let agent = ClaudeCodeObservedAgent::new();
         let adapter: &dyn ObservedAgent = &agent;
-        let src = resolve_transcript_source(adapter, Some(&path))
+        let src = resolve_transcript_source(adapter, &test_ctx(Some(path.clone())))
             .unwrap()
             .unwrap();
         // Swap the path to a NEW file with different content after auth.
@@ -365,7 +386,7 @@ mod tests {
         let path = make_claude_transcript(home.path(), "big.jsonl", b"0123456789");
         let agent = ClaudeCodeObservedAgent::new();
         let adapter: &dyn ObservedAgent = &agent;
-        let src = resolve_transcript_source(adapter, Some(&path))
+        let src = resolve_transcript_source(adapter, &test_ctx(Some(path.clone())))
             .unwrap()
             .unwrap();
         match src {

@@ -12,7 +12,10 @@ pub mod gemini;
 pub mod stable_promoted;
 
 pub use claude_code::{
-    ClaudeCodeObservedAgent, rfc3339_boundary_for_unix_seconds, write_truncated_transcript,
+    ClaudeCodeObservedAgent, FlushOutcome, claude_project_slug, claude_session_dir, flush_wait,
+    resolve_session_file, rfc3339_boundary_for_unix_seconds, write_truncated_transcript,
 };
 pub use gemini::GeminiObservedAgent;
-pub use stable_promoted::{STABLE_PROMOTED_SPECS, StablePromotedAgent, stable_promoted_spec_for};
+pub use stable_promoted::{
+    STABLE_PROMOTED_SPECS, StablePromotedAgent, find_codex_rollout, stable_promoted_spec_for,
+};
