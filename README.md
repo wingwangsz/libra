@@ -171,31 +171,9 @@ Libra natively supports the [Model Context Protocol](https://modelcontextprotoco
 
 ## Supported AI Providers
 
-| Provider | Default Model | Auth | Base URL Override |
-|----------|--------------|------|-------------------|
-| **Gemini** (default) | `gemini-2.5-flash` | `GEMINI_API_KEY` | — |
-| **OpenAI** | `gpt-4o-mini` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` |
-| **Anthropic** | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
-| **DeepSeek** | `deepseek-chat` | `DEEPSEEK_API_KEY` | `--api-base` |
-| **Kimi** | `kimi-k2.6` | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` |
-| **Zhipu** | `glm-5` | `ZHIPU_API_KEY` | `ZHIPU_BASE_URL` |
-| **Ollama** | *(specify `--model`)* | `OLLAMA_API_KEY` | `OLLAMA_BASE_URL`, `--api-base` |
+Libra supports Gemini (default), OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, and Ollama — switch providers freely with `--provider`.
 
-> See [docs.libra.tools](https://docs.libra.tools) for provider-specific tuning options, reasoning controls, and model selection.
-
----
-
-## Architecture
-
-Libra is built in **Rust** with a clean, modular architecture:
-
-- **SQLite-backed metadata**: Unified transactional management for config, refs, HEAD, and all AI runtime data
-- **Git-compatible objects**: On-disk formats (loose + pack) are compatible with standard Git
-- **Tiered storage**: Local + S3/R2/MinIO object store with LRU caching
-- **Vault encryption**: Per-repository libvault key management
-- **Cross-platform**: Windows, Linux, macOS
-
-For detailed architecture docs, see [docs.libra.tools](https://docs.libra.tools).
+> See [docs.libra.tools](https://docs.libra.tools/en/docs/getting-started/agent) for provider setup and configuration details.
 
 ---
 

@@ -171,31 +171,9 @@ Libra 原生支持 [Model Context Protocol](https://modelcontextprotocol.io/)，
 
 ## 支持的 AI 提供商
 
-| 提供商 | 默认模型 | 认证方式 | 基础 URL 覆盖 |
-|----------|--------------|------|-------------------|
-| **Gemini**（默认） | `gemini-2.5-flash` | `GEMINI_API_KEY` | — |
-| **OpenAI** | `gpt-4o-mini` | `OPENAI_API_KEY` | `OPENAI_BASE_URL` |
-| **Anthropic** | `claude-sonnet-4-6` | `ANTHROPIC_API_KEY` | `ANTHROPIC_BASE_URL` |
-| **DeepSeek** | `deepseek-chat` | `DEEPSEEK_API_KEY` | `--api-base` |
-| **Kimi** | `kimi-k2.6` | `MOONSHOT_API_KEY` | `MOONSHOT_BASE_URL` |
-| **Zhipu** | `glm-5` | `ZHIPU_API_KEY` | `ZHIPU_BASE_URL` |
-| **Ollama** | *（指定 `--model`）* | `OLLAMA_API_KEY` | `OLLAMA_BASE_URL`, `--api-base` |
+Libra 支持 Gemini（默认）、OpenAI、Anthropic、DeepSeek、Kimi、Zhipu 和 Ollama —— 通过 `--provider` 自由切换。
 
-> 前往 [docs.libra.tools](https://docs.libra.tools) 查看提供商特定的调优选项、推理控制参数和模型选择。
-
----
-
-## 架构
-
-Libra 使用 **Rust** 构建，采用清晰、模块化的架构：
-
-- **SQLite 元数据**：对 config、refs、HEAD 和所有 AI 运行时数据进行统一事务管理
-- **Git 兼容对象**：磁盘格式（loose + pack）与标准 Git 兼容
-- **分层存储**：本地 + S3/R2/MinIO 对象存储，带 LRU 缓存
-- **Vault 加密**：每个仓库独立的 libvault 密钥管理
-- **跨平台**：Windows、Linux、macOS
-
-详细架构文档请访问 [docs.libra.tools](https://docs.libra.tools)。
+> 前往 [docs.libra.tools](https://docs.libra.tools/en/docs/getting-started/agent) 查看提供商配置详情。
 
 ---
 
