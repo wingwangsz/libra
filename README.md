@@ -107,20 +107,6 @@ Libra speaks Git's language. On-disk formats (objects, index, pack, pack-index) 
 
 Key difference: Git manages files. Libra manages **creation**.
 
-### 🤖 Multi-Agent Collaboration
-
-The `libra code` command launches an interactive TUI backed by a web server and an MCP stdio interface, designed for collaborative AI-human workflows. Switch between 7+ AI providers without changing your workflow.
-
-```bash
-libra code --provider gemini      # Google Gemini (default)
-libra code --provider openai      # OpenAI GPT
-libra code --provider anthropic   # Anthropic Claude
-libra code --provider deepseek    # DeepSeek
-libra code --provider kimi        # Moonshot AI
-libra code --provider zhipu       # Zhipu GLM
-libra code --provider ollama      # Local inference
-```
-
 ### 🔐 Vault-Backed Security
 
 Every `libra init` automatically creates a per-repository vault for encrypted key management:
@@ -139,21 +125,6 @@ Every tool invocation from an AI agent passes through a configurable safety sand
 - **Tiered storage**: Offload large objects to S3/R2/MinIO with local LRU caching
 - **Cloud backup**: Sync your entire repository state (including AI history) to Cloudflare D1 + R2
 - **Portable**: Move a Libra repository between machines with all AI context intact
-
-### 🛠️ AI-Native Subcommands
-
-Commands you won't find in Git, built for agent workflows:
-
-| Command | Purpose |
-|---------|---------|
-| `libra code` | Launch AI-native TUI (TUI + Web + MCP) |
-| `libra automation` | Cron-driven rule-based automation |
-| `libra agent` | Capture external agent sessions (Claude Code, Gemini) |
-| `libra publish` | Read-only Cloudflare Worker publishing |
-| `libra graph` | Visualize AI thread version graphs |
-| `libra sandbox` | Inspect and configure safety sandbox |
-| `libra usage` | Token and cost tracking across providers |
-| `libra cloud` | Backup and restore to/from D1 + R2 |
 
 ### 🌐 MCP Protocol Native
 
@@ -217,6 +188,7 @@ For detailed contribution guidelines, see [docs/development/contributing.md](doc
 MIT License — see [LICENSE](LICENSE) for details.
 
 Copyright (c) 2025-2026 Web3 Infrastructure Foundation.
+Copyright (c) 2026 GitMono Limited.
 
 ---
 
