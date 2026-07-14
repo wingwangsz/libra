@@ -71,6 +71,7 @@ pub mod logfile;
 pub mod ls_files;
 pub mod ls_remote;
 pub mod ls_tree;
+pub mod mailinfo;
 pub mod maintenance;
 #[cfg(feature = "fastcdc")]
 pub mod media;

@@ -59,4 +59,4 @@ libra am --abort
 
 ## 当前限制
 
-这是 P2-01 最小 surface，不是完整 Git `am`。当前不接受 stdin、单个 mbox 内的多封邮件、MIME multipart/attachment、binary patch、仅 rename 或仅 mode 的补丁，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。内容补丁会保留已有文件权限，但不会应用邮件中的 mode change。不会运行 applypatch/commit hooks。`mailinfo` 尚未作为独立命令公开。
+这是 P2-01 最小 surface，不是完整 Git `am`。当前不接受 stdin、单个 mbox 内的多封邮件、MIME multipart/attachment、binary patch、仅 rename 或仅 mode 的补丁，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。内容补丁会保留已有文件权限，但不会应用邮件中的 mode change。不会运行 applypatch/commit hooks。共享 parser 也通过独立的 [`libra mailinfo`](mailinfo.md) 命令公开。

@@ -57,7 +57,7 @@ Command Groups:
   Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, review, investigate, service
-  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
+  Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, mailinfo, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
 
 Help Topics:
   error-codes  Print the stable CLI error code table (`libra help error-codes`)
@@ -468,6 +468,11 @@ enum Commands {
         after_help = command::am::AM_EXAMPLES
     )]
     Am(command::am::AmArgs),
+    #[command(
+        about = "Extract metadata, message, and patch from one mail",
+        after_help = command::mailinfo::MAILINFO_EXAMPLES
+    )]
+    Mailinfo(command::mailinfo::MailinfoArgs),
     #[command(
         about = "Iterate over refs in a local repository with formatting and filtering",
         after_help = command::for_each_ref::FOR_EACH_REF_EXAMPLES
@@ -1420,6 +1425,9 @@ fn command_preflight(command: &Commands) -> CliResult<CommandPreflight> {
         | Commands::Login(_)
         | Commands::Whoami(_)
         | Commands::Logout(_)
+        // `mailinfo` reads one mail from stdin and writes two ordinary files;
+        // it does not inspect repository state or object storage.
+        | Commands::Mailinfo(_)
         | Commands::Sandbox(_) => Ok(CommandPreflight::none()),
         // `cache info` only inspects env/config-derived storage tunables and
         // works outside a repository; `cache evict` deletes local objects, so
@@ -1862,6 +1870,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
             command::format_patch::execute_safe(cmd_args, &output).await?
         }
         Commands::Am(cmd_args) => command::am::execute_safe(cmd_args, &output).await?,
+        Commands::Mailinfo(cmd_args) => command::mailinfo::execute_safe(cmd_args, &output)?,
         Commands::ForEachRef(cmd_args) => {
             command::for_each_ref::execute_safe(cmd_args, &output).await?
         }

@@ -53,6 +53,9 @@ notes: |
   Wave 3 requires `gh` auth + create/delete private repo permission.
   All scenarios must follow the §3.3.1 canonical libra()/gitfix() isolation
   template in the md (env -i + SAFE_PATH + TMPDIR + RUN_ROOT).
+  Cargo-only compatibility targets are not duplicated as runner scenarios;
+  P2-02 mailinfo is registered as compat_mailinfo_basic in tests/INDEX.md and
+  the integration-test-plan matrix.
 
 scenarios:
   # --- Wave 1: core local version control (no network, no external services) ---

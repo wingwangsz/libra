@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Minimal mail parsing plumbing (v0.18.85)**: adds repo-independent
+  `libra mailinfo <msg> <patch> < mail` with Git-shaped author/email/subject/date
+  metadata, body-only message output, separator-through-signature patch output,
+  JSON/machine, and quiet modes. `mailinfo` and `am` now share one bounded
+  UTF-8 single-part transfer/RFC 2047 parser; repository-specific patch-target
+  checks remain in `am`. Both output payloads are staged before per-file atomic
+  replacement, and lexical or symlink-parent aliases cannot collapse the two
+  destinations. English/Chinese user docs and an eight-scenario Unix
+  compatibility target cover repo-free use, folded headers, output safety, and
+  fail-closed unsupported inputs.
+
 - **Minimal mail patch sequencer (v0.18.84)**: adds `libra am <patch>...`
   with `--continue`, `--skip`, and `--abort` for bounded plain-text
   `format-patch` mail files. The implementation preserves message/author/date,

@@ -8,13 +8,13 @@
 
 - 兼容级别：`partial`。
 - 已支持：多个独立 patch mail 文件、基本/折叠 headers、`[PATCH ...]` subject cleanup、in-body `From:`、RFC 2822 author date、UTF-8/US-ASCII RFC 2047 B/Q、single-part 7bit/8bit/binary/quoted-printable/base64、文本 new/modify/delete diff、author/message/date 保留、`--continue`/`--skip`/`--abort`、JSON/machine。
-- 明确延后：stdin/多消息 mbox、MIME multipart、binary、rename-only/mode-only、3-way marker、applypatch hooks、全部 mail flags；独立 `mailinfo` 由 P2-02 接入。
+- 明确延后：stdin/多消息 mbox、MIME multipart、binary、rename-only/mode-only、3-way marker、applypatch hooks、全部 mail flags；P2-02 已公开共用 parser 的独立 `mailinfo`。
 - 边界：总输入 64 MiB、最多 10,000 mail；需要 local branch + existing HEAD；新 series 拒绝 staged/tracked dirty state，并直接以 index + filesystem 拒绝所有 existing non-index target（含 ignored），不依赖 status 的 untracked projection。
 
 ## 设计方案
 
 - 入口：`src/cli.rs::Commands::Am` → `command::am::execute_safe`。
-- parser：`parse_mail_patch` 做 CRLF normalize、header unfolding/transfer decode、identity/date/subject/message split 与 diff extraction；解析出的 `MailPatch` 连同 targets 进入持久状态。状态 load 会重新解析 patch targets 并与保存值比对，外部篡改不能把 cleanup 路径改到工作树之外。
+- parser：`command::mailinfo::parse_mail` 做 CRLF normalize、header unfolding/transfer decode、identity/date/subject/message split 与 diff extraction；public `mailinfo` 和 `am` 共用这一个 seam。`am` 在 repo context 继续执行 `patch_targets` guard，解析出的 `MailPatch` 连同 targets 进入持久状态。状态 load 会重新解析 patch targets 并与保存值比对，外部篡改不能把 cleanup 路径改到工作树之外。
 - patch engine：复用 `command::apply::{patch_targets,prepare_patch}`。所有 file section 在 memory 中 test-apply 后才写；path guard 拒绝 absolute/empty/`.`/`..`/NUL/`.libra`/symlink component，避免非规范拼写绕过 untracked collision；写入使用 `write_atomic` 并恢复已有 permissions。公开 `apply` 仍保持 check-only。
 - staging：worktree 写入后以 exact targets 调用 `add::run_add(force=true)`，继续保留 layer exclusion、LFS lock policy、case collision 与 index save 约束。
 - commit：从 index 走 `tree_plumbing::write_tree_from_index`，author/date 来自 mail，committer 来自当前 config/env；commit object 先落 object store，再由 `with_reflog` transaction 同时更新 branch、reflog 和下一 `sequence_state`（最后一封则 clear）。因此不存在“branch 已移动但 state 仍指旧邮件”的 crash window；失败只可能留下 unreachable object。
@@ -28,14 +28,14 @@
 
 - `compat_mail_am_basic`：16 个黑盒场景覆盖 generated `format-patch` replay、message/author/date、series、单封 add+delete、SHA-256、conflict→continue、skip、abort、dirty/untracked/ignored/staged guards、非规范 path alias 防护、same-branch HEAD drift、initial-state/commits 间 pristine resume、injected write→stage interruption cleanup、executable preservation、JSON/help。
 - `command_test::command::apply_test`：16 个 shared parser regression，包括非规范 alias 与 symlink-component escape rejection。
-- `command::am::tests`：plain mail parse、quoted-printable/RFC 2047、subject cleanup。
+- `command::mailinfo::tests`：plain mail 的 mailinfo/am 双视图、quoted-printable/RFC 2047（含 folded adjacent words）、subject cleanup。
+- `compat_mailinfo_basic`：Unix 8 个（非 Unix 7 个）repo-independent 黑盒场景固定共享 parser、body/patch outputs、JSON/quiet 与 output safety。
 - `internal::sequencer::tests`：crate-private `am` unified row round-trip、双向跨操作 mutex，以及 public `SequenceKind` source-compat guard。
 
 ## 还未实现的功能
 
 | 类别 | 未完成项 | 处理 |
 |---|---|---|
-| mail plumbing | 公开 `mailinfo msg patch < mail` | P2-02。当前 parser 为 `am` 内部实现。 |
 | interop | Git format-patch→Libra am 与 Libra format-patch→Git am 的完整矩阵 | P2-03；P2-01 只固定 Libra 默认 single-part 输出。 |
 | conflict | `--3way`、自动 conflict marker、rerere | 延后；当前 exact apply stop + manual stage。 |
 | formats | multipart/attachment、多消息 mbox、binary/rename/mode-only | 延后；明确错误，不 silent fallback。 |
@@ -43,6 +43,6 @@
 
 ## 维护要求
 
-- 修改 mail parser 时同步 P2-02 的 future `mailinfo` 共用 seam，不能产生两套 cleanup 语义。
+- 修改 mail parser 时必须同步 public `mailinfo` 与 `am` 的测试，不能产生两套 cleanup 语义。
 - branch/ref/sequencer advance 必须继续保持单 DB transaction；任何拆分都按 P1 correctness regression 处理。
 - rollback 新增 path class 时必须加入 interruption-before-stage 测试，证明 abort 不留文件且不删 pre-existing untracked data。

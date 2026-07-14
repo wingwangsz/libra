@@ -150,6 +150,7 @@ Every Libra command accepts the following global flags:
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
 | `libra apply` | | Check whether a unified-diff patch applies (`--check`) | [apply.md](apply.md) |
+| `libra mailinfo` | | Extract metadata, message body, and patch text from one email patch | [mailinfo.md](mailinfo.md) |
 | `libra cat-file` | | Inspect Git objects and AI objects by type, size, or pretty-printed content | [cat-file.md](cat-file.md) |
 | `libra check-attr` | | Report Git/Libra attributes (e.g. `filter`, `diff`, `export-ignore`) for pathnames | [check-attr.md](check-attr.md) |
 | `libra check-mailmap` | | Resolve `Name <email>` contacts through `.mailmap` | [check-mailmap.md](check-mailmap.md) |
