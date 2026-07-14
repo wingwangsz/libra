@@ -247,37 +247,70 @@ const ROLLOUT_MAX_ENTRIES_PER_DIR: usize = 4_096;
 const ROLLOUT_MAX_FILES_SCANNED: usize = 10_000;
 
 fn codex_sessions_root() -> Option<std::path::PathBuf> {
+    // $CODEX_HOME (absolute) wins WITHOUT requiring a resolvable home dir;
+    // only the fallback needs one.
+    if let Some(path) = std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from)
+        && path.is_absolute()
+    {
+        return Some(path.join("sessions"));
+    }
     let home = std::env::var_os("LIBRA_TEST_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::home_dir)?;
-    let codex_home = match std::env::var_os("CODEX_HOME").map(std::path::PathBuf::from) {
-        Some(path) if path.is_absolute() => path,
-        _ => home.join(".codex"),
-    };
-    Some(codex_home.join("sessions"))
+    Some(home.join(".codex").join("sessions"))
 }
 
-/// List a directory's entry names, sorted DESCENDING (newest date-partition
-/// first), bounded by [`ROLLOUT_MAX_ENTRIES_PER_DIR`].
-fn sorted_desc_entries(dir: &std::path::Path) -> Vec<std::ffi::OsString> {
-    let Ok(read) = fs::read_dir(dir) else {
-        return Vec::new();
+/// List a directory's entry names filtered by `keep`, sorted DESCENDING
+/// (newest date partition first). Bounded and LOUD: scanning more than
+/// [`ROLLOUT_MAX_ENTRIES_PER_DIR`] entries is an explicit error (a silent
+/// prefix could skip a newer partition and return a stale match); a missing
+/// directory lists empty; any other I/O failure propagates so callers can
+/// diagnose it instead of reading "not found".
+fn sorted_desc_entries(
+    dir: &std::path::Path,
+    keep: impl Fn(&str) -> bool,
+) -> Result<Vec<std::ffi::OsString>> {
+    let read = match fs::read_dir(dir) {
+        Ok(read) => read,
+        Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(err) => {
+            return Err(err).with_context(|| format!("read rollout directory {}", dir.display()));
+        }
     };
-    let mut names: Vec<std::ffi::OsString> = read
-        .take(ROLLOUT_MAX_ENTRIES_PER_DIR)
-        .filter_map(|entry| entry.ok().map(|e| e.file_name()))
-        .collect();
+    let mut names: Vec<std::ffi::OsString> = Vec::new();
+    for (scanned, entry) in read.enumerate() {
+        if scanned >= ROLLOUT_MAX_ENTRIES_PER_DIR {
+            return Err(anyhow!(
+                "rollout directory {} exceeds the {} entry scan bound; refusing a possibly \
+                 stale answer (GC-DR-08 bounded discovery)",
+                dir.display(),
+                ROLLOUT_MAX_ENTRIES_PER_DIR
+            ));
+        }
+        let entry =
+            entry.with_context(|| format!("read rollout directory entry in {}", dir.display()))?;
+        let name = entry.file_name();
+        if keep(&name.to_string_lossy()) {
+            names.push(name);
+        }
+    }
     names.sort_unstable_by(|a, b| b.cmp(a));
-    names
+    Ok(names)
+}
+
+fn all_ascii_digits(name: &str, len: usize) -> bool {
+    name.len() == len && name.bytes().all(|b| b.is_ascii_digit())
 }
 
 /// Locate the newest Codex rollout JSONL for `session_id` under
 /// `$CODEX_HOME/sessions/YYYY/MM/DD/rollout-*-<session_id>.jsonl`
 /// (plan-20260713 DR-03, mirroring Entire's `findRolloutBySessionID`).
 ///
-/// Bounded (GC-DR-08): fixed depth 3, per-dir and total-file caps, newest
-/// date partitions first, first match wins. Fail-closed on an invalid id or
-/// a symlinked match; `Ok(None)` when nothing is found.
+/// Bounded (GC-DR-08): fixed depth 3, digit-validated date components (a
+/// lexically-high junk directory can never win), per-dir scan bound and a
+/// total-file cap that FAIL rather than silently mis-answer, newest date
+/// partitions first, first match wins. Fail-closed on an invalid id or a
+/// symlinked match; `Ok(None)` only when nothing matches.
 pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>> {
     let valid = !session_id.is_empty()
         && session_id.len() <= 64
@@ -294,28 +327,32 @@ pub fn find_codex_rollout(session_id: &str) -> Result<Option<std::path::PathBuf>
     };
     let suffix = format!("-{session_id}.jsonl");
     let mut files_seen = 0usize;
-    for year in sorted_desc_entries(&root) {
+    for year in sorted_desc_entries(&root, |n| all_ascii_digits(n, 4))? {
         let year_dir = root.join(&year);
         if !year_dir.is_dir() {
             continue;
         }
-        for month in sorted_desc_entries(&year_dir) {
+        for month in sorted_desc_entries(&year_dir, |n| all_ascii_digits(n, 2))? {
             let month_dir = year_dir.join(&month);
             if !month_dir.is_dir() {
                 continue;
             }
-            for day in sorted_desc_entries(&month_dir) {
+            for day in sorted_desc_entries(&month_dir, |n| all_ascii_digits(n, 2))? {
                 let day_dir = month_dir.join(&day);
                 if !day_dir.is_dir() {
                     continue;
                 }
-                for name in sorted_desc_entries(&day_dir) {
-                    files_seen += 1;
-                    if files_seen > ROLLOUT_MAX_FILES_SCANNED {
-                        return Ok(None); // bounded: give up, never stall
-                    }
+                let names = sorted_desc_entries(&day_dir, |n| n.starts_with("rollout-"))?;
+                files_seen += names.len();
+                if files_seen > ROLLOUT_MAX_FILES_SCANNED {
+                    return Err(anyhow!(
+                        "rollout discovery scanned more than {ROLLOUT_MAX_FILES_SCANNED} files; \
+                         refusing a possibly stale answer (GC-DR-08 bounded discovery)"
+                    ));
+                }
+                for name in names {
                     let name_str = name.to_string_lossy();
-                    if name_str.starts_with("rollout-") && name_str.ends_with(&suffix) {
+                    if name_str.ends_with(&suffix) {
                         let candidate = day_dir.join(&name);
                         let meta = fs::symlink_metadata(&candidate)
                             .context("stat candidate Codex rollout")?;
@@ -367,6 +404,51 @@ mod tests {
                     None => std::env::remove_var("CODEX_HOME"),
                 }
             }
+        }
+    }
+
+    /// R1 follow-ups: absolute $CODEX_HOME needs no home; junk lexically-high
+    /// dirs never win; I/O errors surface instead of reading "not found".
+    #[test]
+    #[serial_test::serial]
+    fn codex_rollout_discovery_hardening() {
+        let tmp = tempfile::tempdir().unwrap();
+        let codex_home = tmp.path().join("codex-abs");
+        // Point LIBRA_TEST_HOME at a NONEXISTENT dir: with an absolute
+        // CODEX_HOME the lookup must still work (home-independent).
+        let _g = CodexHomeGuard::set(&tmp.path().join("no-such-home"), &codex_home);
+        let sid = "0199a213-81a0-7800-8aa2-58a4a352b423";
+
+        let day = codex_home.join("sessions/2026/07/13");
+        std::fs::create_dir_all(&day).unwrap();
+        let real = day.join(format!("rollout-2026-07-13T09-30-00-{sid}.jsonl"));
+        std::fs::write(&real, "{}\n").unwrap();
+        // Junk lexically-above-year directory with a decoy match: the digit
+        // filter must keep it out of the walk entirely.
+        let junk = codex_home.join("sessions/zzzz/07/13");
+        std::fs::create_dir_all(&junk).unwrap();
+        std::fs::write(
+            junk.join(format!("rollout-9999-01-01T00-00-00-{sid}.jsonl")),
+            "{}\n",
+        )
+        .unwrap();
+        let found = find_codex_rollout(sid).unwrap().expect("found");
+        assert_eq!(found, real, "digit-validated partitions only");
+
+        // I/O error (unreadable year dir) surfaces as Err, not Ok(None).
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let locked = codex_home.join("sessions/2025");
+            std::fs::create_dir_all(&locked).unwrap();
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+            let missing = "ffffffff-1111-2222-3333-444444444444";
+            let result = find_codex_rollout(missing);
+            std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+            assert!(
+                result.is_err(),
+                "permission failure must be diagnosable, not \"not found\""
+            );
         }
     }
 
