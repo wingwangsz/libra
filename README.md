@@ -123,7 +123,7 @@ Every tool invocation from an AI agent passes through a configurable safety sand
 
 ### ☁️ Tiered Cloud Storage & Backup
 
-- **Tiered storage**: Offload large objects to S3/R2/MinIO with local LRU caching
+- **Tiered storage**: Offload large objects to S3/R2/RustFS with local LRU caching
 - **Cloud backup**: Sync your entire repository state (including AI history) to Cloudflare D1 + R2
 - **Portable**: Move a Libra repository between machines with all AI context intact
 
@@ -147,7 +147,7 @@ Libra natively supports the [Model Context Protocol](https://modelcontextprotoco
 
 ## Supported AI Providers
 
-Libra supports Gemini (default), OpenAI, Anthropic, DeepSeek, Kimi, Zhipu, and Ollama — switch providers freely with `--provider`.
+Libra already works with Claude Code, CodeX and OpenCode; support for other mainstream Agents will be released gradually.
 
 > See [docs.libra.tools](https://docs.libra.tools/en/docs/getting-started/agent) for provider setup and configuration details.
 
