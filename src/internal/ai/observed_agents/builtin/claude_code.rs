@@ -620,6 +620,7 @@ mod tests {
         );
         assert_eq!(claude_project_slug(Path::new("/")), "-");
         assert_eq!(claude_project_slug(Path::new("/a b/中文")), "-a-b---"); // non-ASCII → '-'
+        assert_eq!(claude_project_slug(Path::new("/p/🚀x")), "-p--x"); // non-BMP → '-' (per char)
 
         let home = tempfile::tempdir().unwrap();
         let _g = HomeGuard::set(home.path());
@@ -678,6 +679,11 @@ mod tests {
             flush_wait(&dir.path().join("nope.jsonl"), budget, poll),
             FlushOutcome::Settled
         );
+
+        // Empty file: nothing in flight — settled immediately.
+        let empty = dir.path().join("empty.jsonl");
+        std::fs::write(&empty, b"").unwrap();
+        assert_eq!(flush_wait(&empty, budget, poll), FlushOutcome::Settled);
 
         // Complete tail: settled immediately.
         let complete = dir.path().join("complete.jsonl");
