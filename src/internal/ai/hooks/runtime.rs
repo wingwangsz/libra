@@ -1247,6 +1247,42 @@ async fn write_committed_checkpoint(
                                 ));
                             }
                         };
+                        // Codex M3 R2 P1-2: a purely in-flight skip (another
+                        // writer holds the claim lease for every turn, nothing
+                        // reserved here) must NOT mark this export generation
+                        // clean. If that writer then crashes, its claim lease
+                        // expires and only a DIRTY job lets a later idle
+                        // retry — advancing to clean would silently drop the
+                        // transcript. Mirror the live path: release dirty
+                        // WITHOUT advancing processed, so acquisition re-fires.
+                        if outcome.is_inflight_only_skip() {
+                            tracing::warn!(
+                                session_id = %libra_session_id,
+                                skipped_inflight = outcome.skipped_inflight,
+                                "opencode export: coverage held by another in-flight writer; \
+                                 releasing dirty for retry"
+                            );
+                            let done_ms = Utc::now().timestamp_millis();
+                            if let Err(job_err) = export_job::release(
+                                conn,
+                                "opencode",
+                                &envelope.session_id,
+                                &owner,
+                                fence_token,
+                                "dirty",
+                                None,
+                                done_ms,
+                            )
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %format!("{job_err:#}"),
+                                    session_id = %libra_session_id,
+                                    "failed to release opencode export job after in-flight skip"
+                                );
+                            }
+                            return Ok(());
+                        }
                         if outcome.is_noop() {
                             tracing::info!(
                                 session_id = %libra_session_id,

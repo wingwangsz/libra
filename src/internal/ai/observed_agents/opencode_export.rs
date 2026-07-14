@@ -356,22 +356,28 @@ async fn run_bounded_exporter(
     // silent truncation.
     let mut stdout_file = stdout_file;
     use std::io::{Read as _, Seek as _, SeekFrom};
-    let size = stdout_file
-        .seek(SeekFrom::End(0))
-        .context("measure export output")?;
-    if size > limits.max_bytes {
-        bail!(
-            "opencode export exceeded the {} byte cap; refusing truncated content",
-            limits.max_bytes
-        );
-    }
     stdout_file
         .seek(SeekFrom::Start(0))
         .context("rewind export output")?;
-    let mut out = Vec::with_capacity(size as usize);
-    stdout_file
+    // Bounded read + recheck on the bytes ACTUALLY read (Codex M3 R2 P1-1):
+    // never trust a pre-measured size and never read unbounded into memory. A
+    // `setsid()`-escaped exporter descendant is invisible to the process-group
+    // liveness probe and could append between a size measurement and the read;
+    // in the non-sandboxed path there is no PID namespace to reap it (the
+    // sandboxed path's `--unshare-all` already does). Reading at most cap+1
+    // bytes and rejecting any overflow closes that window regardless: content
+    // over the cap is refused, never accepted or truncated silently.
+    let mut out = Vec::new();
+    let read = (&mut stdout_file)
+        .take(limits.max_bytes.saturating_add(1))
         .read_to_end(&mut out)
-        .context("read export output file")?;
+        .context("read export output file")? as u64;
+    if read > limits.max_bytes {
+        bail!(
+            "opencode export exceeded the {} byte cap; refusing content",
+            limits.max_bytes
+        );
+    }
     if !status.success() {
         bail!(
             "opencode export failed (status {status}); stderr (redacted, capped): {}",
@@ -409,16 +415,7 @@ pub async fn run_export_subprocess_sandboxed(
         if !binary.is_absolute() {
             bail!("exporter binary path must be absolute (trusted provenance)");
         }
-        let bwrap = std::env::var_os("LIBRA_LINUX_SANDBOX_EXE")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute() && p.is_file())
-            .or_else(which_bwrap)
-            .ok_or_else(|| {
-                anyhow!(
-                    "bubblewrap (bwrap) is required for the OpenCode export sandbox and was \
-                     not found; install bwrap or set LIBRA_LINUX_SANDBOX_EXE (fail-closed)"
-                )
-            })?;
+        let bwrap = resolve_trusted_bwrap()?;
 
         use crate::internal::ai::sandbox::{
             policy::SandboxPolicy, proxy::NetworkAccessMode, runtime::create_bwrap_command_args,
@@ -462,17 +459,11 @@ pub async fn run_export_subprocess_sandboxed(
         // need WRITE access even for pure reads — a read-only bind makes
         // `export` fail with a generic error. Bind ONLY the opencode data
         // dir read-write (mounted after the ro HOME bind so it wins);
-        // network stays unshared and everything else read-only.
-        let data_root = std::env::var_os("XDG_DATA_HOME")
-            .map(std::path::PathBuf::from)
-            .filter(|p| p.is_absolute())
-            .or_else(|| {
-                std::env::var_os("HOME")
-                    .map(std::path::PathBuf::from)
-                    .map(|h| h.join(".local/share"))
-            })
-            .map(|base| base.join("opencode"));
-        if let Some(store) = data_root.filter(|p| p.is_dir()) {
+        // network stays unshared and everything else read-only. The store is
+        // resolved to a CANONICAL directory strictly contained under the data
+        // root (Codex M3 R2 P1-5) so a planted `…/opencode -> ~/.ssh` symlink
+        // cannot get an arbitrary target bound read-write.
+        if let Some(store) = resolve_opencode_store() {
             let d = store.to_string_lossy().into_owned();
             extra.extend(["--bind".to_string(), d.clone(), d]);
         }
@@ -499,6 +490,110 @@ fn which_bwrap() -> Option<std::path::PathBuf> {
         .find(|candidate| candidate.is_file())
 }
 
+/// Resolve the bubblewrap binary for the Required sandbox WITH integrity
+/// checks (Codex M3 R2 P1-4). `LIBRA_LINUX_SANDBOX_EXE` / `PATH` may only NAME
+/// the candidate — it must then resolve (through every symlink) to a
+/// root-owned regular file that is not writable by group or other. Otherwise
+/// an attacker who can plant a file on `PATH` or set the env var could supply
+/// a fake "bwrap" that ignores its arguments and runs the trusted exporter
+/// unsandboxed (network + host writes restored). Fail-closed on any doubt: the
+/// capability becomes unavailable, never a degraded unsandboxed run (GC-DR-14).
+#[cfg(target_os = "linux")]
+fn resolve_trusted_bwrap() -> Result<std::path::PathBuf> {
+    let candidate = std::env::var_os("LIBRA_LINUX_SANDBOX_EXE")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(which_bwrap)
+        .ok_or_else(|| {
+            anyhow!(
+                "bubblewrap (bwrap) is required for the OpenCode export sandbox and was \
+                 not found; install bwrap or set LIBRA_LINUX_SANDBOX_EXE to a root-owned \
+                 bwrap binary (fail-closed)"
+            )
+        })?;
+    validate_trusted_bwrap(&candidate)
+}
+
+/// Integrity core (testable without env mutation): resolve every symlink so
+/// the ownership/mode checks apply to the file that will actually be exec'd,
+/// then require a root-owned regular file that is not writable by group or
+/// other. Anything else is refused fail-closed (GC-DR-14).
+#[cfg(target_os = "linux")]
+fn validate_trusted_bwrap(candidate: &std::path::Path) -> Result<std::path::PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
+    let canonical = std::fs::canonicalize(candidate).with_context(|| {
+        format!(
+            "cannot resolve sandbox binary {} (fail-closed)",
+            candidate.display()
+        )
+    })?;
+    let meta = std::fs::metadata(&canonical)
+        .with_context(|| format!("cannot stat sandbox binary {}", canonical.display()))?;
+    if !meta.file_type().is_file() {
+        bail!(
+            "sandbox binary {} is not a regular file; refusing (fail-closed)",
+            canonical.display()
+        );
+    }
+    if meta.uid() != 0 {
+        bail!(
+            "sandbox binary {} is not owned by root (uid {}); a non-root bwrap could be an \
+             attacker-planted helper that runs the exporter unsandboxed — refusing \
+             (fail-closed, GC-DR-14)",
+            canonical.display(),
+            meta.uid()
+        );
+    }
+    if meta.mode() & 0o022 != 0 {
+        bail!(
+            "sandbox binary {} is writable by group or other (mode {:o}); refusing \
+             (fail-closed)",
+            canonical.display(),
+            meta.mode() & 0o7777
+        );
+    }
+    Ok(canonical)
+}
+
+/// Resolve the OpenCode WAL store to a CANONICAL directory strictly contained
+/// under the approved data root (Codex M3 R2 P1-5). A bare `is_dir()` follows
+/// symlinks, so a planted `…/opencode -> ~/.ssh` would be bound READ-WRITE.
+/// Canonicalizing both the base and the store and requiring containment
+/// rejects that (and `..`-based escapes); on rejection we skip the RW bind and
+/// let the export fail closed rather than expose an arbitrary target.
+#[cfg(target_os = "linux")]
+fn resolve_opencode_store() -> Option<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .filter(|p| p.is_absolute())
+        .or_else(|| {
+            std::env::var_os("HOME")
+                .map(std::path::PathBuf::from)
+                .map(|h| h.join(".local/share"))
+        })?;
+    resolve_opencode_store_under(&base)
+}
+
+/// Containment core (testable without env mutation): canonicalize `base` and
+/// its `opencode` child, then require the resolved store to stay strictly
+/// under the canonical base. Rejects `opencode -> ~/.ssh` and `..`-based
+/// escapes so an out-of-tree target is never bound read-write.
+#[cfg(target_os = "linux")]
+fn resolve_opencode_store_under(base: &std::path::Path) -> Option<std::path::PathBuf> {
+    let base = std::fs::canonicalize(base).ok()?;
+    let store = std::fs::canonicalize(base.join("opencode")).ok()?;
+    if !store.starts_with(&base) {
+        tracing::warn!(
+            store = %store.display(),
+            base = %base.display(),
+            "opencode data dir resolves outside the approved data root; refusing RW bind"
+        );
+        return None;
+    }
+    store.is_dir().then_some(store)
+}
+
 #[cfg(test)]
 mod tests {
     use std::os::unix::fs::PermissionsExt;
@@ -513,6 +608,22 @@ mod tests {
         std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
         path
+    }
+
+    /// Whether an executable named `name` is resolvable on `PATH` (used to skip
+    /// tests that depend on an optional system tool such as `setsid`).
+    fn binary_on_path(name: &str) -> bool {
+        std::env::var_os("PATH")
+            .map(|path| {
+                std::env::split_paths(&path).any(|dir| {
+                    let candidate = dir.join(name);
+                    candidate.is_file()
+                        && std::fs::metadata(&candidate)
+                            .map(|m| m.permissions().mode() & 0o111 != 0)
+                            .unwrap_or(false)
+                })
+            })
+            .unwrap_or(false)
     }
 
     #[tokio::test]
@@ -606,6 +717,81 @@ mod tests {
             "descendant rejection must be prompt, waited {:?}",
             started.elapsed()
         );
+    }
+
+    /// Codex M3 R2 P1-1: a `setsid()`-escaped descendant leaves the child's
+    /// process group (so the group-liveness probe cannot see it), yet the
+    /// over-cap bytes it writes to the inherited stdout are still refused —
+    /// the byte cap is enforced on the bytes, not on group membership. Skips
+    /// when `setsid` is unavailable.
+    #[tokio::test]
+    async fn opencode_export_setsid_escapee_cannot_exceed_cap() {
+        if !binary_on_path("setsid") {
+            eprintln!("skipped (setsid not available)");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        // The escapee runs in its OWN session (setsid) and floods the inherited
+        // stdout far past the cap; the parent lingers so those bytes land, then
+        // exits success. Pre-P1 the group-liveness probe would miss the escapee
+        // and accept the file; the bounded read + recheck now refuses it.
+        let bin = fake_exporter(
+            dir.path(),
+            "setsid sh -c 'head -c 200000 /dev/zero' ; sleep 0.2 ; exit 0",
+        );
+        let err = run_export_subprocess(
+            &bin,
+            "s1",
+            ExportLimits {
+                max_bytes: 1024,
+                deadline: Duration::from_secs(5),
+            },
+        )
+        .await
+        .expect_err("group-escaped over-cap output must be refused");
+        assert!(format!("{err:#}").contains("byte cap"), "got {err:#}");
+    }
+
+    /// Codex M3 R2 P1-4: a non-root (or group/other-writable) "bwrap" must be
+    /// refused — otherwise a planted helper could ignore its arguments and run
+    /// the exporter unsandboxed. Runs the env-free integrity core so it holds
+    /// whether the test user is root or not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn validate_trusted_bwrap_refuses_untrusted_helper() {
+        let dir = tempfile::tempdir().unwrap();
+        let fake = dir.path().join("bwrap");
+        std::fs::write(&fake, "#!/bin/sh\nexec \"$@\"\n").unwrap();
+        // World-writable: fails the mode check even when the owner is root, and
+        // fails the uid check when it is not — either way, refused.
+        std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o777)).unwrap();
+        let err =
+            validate_trusted_bwrap(&fake).expect_err("untrusted sandbox helper must be refused");
+        assert!(format!("{err:#}").contains("refusing"), "got {err:#}");
+    }
+
+    /// Codex M3 R2 P1-5: an `opencode` data dir that is a symlink escaping the
+    /// data root must NOT be resolved for the RW bind; a real contained dir is.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn resolve_opencode_store_refuses_symlink_escape() {
+        use std::os::unix::fs::symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let base = tmp.path().join("share");
+        let secret = tmp.path().join("secret");
+        std::fs::create_dir_all(&base).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        // base/opencode -> ../secret : canonical target escapes the data root.
+        symlink(&secret, base.join("opencode")).unwrap();
+        assert!(
+            resolve_opencode_store_under(&base).is_none(),
+            "symlink escaping the data root must be refused"
+        );
+        // A real contained directory is accepted (canonical, under base).
+        std::fs::remove_file(base.join("opencode")).unwrap();
+        std::fs::create_dir(base.join("opencode")).unwrap();
+        let got = resolve_opencode_store_under(&base).expect("contained store accepted");
+        assert!(got.starts_with(std::fs::canonicalize(&base).unwrap()));
     }
 
     /// Deadline kills a hung exporter; the wait stays bounded.
