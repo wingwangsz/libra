@@ -97,7 +97,7 @@ Claude Code 是第一批必须可安装的 external-agent hook provider。执行
 
 1. **注册与状态输出**
 
-   `claude-code` 行必须暴露：`supported=true`、`support_wave="first_batch"`、`registered=true`、`agent_kind=claude-code`、`db_value=claude_code`、`provider_name=claude`、`stability=stable`、`protected_dirs=[".claude"]`、`transcript_readable=true`、`hook_installable=true`、`installed=<bool>`、`capabilities.hooks=true`。（native transcript 可读性由 `transcript_readable=true` 表达；`capabilities.*` 只覆盖 E1 的 8 个 `DeclaredAgentCaps` bool，无 `native_transcript` 键。）
+   `claude-code` 行必须暴露：`supported=true`、`support_wave="first_batch"`、`registered=true`、`agent_kind=claude-code`、`db_value=claude_code`、`provider_name=claude`、`stability=stable`、`protected_dirs=[".claude"]`、`transcript_readable=true`、`hook_installable=true`、`installed=<bool>`、`capabilities.hooks=true`、`capabilities.transcript_preparer=true`。（native transcript 可读性由 `transcript_readable=true` 表达；`capabilities.*` 只覆盖 E1 的 8 个 `DeclaredAgentCaps` bool，无 `native_transcript` 键。M2 preparer 只在 provider-root 预授权后执行有界 flush-wait。）
 
 2. **启用顺序**
 
