@@ -5,12 +5,14 @@
 //! this module is the ONLY code allowed to read or write it — no command may
 //! `CREATE TABLE` or touch the row directly. v1 migrates **cherry-pick** onto
 //! it (retiring cherry-pick's lazy in-command DDL and the never-read
-//! `revert_sequence` orphan); merge / revert / rebase keep their existing
-//! stores and migrate in scoped follow-ups.
+//! `revert_sequence` orphan); `am` also uses this table through a crate-private
+//! row type so the public `SequenceKind` enum remains source-compatible; merge
+//! / revert / rebase keep their existing stores and migrate in scoped follow-ups.
 //!
 //! Two responsibilities:
 //!
-//! 1. **Storage** — [`load`] / [`save`] / [`clear`] for the migrated consumer.
+//! 1. **Storage** — [`load`] / [`save`] / [`clear`] for the migrated public
+//!    consumer, plus crate-private `am` counterparts.
 //!    `save` is a single `DELETE`+`INSERT` inside one transaction, so a reader
 //!    sees either the full old row or the full new row, never a torn write;
 //!    durability rides SQLite's `synchronous = FULL` (pinned in `db.rs`), the
@@ -105,8 +107,29 @@ pub struct SequenceState {
     pub payload: String,
 }
 
-/// Load the active unified-table sequence, if any (v1: cherry-pick).
-pub async fn load() -> Result<Option<SequenceState>, String> {
+/// Crate-private `am` row. Keeping this separate avoids adding a variant to
+/// the public [`SequenceKind`] enum, which would break downstream exhaustive
+/// matches in a patch release, while still sharing the one-row sequencer table.
+#[derive(Debug, Clone)]
+pub(crate) struct AmSequenceState {
+    pub(crate) head_name: String,
+    pub(crate) head_orig: String,
+    pub(crate) current_oid: String,
+    pub(crate) todo: Vec<String>,
+    pub(crate) payload: String,
+}
+
+#[derive(Debug)]
+struct StoredSequenceState {
+    kind: String,
+    head_name: String,
+    head_orig: String,
+    current_oid: String,
+    todo: Vec<String>,
+    payload: String,
+}
+
+async fn load_stored() -> Result<Option<StoredSequenceState>, String> {
     let db = get_db_conn_instance().await;
     let stmt = Statement::from_string(
         DbBackend::Sqlite,
@@ -125,11 +148,9 @@ pub async fn load() -> Result<Option<SequenceState>, String> {
     let Some(row) = row else {
         return Ok(None);
     };
-    let kind_token: String = row
+    let kind: String = row
         .try_get_by_index(0)
         .map_err(|e| format!("invalid kind: {e}"))?;
-    let kind = SequenceKind::from_token(&kind_token)
-        .ok_or_else(|| format!("unknown sequence kind '{kind_token}'"))?;
     let head_name: String = row
         .try_get_by_index(1)
         .map_err(|e| format!("invalid head_name: {e}"))?;
@@ -151,13 +172,49 @@ pub async fn load() -> Result<Option<SequenceState>, String> {
         .filter(|line| !line.is_empty())
         .map(str::to_string)
         .collect();
-    Ok(Some(SequenceState {
+    Ok(Some(StoredSequenceState {
         kind,
         head_name,
         head_orig,
         current_oid,
         todo,
         payload,
+    }))
+}
+
+/// Load the active unified-table sequence, if any (v1: cherry-pick).
+pub async fn load() -> Result<Option<SequenceState>, String> {
+    let Some(stored) = load_stored().await? else {
+        return Ok(None);
+    };
+    let kind = SequenceKind::from_token(&stored.kind)
+        .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))?;
+    Ok(Some(SequenceState {
+        kind,
+        head_name: stored.head_name,
+        head_orig: stored.head_orig,
+        current_oid: stored.current_oid,
+        todo: stored.todo,
+        payload: stored.payload,
+    }))
+}
+
+pub(crate) async fn load_am() -> Result<Option<AmSequenceState>, String> {
+    let Some(stored) = load_stored().await? else {
+        return Ok(None);
+    };
+    if stored.kind != "am" {
+        if SequenceKind::from_token(&stored.kind).is_none() {
+            return Err(format!("unknown sequence kind '{}'", stored.kind));
+        }
+        return Ok(None);
+    }
+    Ok(Some(AmSequenceState {
+        head_name: stored.head_name,
+        head_orig: stored.head_orig,
+        current_oid: stored.current_oid,
+        todo: stored.todo,
+        payload: stored.payload,
     }))
 }
 
@@ -170,32 +227,102 @@ pub async fn save(state: &SequenceState) -> Result<(), String> {
         .begin()
         .await
         .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
-    txn.execute(Statement::from_string(
+    save_with_conn(&txn, state)
+        .await
+        .map_err(|e| format!("failed to save sequence_state: {e}"))?;
+    txn.commit()
+        .await
+        .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
+    Ok(())
+}
+
+/// Replace the unified sequence row using the caller's transaction. Commands
+/// that move a ref and advance their sequencer position use this to make both
+/// changes commit atomically with the reflog entry.
+pub(crate) async fn save_with_conn<C>(db: &C, state: &SequenceState) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    save_fields(
+        db,
+        state.kind.as_str(),
+        &state.head_name,
+        &state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.payload,
+    )
+    .await
+}
+
+pub(crate) async fn save_am(state: &AmSequenceState) -> Result<(), String> {
+    use sea_orm::TransactionTrait;
+    let db = get_db_conn_instance().await;
+    let txn = db
+        .begin()
+        .await
+        .map_err(|e| format!("failed to begin sequence_state transaction: {e}"))?;
+    save_am_with_conn(&txn, state)
+        .await
+        .map_err(|e| format!("failed to save am sequence_state: {e}"))?;
+    txn.commit()
+        .await
+        .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
+    Ok(())
+}
+
+pub(crate) async fn save_am_with_conn<C>(
+    db: &C,
+    state: &AmSequenceState,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    save_fields(
+        db,
+        "am",
+        &state.head_name,
+        &state.head_orig,
+        &state.current_oid,
+        &state.todo,
+        &state.payload,
+    )
+    .await
+}
+
+async fn save_fields<C>(
+    db: &C,
+    kind: &str,
+    head_name: &str,
+    head_orig: &str,
+    current_oid: &str,
+    todo: &[String],
+    payload: &str,
+) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute(Statement::from_string(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state".to_string(),
     ))
-    .await
-    .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
-    let todo = state.todo.join("\n");
-    txn.execute(Statement::from_sql_and_values(
+    .await?;
+    let todo = todo.join("\n");
+    db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "INSERT INTO sequence_state \
          (id, kind, head_name, head_orig, current_oid, todo, payload) \
          VALUES (1, ?, ?, ?, ?, ?, ?)",
         [
-            state.kind.as_str().into(),
-            state.head_name.clone().into(),
-            state.head_orig.clone().into(),
-            state.current_oid.clone().into(),
+            kind.to_string().into(),
+            head_name.to_string().into(),
+            head_orig.to_string().into(),
+            current_oid.to_string().into(),
             todo.into(),
-            state.payload.clone().into(),
+            payload.to_string().into(),
         ],
     ))
-    .await
-    .map_err(|e| format!("failed to save sequence_state: {e}"))?;
-    txn.commit()
-        .await
-        .map_err(|e| format!("failed to commit sequence_state transaction: {e}"))?;
+    .await?;
     Ok(())
 }
 
@@ -205,13 +332,42 @@ pub async fn save(state: &SequenceState) -> Result<(), String> {
 /// Idempotent.
 pub async fn clear(kind: SequenceKind) -> Result<(), String> {
     let db = get_db_conn_instance().await;
+    clear_with_conn(&db, kind)
+        .await
+        .map_err(|e| format!("failed to clear sequence_state: {e}"))
+}
+
+/// Transaction-scoped counterpart of [`clear`].
+pub(crate) async fn clear_with_conn<C>(db: &C, kind: SequenceKind) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
     db.execute(Statement::from_sql_and_values(
         DbBackend::Sqlite,
         "DELETE FROM sequence_state WHERE kind = ?",
         [kind.as_str().into()],
     ))
-    .await
-    .map_err(|e| format!("failed to clear sequence_state: {e}"))?;
+    .await?;
+    Ok(())
+}
+
+pub(crate) async fn clear_am() -> Result<(), String> {
+    let db = get_db_conn_instance().await;
+    clear_am_with_conn(&db)
+        .await
+        .map_err(|e| format!("failed to clear am sequence_state: {e}"))
+}
+
+pub(crate) async fn clear_am_with_conn<C>(db: &C) -> Result<(), sea_orm::DbErr>
+where
+    C: ConnectionTrait,
+{
+    db.execute(Statement::from_sql_and_values(
+        DbBackend::Sqlite,
+        "DELETE FROM sequence_state WHERE kind = ?",
+        ["am".into()],
+    ))
+    .await?;
     Ok(())
 }
 
@@ -223,10 +379,37 @@ fn is_missing_table(err: &sea_orm::DbErr) -> bool {
     err.to_string().contains("no such table")
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ActiveSequenceKind {
+    Am,
+    Known(SequenceKind),
+}
+
+impl ActiveSequenceKind {
+    fn describe(self) -> (&'static str, &'static str) {
+        match self {
+            ActiveSequenceKind::Am => (
+                "an am operation",
+                "conclude it with 'libra am --continue' or 'libra am --abort'",
+            ),
+            ActiveSequenceKind::Known(kind) => kind.describe(),
+        }
+    }
+}
+
 /// READ-ONLY: does the unified table hold an active row? (No migration, no
 /// write — safe on the mutex hot path and in `libra status`.)
-async fn unified_active() -> Result<Option<SequenceKind>, String> {
-    Ok(load().await?.map(|state| state.kind))
+async fn unified_active() -> Result<Option<ActiveSequenceKind>, String> {
+    let Some(stored) = load_stored().await? else {
+        return Ok(None);
+    };
+    if stored.kind == "am" {
+        return Ok(Some(ActiveSequenceKind::Am));
+    }
+    SequenceKind::from_token(&stored.kind)
+        .map(ActiveSequenceKind::Known)
+        .map(Some)
+        .ok_or_else(|| format!("unknown sequence kind '{}'", stored.kind))
 }
 
 /// READ-ONLY error-aware probe of a legacy `<store>` table for a single row.
@@ -252,7 +435,7 @@ async fn legacy_table_active<C: ConnectionTrait>(db: &C, table: &str) -> Result<
 /// consumer's OLD store: an intervening OLD binary can recreate
 /// `revert-state.json` (or a `cherry_pick_state` row), and the mutex must see
 /// it — otherwise a new sequence could start over an old-binary sequence.
-pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
+pub(crate) async fn detect_active_operation() -> Result<Option<ActiveSequenceKind>, String> {
     // Unified table first (cherry-pick in v1).
     if let Some(kind) = unified_active().await? {
         return Ok(Some(kind));
@@ -260,10 +443,10 @@ pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
     let storage = util::storage_path();
     // Legacy JSON sidecars (merge, revert).
     if storage.join("merge-state.json").exists() {
-        return Ok(Some(SequenceKind::Merge));
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Merge)));
     }
     if storage.join("revert-state.json").exists() {
-        return Ok(Some(SequenceKind::Revert));
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Revert)));
     }
     // Legacy rebase: DB table row or the on-disk rebase-merge dir.
     let db = get_db_conn_instance().await;
@@ -271,14 +454,28 @@ pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
         || storage.join("rebase-merge").exists()
         || storage.join("rebase-apply").exists()
     {
-        return Ok(Some(SequenceKind::Rebase));
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::Rebase)));
     }
     // Compat window: an old binary may have recreated the pre-2.6
     // `cherry_pick_state` table after this binary migrated it away.
     if legacy_table_active(&db, "cherry_pick_state").await? {
-        return Ok(Some(SequenceKind::CherryPick));
+        return Ok(Some(ActiveSequenceKind::Known(SequenceKind::CherryPick)));
     }
     Ok(None)
+}
+
+/// Backward-compatible public facade for the pre-`am` enum surface. An active
+/// `am` cannot be represented by [`SequenceKind`], so callers receive an error
+/// instead of a misleading `None` while crate-internal consumers use
+/// [`detect_active_operation`].
+pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
+    match detect_active_operation().await? {
+        Some(ActiveSequenceKind::Known(kind)) => Ok(Some(kind)),
+        Some(ActiveSequenceKind::Am) => {
+            Err("an am operation is active and is not representable by SequenceKind".to_string())
+        }
+        None => Ok(None),
+    }
 }
 
 /// The symmetric start-time mutex (lore.md 2.6): reject a NEW sequence when any
@@ -286,7 +483,15 @@ pub async fn detect_active() -> Result<Option<SequenceKind>, String> {
 /// continue/abort/skip, so the in-progress op can still be concluded. The
 /// error names the blocking op and how to conclude or abort it.
 pub async fn ensure_none_in_progress(next: SequenceKind) -> CliResult<()> {
-    let active = detect_active().await.map_err(|e| {
+    ensure_none_for(ActiveSequenceKind::Known(next)).await
+}
+
+pub(crate) async fn ensure_none_for_am() -> CliResult<()> {
+    ensure_none_for(ActiveSequenceKind::Am).await
+}
+
+async fn ensure_none_for(next: ActiveSequenceKind) -> CliResult<()> {
+    let active = detect_active_operation().await.map_err(|e| {
         CliError::fatal(format!("failed to check for an in-progress sequence: {e}"))
             .with_stable_code(StableErrorCode::RepoStateInvalid)
     })?;
@@ -324,6 +529,16 @@ mod tests {
         }
     }
 
+    fn sample_am() -> AmSequenceState {
+        AmSequenceState {
+            head_name: "main".to_string(),
+            head_orig: "a".repeat(40),
+            current_oid: "b".repeat(40),
+            todo: vec!["one.patch".to_string(), "two.patch".to_string()],
+            payload: "{\"current\":0}".to_string(),
+        }
+    }
+
     /// Round-trip every SequenceKind through the unified table so the superset
     /// schema is validated for all four consumers (not just the migrated one).
     #[tokio::test]
@@ -355,6 +570,18 @@ mod tests {
             // clear() is idempotent.
             clear(kind).await.expect("idempotent clear");
         }
+
+        let state = sample_am();
+        save_am(&state).await.expect("save am");
+        let loaded = load_am().await.expect("load am").expect("am present");
+        assert_eq!(loaded.head_orig, state.head_orig);
+        assert_eq!(loaded.current_oid, state.current_oid);
+        assert_eq!(loaded.todo, state.todo);
+        assert_eq!(loaded.payload, state.payload);
+        save_am(&state).await.expect("re-save am replaces");
+        clear_am().await.expect("clear am");
+        assert!(load_am().await.expect("load cleared am").is_none());
+        clear_am().await.expect("idempotent clear am");
     }
 
     /// The symmetric mutex blocks a DIFFERENT sequence, allows the same kind
@@ -371,8 +598,8 @@ mod tests {
             .await
             .expect("idle allows start");
 
-        // An active cherry-pick blocks a merge/revert/rebase start but not a
-        // new cherry-pick (its own InProgress check owns that).
+        // An active cherry-pick blocks every other operation, including am,
+        // but not a new cherry-pick (its own InProgress check owns that).
         save(&sample(SequenceKind::CherryPick)).await.expect("save");
         for other in [
             SequenceKind::Merge,
@@ -390,9 +617,41 @@ mod tests {
         ensure_none_in_progress(SequenceKind::CherryPick)
             .await
             .expect("same-op defers to the command's own check");
+        let err = ensure_none_for_am()
+            .await
+            .expect_err("cherry-pick blocks am");
+        assert!(err.to_string().contains("cherry-pick"), "{err}");
         assert_eq!(
             detect_active().await.expect("detect"),
             Some(SequenceKind::CherryPick)
         );
+        clear(SequenceKind::CherryPick).await.expect("clear");
+
+        // The crate-private am kind symmetrically blocks every public
+        // sequencer kind without expanding the public enum.
+        save_am(&sample_am()).await.expect("save am");
+        for other in [
+            SequenceKind::Merge,
+            SequenceKind::Revert,
+            SequenceKind::CherryPick,
+            SequenceKind::Rebase,
+        ] {
+            let err = ensure_none_in_progress(other)
+                .await
+                .expect_err("am blocks cross-op start");
+            assert!(err.to_string().contains("am operation"), "{err}");
+        }
+        ensure_none_for_am()
+            .await
+            .expect("same am defers to the command's own check");
+        assert_eq!(
+            detect_active_operation().await.expect("detect am"),
+            Some(ActiveSequenceKind::Am)
+        );
+        assert!(
+            detect_active().await.is_err(),
+            "public legacy enum must not silently hide active am"
+        );
+        clear_am().await.expect("clear am");
     }
 }

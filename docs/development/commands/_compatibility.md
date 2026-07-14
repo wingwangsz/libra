@@ -50,6 +50,7 @@ flowchart TD
 | pull | partial | partial | fetch + fast-forward/three-way merge supported; `pull.rebase`/`branch.<name>.rebase`/`pull.ff` defaults are config-aware with local/global decryption, system-scope skip, and explicit unsupported diagnostics for interactive/rebase-merges modes; advanced strategy flags still partial |
 | push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |
 | checkout | partial | partial | visible branch compatibility surface including worktree-scoped `checkout -` previous-target toggling shared with `switch -`, `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
+| am | partial | partial | P2-01 exposes ordered plain-text patch files plus continue/skip/abort with bounded internal mail parsing and rollback; public mailinfo, multipart/binary/3-way/hooks and the wider Git option surface remain P2-02/P2-03 follow-ups |
 
 ## 子面兼容分级（CG-01）
 

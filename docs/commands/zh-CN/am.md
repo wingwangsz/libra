@@ -1,0 +1,62 @@
+# `libra am`
+
+把一个或多个纯文本 `format-patch` 邮件文件依次应用为提交。每个提交保留邮件中的 subject/body、author 和 `Date:`；committer 使用当前 Libra 身份。
+
+## 用法
+
+```text
+libra am <patch>...
+libra am --continue
+libra am --skip
+libra am --abort
+```
+
+## 行为
+
+新 series 必须在已有提交的本地分支上启动，并且不能有 staged 或 tracked 工作树改动。无关的 untracked 文件会保留；但只要任一邮件会触及已有的 non-index 路径（包括 ignored 路径），命令就会在保存 sequencer 状态前拒绝。邮件总输入上限为 64 MiB，文件数上限为 10,000。
+
+最小 mail parser 接受 UTF-8、single-part 邮件，以及 `7bit`、`8bit`、`binary`、quoted-printable、base64 transfer encoding。它读取 `From:`、`Date:`、`Subject:`，清理前导 `[PATCH ...]`，支持标准 in-body `From:` 覆盖，并从 `---` 分隔线之后提取文本 `diff --git`。UTF-8/US-ASCII 的 RFC 2047 `B`/`Q` encoded word 会被解码。
+
+每个目标都会拒绝绝对路径、空/`.`/`..` 路径组件、NUL、`.libra/` 和已有 symlink 路径组件。单封邮件中的所有文件会先全部试应用，再进行第一次写入。文件替换使用原子 rename；内容补丁保留已有 permission bits。
+
+工作树写入前会先持久化 sequencer 状态。每个成功提交会在同一个 SQLite transaction 中移动 branch、写 reflog，并推进或清除 `am` 位置。`--continue` / `--skip` 会拒绝 tip 已在 sequencer 之外移动的分支。如果中断发生在状态保存后、当前邮件尚未写入前（包括两次 commit 之间），`--continue` 会重试该邮件。`--abort` 恢复原始 branch tip、index 和 tracked 工作树；如果中断发生在新文件写入后、stage 前，也会清理该新文件目标。
+
+## 冲突恢复
+
+此最小版本不会生成三方 conflict marker。补丁无法应用时，当前 branch tip 不动，并保留可恢复的 series：
+
+1. 手工解决受影响路径；
+2. 用 `libra add` 只 stage 当前补丁包含的路径；
+3. 运行 `libra am --continue`。
+
+`--skip` 丢弃当前补丁并继续下一封邮件；`--abort` 丢弃整个 series 并恢复 `am` 前状态。
+
+## 选项
+
+| 选项 | 含义 |
+|---|---|
+| `--continue` | 提交完整 staged resolution 并继续。当前补丁仍有 unstaged 路径、无关 tracked 改动、unresolved index entry、空 resolution 或无关 staged 路径时会拒绝；pristine recovery state 会重试当前邮件。 |
+| `--skip` | reset 当前补丁并继续剩余邮件。 |
+| `--abort` | 恢复原始 branch tip、index 和 tracked 工作树并清除 sequencer。 |
+| `--json` / `--machine` | 在标准 envelope 中输出 action、已应用邮件的源文件/subject/commit ID，以及可选 restored HEAD。 |
+
+## 示例
+
+```bash
+# 生成并重放 series
+libra format-patch -o outgoing origin/main..HEAD
+libra switch target
+libra am outgoing/0001-*.patch outgoing/0002-*.patch
+
+# 解决停止的补丁
+$EDITOR src/lib.rs
+libra add src/lib.rs
+libra am --continue
+
+# 取消整个 series
+libra am --abort
+```
+
+## 当前限制
+
+这是 P2-01 最小 surface，不是完整 Git `am`。当前不接受 stdin、单个 mbox 内的多封邮件、MIME multipart/attachment、binary patch、仅 rename 或仅 mode 的补丁，也不公开 Git 的完整 flag 集（`-3`/`--3way`、`--signoff`、`--keep`、`--scissors` 等）。内容补丁会保留已有文件权限，但不会应用邮件中的 mode change。不会运行 applypatch/commit hooks。`mailinfo` 尚未作为独立命令公开。

@@ -22,7 +22,8 @@
 | 命令 | 兼容级别 | 当前说明 |
 |---|---|---|
 | [`add`](add.md) | `partial` | sparse-checkout flag unsupported |
-| [`apply`](apply.md) | `partial` | `--check` MVP: validate a unified-diff patch (single/multi-file, new/modify/delete) against the worktree via `diffy`, without writing; `-p<n>`, files or stdin, 64 MiB cap, `--json`; unsafe paths (absolute/`..`/NUL/`.libra/`) rejected; exit 0/1/128. Real apply, `--index`/`--3way`/`--reverse`/binary deferred |
+| [`apply`](apply.md) | `partial` | `--check` MVP: validate a unified-diff patch (single/multi-file, new/modify/delete) against the worktree via `diffy`, without writing; `-p<n>`, files or stdin, 64 MiB cap, `--json`; unsafe paths (absolute/empty/`.`/`..`/NUL/`.libra`/symlink) rejected; exit 0/1/128. Real public apply, `--index`/`--3way`/`--reverse`/binary deferred |
+| [`am`](am.md) | `partial` | P2-01 minimal plain-text mail sequencer: ordered patch files, single-part transfer/RFC 2047 decode, message/author/date preservation, exact text apply, and crash-safe `--continue`/`--skip`/`--abort`; multipart/binary/3-way/hooks/wider flags and public `mailinfo` deferred |
 | [`archive`](archive.md) | `partial` | Creates tar/tar.gz/tar.bz2/zip archives from a committed tree; `--format`, `--output`, `--prefix`, `--list`, `-v`/`--verbose`, `--add-file=<file>`, `--compression-level <0-9>`, `--mtime <time>`, `export-ignore` filtering from Git/Libra attributes, and `TREEISH <path>...` supported |
 | [`agent`](../tracing/agent.md) | `intentionally-different` | Libra external-agent capture extension, not a Git command（开发文档已迁移至 `docs/development/tracing/agent.md`） |
 | [`login`](login.md) | `intentionally-different` | Libra host-scoped HTTP auth extension (session-token login), not a Git command |

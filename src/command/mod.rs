@@ -12,6 +12,7 @@ pub mod account;
 pub mod add;
 pub mod agent;
 pub mod alternates;
+pub mod am;
 pub mod apply;
 pub mod archive;
 pub mod auth;

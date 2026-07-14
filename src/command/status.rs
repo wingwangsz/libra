@@ -484,21 +484,34 @@ struct StatusData {
 }
 
 /// Human advisory for a non-merge sequence in progress (read-only detection).
-async fn sequence_notice() -> Option<String> {
-    use crate::internal::sequencer::{self, SequenceKind};
-    match sequencer::detect_active().await.ok().flatten() {
-        Some(SequenceKind::CherryPick) => Some(
+async fn sequence_notice() -> CliResult<Option<String>> {
+    use crate::internal::sequencer::{self, ActiveSequenceKind, SequenceKind};
+    let active = sequencer::detect_active_operation()
+        .await
+        .map_err(|error| {
+            CliError::fatal(format!(
+                "failed to inspect in-progress operation state: {error}"
+            ))
+            .with_stable_code(StableErrorCode::RepoStateInvalid)
+            .with_hint("repair the repository sequencer state, then retry 'libra status'")
+        })?;
+    Ok(match active {
+        Some(ActiveSequenceKind::Am) => Some(
+            "You are in the middle of an am operation; use 'libra am --continue', '--skip', or '--abort'."
+                .to_string(),
+        ),
+        Some(ActiveSequenceKind::Known(SequenceKind::CherryPick)) => Some(
             "cherry-pick in progress; run 'libra cherry-pick --continue' or '--abort'".to_string(),
         ),
-        Some(SequenceKind::Revert) => {
+        Some(ActiveSequenceKind::Known(SequenceKind::Revert)) => {
             Some("revert in progress; run 'libra revert --continue' or '--abort'".to_string())
         }
-        Some(SequenceKind::Rebase) => {
+        Some(ActiveSequenceKind::Known(SequenceKind::Rebase)) => {
             Some("rebase in progress; run 'libra rebase --continue' or '--abort'".to_string())
         }
         // Merge has its own dedicated rendering below.
-        Some(SequenceKind::Merge) | None => None,
-    }
+        Some(ActiveSequenceKind::Known(SequenceKind::Merge)) | None => None,
+    })
 }
 
 impl StatusData {
@@ -635,7 +648,7 @@ async fn collect_status_data(args: &StatusArgs) -> CliResult<StatusData> {
         stash_count,
         upstream,
         merge_state,
-        sequence_notice: sequence_notice().await,
+        sequence_notice: sequence_notice().await?,
         sparse_view_active: crate::internal::sparse::SparseView::load()
             .await
             .is_active(),
@@ -1360,7 +1373,7 @@ async fn run_status_cache_mode(args: &StatusArgs, output: &OutputConfig) -> CliR
         stash_count,
         upstream,
         merge_state,
-        sequence_notice: sequence_notice().await,
+        sequence_notice: sequence_notice().await?,
         sparse_view_active: crate::internal::sparse::SparseView::load()
             .await
             .is_active(),
@@ -3380,6 +3393,36 @@ mod test {
         assert!(ignored.contains(&PathBuf::from("ignored-dir")));
         assert!(!visible.contains(&PathBuf::from("ignored-dir/nested/file.txt")));
         assert!(!ignored.contains(&PathBuf::from("ignored-dir/nested/file.txt")));
+    }
+
+    #[tokio::test]
+    #[serial]
+    async fn sequence_notice_surfaces_corrupt_sequence_kind() {
+        let repo = tempdir().expect("failed to create temp repo");
+        test::setup_with_new_libra_in(repo.path()).await;
+        let _guard = ChangeDirGuard::new(repo.path());
+        let db_path = repo.path().join(".libra").join("libra.db");
+        let db = get_db_conn_instance().await;
+        db.execute(Statement::from_string(
+            db.get_database_backend(),
+            "INSERT INTO sequence_state \
+             (id, kind, head_name, head_orig, current_oid, todo, payload) \
+             VALUES (1, 'corrupt', 'main', 'a', 'b', '', '{}')",
+        ))
+        .await
+        .expect("insert corrupt sequence row");
+
+        let error = sequence_notice()
+            .await
+            .expect_err("corrupt sequence state must fail closed");
+        assert_eq!(error.stable_code(), StableErrorCode::RepoStateInvalid);
+        assert!(
+            error
+                .to_string()
+                .contains("unknown sequence kind 'corrupt'")
+        );
+
+        reset_db_conn_instance_for_path(&db_path).await;
     }
 
     #[tokio::test]

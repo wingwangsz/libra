@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.83"
+version = "0.18.84"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -324,6 +324,10 @@ path = "tests/compat/checkout_branch_startpoint_test.rs"
 [[test]]
 name = "compat_previous_branch_shortcut"
 path = "tests/compat/previous_branch_shortcut_test.rs"
+
+[[test]]
+name = "compat_mail_am_basic"
+path = "tests/compat/mail_am_basic_test.rs"
 
 [[test]]
 name = "compat_switch_orphan_root"

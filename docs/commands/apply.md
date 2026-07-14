@@ -19,8 +19,9 @@ each file:
 
 1. parses the hunks (a malformed patch is a fatal error);
 2. resolves the target path, stripping `<n>` leading components (`-p<n>`,
-   default 1) and rejecting any path that is absolute, contains `..`, contains a
-   NUL, or points inside `.libra/`;
+   default 1) and rejecting any path that is absolute, contains an empty, `.`,
+   or `..` component or NUL, points inside `.libra/`, or traverses an existing
+   symlink component;
 3. test-applies the hunks to the current file content (an empty base for a
    new-file patch whose source is `/dev/null`).
 

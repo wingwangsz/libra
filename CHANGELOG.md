@@ -4,6 +4,16 @@
 
 ### Added
 
+- **Minimal mail patch sequencer (v0.18.84)**: adds `libra am <patch>...`
+  with `--continue`, `--skip`, and `--abort` for bounded plain-text
+  `format-patch` mail files. The implementation preserves message/author/date,
+  shares the traversal- and symlink-safe text patch engine with `apply
+  --check`, pins branch position across recovery, atomically advances
+  branch/reflog/sequencer state, and cleans pre-stage new-file remnants on
+  abort. English/Chinese user docs and a sixteen-scenario compatibility target
+  cover clean-window crash resume plus rollback and document the intentionally
+  deferred multipart/binary/3-way/hooks surface.
+
 - **Previous checkout target shortcut (v0.18.83)**: adds worktree-scoped
   `libra switch -` and `libra checkout -` toggling across local branches and
   detached commits. Both commands share HEAD reflog history and record their
