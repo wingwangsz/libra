@@ -7,6 +7,7 @@
 
 ```
 libra checkout [<branch>]
+libra checkout -
 libra checkout -b <name> [<start-point>]
 libra checkout -B <name> [<start-point>]
 libra checkout --orphan <name>
@@ -15,7 +16,9 @@ libra checkout [<tree-ish>] -- <pathspec>...
 
 ## 说明
 
-`libra checkout` 是一个 Git 兼容表面，内部委托给 `switch` 和 `restore`。它支持最常见的 `git checkout` 模式：显示当前分支、切换到已有分支、用 `-b` 从 HEAD 或显式 start-point 创建新分支、用 `-B` 从 HEAD 或显式 start-point 强制创建/重置分支、用 `--orphan` 创建 unborn orphan 分支、自动跟踪远程分支，以及在存在显式 `--` 分隔符时恢复路径。
+`libra checkout` 是一个 Git 兼容表面，内部委托给 `switch` 和 `restore`。它支持最常见的 `git checkout` 模式：显示当前分支、切换到已有分支、用 `-` 返回上一个 checkout 目标、用 `-b` 从 HEAD 或显式 start-point 创建新分支、用 `-B` 从 HEAD 或显式 start-point 强制创建/重置分支、用 `--orphan` 创建 unborn orphan 分支、自动跟踪远程分支，以及在存在显式 `--` 分隔符时恢复路径。
+
+`libra checkout -` 与 `switch -` 共享当前 worktree 的 HEAD 导航历史。本地分支来源跟随该分支当前 tip；detached 来源返回 reflog 中保存的完整 commit ID。重复执行会在两个目标间切换；缺少记录、最新来源分支已删除或记录损坏时，会在移动 HEAD 或更改索引/工作树前 fail-closed。
 
 该命令存在的目的是让从 Git 迁移的开发者可以使用熟悉的肌肉记忆。对于新工作流，优先使用 `libra switch`（分支操作）和 `libra restore`（文件操作），它们提供更丰富的错误消息、结构化 JSON 输出和更清晰的语义。
 
@@ -35,7 +38,7 @@ libra checkout [<tree-ish>] -- <pathspec>...
 
 | 标志 | 长选项 | 值 | 说明 |
 |------|------|-------|-------------|
-| | `<branch>` | 位置参数（可选） | 要切换到的目标分支。省略时显示当前分支。 |
+| | `<branch>` | 位置参数（可选） | 要切换到的目标分支，或表示上一 checkout 目标的 `-`。省略时显示当前分支。 |
 | `-b` | | `<name>` | 从 `[<start-point>]` 或当前 HEAD 创建新分支并切换到它 |
 | `-B` | | `<name>` | 从 `[<start-point>]` 或当前 HEAD 强制创建/重置分支并切换到它；已有分支会被重置到该提交 |
 | | `[<start-point>]` | 位置参数 | 与 `-b` / `-B` 搭配使用的可选提交、标签或分支，作为新分支 tip |
@@ -55,6 +58,9 @@ libra checkout
 
 # 切换到已有本地分支
 libra checkout main
+
+# 返回上一个 checkout 目标
+libra checkout -
 
 # 创建并切换到新分支
 libra checkout -b feature-x
@@ -88,6 +94,7 @@ libra checkout HEAD -- link-to-target
 ```bash
 libra checkout                         # 显示当前分支
 libra checkout main                    # 切换到已有本地分支
+libra checkout -                       # 返回上一个 checkout 目标
 libra checkout feature-x               # 切换到其他分支
 libra checkout -b feature-x            # 创建并切换到新分支
 libra checkout -b fix-123 abc1234      # 从 start-point 创建并切换
@@ -258,6 +265,7 @@ Git 肌肉记忆根深蒂固。使用 `git checkout` 多年的开发者会本能
 |---------|-----|-------|----|
 | 显示当前分支 | `git branch --show-current` | `libra checkout`（无参数） | `jj log -r @` |
 | 切换分支 | `git checkout main` | `libra checkout main` | `jj edit <rev>` |
+| 上一个 checkout 目标 | `git checkout -` | `libra checkout -` | N/A |
 | 创建并切换 | `git checkout -b feature` | `libra checkout -b feature` | `jj new` + `jj branch create` |
 | 从提交创建 | `git checkout -b fix abc1234` | `libra checkout -b fix abc1234` | `jj new abc1234` + `jj branch create fix` |
 | 强制创建 / 重置分支 | `git checkout -B feature main` | `libra checkout -B feature main` | N/A |
@@ -279,6 +287,9 @@ Git 肌肉记忆根深蒂固。使用 `git checkout` 多年的开发者会本能
 | 内部分支被阻止 | `LBR-CLI-003` | "checking out '{name}' branch is not allowed" | 128 |
 | 创建内部分支被阻止 | `LBR-CLI-003` | "creating/switching to '{name}' branch is not allowed" | 128 |
 | 找不到分支或 start-point（无远程匹配） | `LBR-CLI-003` | "path specification '{name}' did not match any files known to libra" | 129 |
+| 没有可解析的上一 checkout 目标 | `LBR-CLI-003` | "no previous checkout target is available" | 129 |
+| 读取上一 checkout reflog 失败 | `LBR-IO-001` | "failed to read the current worktree HEAD reflog: ..." | 128 |
+| 上一 checkout 记录损坏或目标 commit 不可读 | `LBR-REPO-002` | "the current worktree HEAD navigation record is invalid: ..." | 128 |
 | Path 模式中 pathspec 不匹配 | `LBR-CLI-003` | "pathspec '{path}' did not match any files" | 128 |
 | `-b` 与 path 模式组合 | `LBR-CLI-002` | "checkout path mode cannot be combined with -b" | 128 |
 | 当前分支（no-op） | N/A | 打印 "Already on {branch}" 并成功 | 0 |

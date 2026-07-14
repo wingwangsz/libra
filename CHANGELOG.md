@@ -4,6 +4,36 @@
 
 ### Added
 
+- **Minimal mail patch sequencer (v0.18.84)**: adds `libra am <patch>...`
+  with `--continue`, `--skip`, and `--abort` for bounded plain-text
+  `format-patch` mail files. The implementation preserves message/author/date,
+  shares the traversal- and symlink-safe text patch engine with `apply
+  --check`, pins branch position across recovery, atomically advances
+  branch/reflog/sequencer state, and cleans pre-stage new-file remnants on
+  abort. English/Chinese user docs and a sixteen-scenario compatibility target
+  cover clean-window crash resume plus rollback and document the intentionally
+  deferred multipart/binary/3-way/hooks surface.
+
+- **Previous checkout target shortcut (v0.18.83)**: adds worktree-scoped
+  `libra switch -` and `libra checkout -` toggling across local branches and
+  detached commits. Both commands share HEAD reflog history and record their
+  own navigation actions; missing history, deleted source branches, corrupt
+  records, and storage failures are rejected before HEAD, index, or worktree
+  mutation. English/Chinese user and developer docs plus a nine-case
+  compatibility target cover same-command, cross-command, detached, JSON, and
+  fail-closed behavior.
+
+- **Import/export fidelity (v0.18.82)**: expands `fast-export` with multiple
+  revisions, incremental ranges, `--all`, annotated tags, notes, and Git path
+  quoting; expands `fast-import` with inline blobs, copy/rename, annotated tags,
+  note records and Git notes-tree translation, reset deletion, bounded parsing,
+  object-type validation, and atomic branch/tag/note publication. `bundle`
+  gains `--all`/`--branches`/`--tags`, full checksum verification, and bounded,
+  hash-kind-aware `unbundle` that imports objects without moving refs. A new
+  compatibility target covers Libra round trips, system-Git interoperability,
+  transactional failures, repeated unbundle, and SHA-256 repositories; English
+  and Chinese command/developer docs describe the supported and deferred edges.
+
 - **Sandboxed repository hooks (v0.18.80)**: adds an Option-A-compatible
   `.libra/hooks` lifecycle for commit, checkout/switch, merge, rebase, and
   pull without executing `.git/hooks`. Hooks run with structured arguments,

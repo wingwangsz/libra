@@ -49,7 +49,8 @@ flowchart TD
 | merge | partial | partial | fast-forward, single-head three-way, `-s ours`, `-X ours/theirs`, unrelated-history opt-in, and CLI/config merge shortlogs supported; octopus and other strategies/options deferred |
 | pull | partial | partial | fetch + fast-forward/three-way merge supported; `pull.rebase`/`branch.<name>.rebase`/`pull.ff` defaults are config-aware with local/global decryption, system-scope skip, and explicit unsupported diagnostics for interactive/rebase-merges modes; advanced strategy flags still partial |
 | push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |
-| checkout | partial | partial | visible branch compatibility surface including `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
+| checkout | partial | partial | visible branch compatibility surface including worktree-scoped `checkout -` previous-target toggling shared with `switch -`, `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
+| am | partial | partial | P2-01 exposes ordered plain-text patch files plus continue/skip/abort with bounded internal mail parsing and rollback; public mailinfo, multipart/binary/3-way/hooks and the wider Git option surface remain P2-02/P2-03 follow-ups |
 
 ## 子面兼容分级（CG-01）
 
@@ -196,7 +197,7 @@ unsupported 子面。
 ### D17：跨网 / foreign-Git / push 侧 `refs/notes/deps` travel
 
 - 状态：延后。lore.md 3.2 v1 只在**本地协议 LibraRepo↔LibraRepo** 之间旅行依赖图：`fetch`/`pull --notes` 从本地 Libra 源经专用旁路（`export_deps_notes` → `deps::import_notes` union-merge）导入 `refs/notes/deps`，默认 OFF（Git parity）。跨网远端（`https://`/`ssh://`/`git://`）、本地 **foreign-Git** 源、以及 **push 侧** notes travel 尚未支持——网络/foreign 远端只发一条诚实的 "not supported yet" 警告并不导入任何图。
-- 原因：Libra 的 note 不是 Git 的 notes-tree-commit（是 loose blob + SQLite `notes` 行，`refs/notes/deps` 非 reference 表真 ref），故无法搭 pack/ref want 集旅行；跨网需要线协议能力（双向 notes-tree ⇄ Libra notes-row 翻译，或 Libra 原生能力协商通道），push 侧还叠加 D2（本地 file remote push 有意拒绝）的原子写/并发语义。这些都需要独立的协议设计与端到端测试。
+- 原因：Libra 的 note 不是 Git 的 notes-tree-commit（是 loose blob + SQLite `notes` 行，`refs/notes/deps` 非 reference 表真 ref），故无法直接搭 pack/ref want 集旅行。P1-11 已在**离线 fast stream** 边界实现双向转换：export 写 `N` records，import 同时接受 `N` 与 Git notes-tree commit，并把 branch/tag/note rows 原子发布；这证明格式转换可行，但不等于网络协商、鉴权或 push 原子性已经存在。跨网仍需线协议能力，push 侧还叠加 D2 的原子写/并发语义。
 - 重启条件：先冻结 notes 线协议（能力协商 + 双向翻译 + 鉴权），补齐跨网/foreign-Git 往返与 push 侧原子写测试，再逐通道开放。
 
 ### D18：依赖过滤克隆的工作树**磁盘**收窄

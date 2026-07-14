@@ -1,0 +1,663 @@
+//! Minimal mail-patch sequencer contracts for plan-20260708 P2-01.
+
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    process::{Command, Output},
+};
+
+use chrono::DateTime;
+use serde_json::Value;
+use tempfile::{TempDir, tempdir};
+
+struct CliFixture {
+    _temp: TempDir,
+    root: PathBuf,
+    home: PathBuf,
+    repo: PathBuf,
+}
+
+impl CliFixture {
+    fn new() -> Self {
+        let temp = tempdir().expect("create tempdir");
+        let root = temp.path().to_path_buf();
+        let home = root.join("home");
+        let repo = root.join("repo");
+        fs::create_dir_all(&home).expect("create isolated home");
+        Self {
+            _temp: temp,
+            root,
+            home,
+            repo,
+        }
+    }
+
+    fn command(&self, cwd: &Path, args: &[&str]) -> Command {
+        let config_home = self.home.join(".config");
+        let global_db = self.home.join(".libra").join("config.db");
+        fs::create_dir_all(&config_home).expect("create isolated config dir");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_libra"));
+        command
+            .args(args)
+            .current_dir(cwd)
+            .env_clear()
+            .env("PATH", "/usr/bin:/bin:/usr/sbin:/sbin")
+            .env("HOME", &self.home)
+            .env("USERPROFILE", &self.home)
+            .env("XDG_CONFIG_HOME", &config_home)
+            .env("LIBRA_CONFIG_GLOBAL_DB", &global_db)
+            .env("LIBRA_TEST", "1")
+            .env("LANG", "C")
+            .env("LC_ALL", "C");
+        if let Some(profile_file) = std::env::var_os("LLVM_PROFILE_FILE") {
+            command.env("LLVM_PROFILE_FILE", profile_file);
+        }
+        command
+    }
+
+    fn run(&self, cwd: &Path, args: &[&str]) -> Output {
+        self.command(cwd, args).output().expect("spawn libra")
+    }
+
+    fn run_env(&self, cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let mut command = self.command(cwd, args);
+        for (key, value) in envs {
+            command.env(key, value);
+        }
+        command.output().expect("spawn libra with env")
+    }
+
+    fn success(&self, cwd: &Path, args: &[&str]) -> Output {
+        let output = self.run(cwd, args);
+        assert_success(args, &output);
+        output
+    }
+
+    fn success_env(&self, cwd: &Path, args: &[&str], envs: &[(&str, &str)]) -> Output {
+        let output = self.run_env(cwd, args, envs);
+        assert_success(args, &output);
+        output
+    }
+
+    fn init_repo(&self) {
+        self.init_repo_with_format(None);
+    }
+
+    fn init_repo_with_format(&self, object_format: Option<&str>) {
+        fs::create_dir_all(&self.repo).expect("create repo dir");
+        let mut args = vec!["init", "--vault", "false"];
+        if let Some(object_format) = object_format {
+            args.extend(["--object-format", object_format]);
+        }
+        args.push(self.repo.to_str().expect("utf8 repo"));
+        self.success(&self.root, &args);
+        self.success(&self.repo, &["config", "set", "user.name", "Am Tester"]);
+        self.success(
+            &self.repo,
+            &["config", "set", "user.email", "am-tester@example.com"],
+        );
+    }
+
+    fn commit_file(&self, path: &str, contents: &str, message: &str) -> String {
+        fs::write(self.repo.join(path), contents).expect("write fixture file");
+        self.success(&self.repo, &["add", path]);
+        self.success(&self.repo, &["commit", "-m", message]);
+        self.rev_parse("HEAD")
+    }
+
+    fn rev_parse(&self, spec: &str) -> String {
+        stdout_trim(&self.success(&self.repo, &["rev-parse", spec]))
+    }
+
+    fn format_series(&self, base: &str) -> Vec<PathBuf> {
+        let out = self.root.join("patches");
+        self.success(
+            &self.repo,
+            &[
+                "format-patch",
+                "-o",
+                out.to_str().expect("utf8 output dir"),
+                &format!("{base}..HEAD"),
+            ],
+        );
+        let mut patches: Vec<PathBuf> = fs::read_dir(out)
+            .expect("read patch dir")
+            .map(|entry| entry.expect("patch entry").path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "patch"))
+            .collect();
+        patches.sort();
+        patches
+    }
+
+    fn am(&self, patches: &[PathBuf]) -> Output {
+        let mut args = vec!["am"];
+        let names: Vec<&str> = patches
+            .iter()
+            .map(|path| path.to_str().expect("utf8 patch path"))
+            .collect();
+        args.extend(names);
+        self.run(&self.repo, &args)
+    }
+}
+
+fn assert_success(args: &[&str], output: &Output) {
+    assert!(
+        output.status.success(),
+        "{} failed\nstdout:\n{}\nstderr:\n{}",
+        args.join(" "),
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn assert_failure(output: &Output, needle: &str) {
+    assert!(!output.status.success(), "command unexpectedly succeeded");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains(needle),
+        "stderr must contain {needle:?}:\n{stderr}"
+    );
+}
+
+fn stdout_trim(output: &Output) -> String {
+    String::from_utf8(output.stdout.clone())
+        .expect("stdout is utf8")
+        .trim()
+        .to_string()
+}
+
+fn setup_single_patch() -> (CliFixture, String, PathBuf) {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("file.txt", "base\n", "base");
+    fs::write(fixture.repo.join("file.txt"), "from mail\n").expect("write mail change");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    fixture.success_env(
+        &fixture.repo,
+        &["commit", "-m", "mail change\n\nMail body."],
+        &[
+            ("GIT_AUTHOR_NAME", "Mail Author"),
+            ("GIT_AUTHOR_EMAIL", "mail-author@example.com"),
+            ("GIT_AUTHOR_DATE", "1700000000 +0530"),
+        ],
+    );
+    let patches = fixture.format_series(&base);
+    assert_eq!(patches.len(), 1);
+    (fixture, base, patches[0].clone())
+}
+
+fn expected_author_line(patch: &Path) -> String {
+    let mail = fs::read_to_string(patch).expect("read patch mail");
+    let from = mail
+        .lines()
+        .find_map(|line| line.strip_prefix("From: "))
+        .expect("From header");
+    let date = mail
+        .lines()
+        .find_map(|line| line.strip_prefix("Date: "))
+        .expect("Date header");
+    let parsed = DateTime::parse_from_rfc2822(date).expect("RFC 2822 Date header");
+    let seconds = parsed.offset().local_minus_utc();
+    let sign = if seconds < 0 { '-' } else { '+' };
+    let absolute = seconds.unsigned_abs();
+    format!(
+        "author {from} {} {sign}{:02}{:02}",
+        parsed.timestamp(),
+        absolute / 3600,
+        (absolute % 3600) / 60
+    )
+}
+
+#[test]
+fn applies_format_patch_and_preserves_message_author_and_date() {
+    let (fixture, base, patch) = setup_single_patch();
+    let expected_author = expected_author_line(&patch);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+
+    let output = fixture.am(&[patch]);
+    assert_success(&["am"], &output);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("read applied file"),
+        "from mail\n"
+    );
+    let raw = String::from_utf8(
+        fixture
+            .success(&fixture.repo, &["cat-file", "-p", "HEAD"])
+            .stdout,
+    )
+    .expect("commit is utf8");
+    assert!(
+        raw.contains(&expected_author),
+        "author metadata was not preserved:\nexpected: {expected_author}\nactual:\n{raw}"
+    );
+    assert!(raw.ends_with("\n\nmail change\n\nMail body.\n"), "{raw}");
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--abort"]),
+        "no am operation",
+    );
+}
+
+#[test]
+fn conflict_then_continue_commits_only_staged_patch_paths() {
+    let (fixture, base, patch) = setup_single_patch();
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    let local = fixture.commit_file("file.txt", "local\n", "local divergence");
+
+    let conflict = fixture.am(&[patch]);
+    assert_failure(&conflict, "patch failed");
+    assert_eq!(fixture.rev_parse("HEAD"), local);
+    let status = fixture.success(&fixture.repo, &["status"]);
+    assert!(String::from_utf8_lossy(&status.stdout).contains("middle of an am operation"));
+
+    fs::write(fixture.repo.join("file.txt"), "resolved\n").expect("write resolution");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    let continued = fixture.success(&fixture.repo, &["am", "--continue"]);
+    assert!(String::from_utf8_lossy(&continued.stdout).contains("Applying: mail change"));
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("read resolution"),
+        "resolved\n"
+    );
+    assert_eq!(fixture.rev_parse("HEAD^"), local);
+}
+
+#[test]
+fn abort_restores_original_tip_index_and_worktree() {
+    let (fixture, base, patch) = setup_single_patch();
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    let local = fixture.commit_file("file.txt", "local\n", "local divergence");
+    let before = stdout_trim(&fixture.success(&fixture.repo, &["status", "--short"]));
+    assert_failure(&fixture.am(&[patch]), "patch failed");
+
+    fs::write(fixture.repo.join("file.txt"), "partial resolution\n")
+        .expect("write partial resolution");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+
+    assert_eq!(fixture.rev_parse("HEAD"), local);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("read restored file"),
+        "local\n"
+    );
+    let status = stdout_trim(&fixture.success(&fixture.repo, &["status", "--short"]));
+    assert_eq!(status, before, "abort did not restore the pre-am status");
+}
+
+#[test]
+fn skip_discards_failed_patch_and_applies_remaining_mail() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("file.txt", "base\n", "base");
+    fixture.commit_file("file.txt", "mail edit\n", "conflicting mail");
+    fixture.commit_file("other.txt", "second\n", "independent mail");
+    let patches = fixture.format_series(&base);
+    assert_eq!(patches.len(), 2);
+
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    let local = fixture.commit_file("file.txt", "local\n", "local divergence");
+    assert_failure(&fixture.am(&patches), "patch failed");
+    fixture.success(&fixture.repo, &["am", "--skip"]);
+
+    assert_eq!(fixture.rev_parse("HEAD^"), local);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("read local file"),
+        "local\n"
+    );
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("other.txt")).expect("read second patch"),
+        "second\n"
+    );
+}
+
+#[test]
+fn dirty_start_and_unexpected_staged_continue_fail_closed() {
+    let (fixture, base, patch) = setup_single_patch();
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    fs::write(fixture.repo.join("file.txt"), "dirty\n").expect("write dirty file");
+    assert_failure(&fixture.am(std::slice::from_ref(&patch)), "cannot start am");
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--abort"]),
+        "no am operation",
+    );
+
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    fixture.commit_file("file.txt", "local\n", "local divergence");
+    fixture.commit_file("tracked.txt", "tracked\n", "add tracked path");
+    assert_failure(&fixture.am(&[patch]), "patch failed");
+    fs::write(fixture.repo.join("file.txt"), "resolved\n").expect("write resolution");
+    fs::write(
+        fixture.repo.join("tracked.txt"),
+        "unrelated tracked change\n",
+    )
+    .expect("write unrelated tracked change");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--continue"]),
+        "outside the current am patch has unstaged changes",
+    );
+    fixture.success(&fixture.repo, &["restore", "tracked.txt"]);
+    fs::write(fixture.repo.join("unrelated.txt"), "do not commit\n").expect("write unrelated");
+    fixture.success(&fixture.repo, &["add", "file.txt", "unrelated.txt"]);
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--continue"]),
+        "outside the current am patch",
+    );
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+}
+
+#[test]
+fn same_branch_head_movement_blocks_resume_but_not_abort() {
+    let (fixture, base, patch) = setup_single_patch();
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    let original = fixture.commit_file("file.txt", "local\n", "local divergence");
+    assert_failure(&fixture.am(&[patch]), "patch failed");
+
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    fs::write(fixture.repo.join("file.txt"), "resolved\n").expect("write resolution");
+    fixture.success(&fixture.repo, &["add", "file.txt"]);
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--continue"]),
+        "moved during am",
+    );
+
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+    assert_eq!(fixture.rev_parse("HEAD"), original);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("read restored file"),
+        "local\n"
+    );
+}
+
+#[test]
+fn abort_cleans_new_file_left_by_interruption_before_staging() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("base.txt", "base\n", "base");
+    fs::create_dir_all(fixture.repo.join("nested")).expect("create nested dir");
+    fixture.commit_file("nested/new.txt", "new\n", "add nested file");
+    let patches = fixture.format_series(&base);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    let before = stdout_trim(&fixture.success(&fixture.repo, &["status", "--short"]));
+
+    let interrupted = fixture.run_env(
+        &fixture.repo,
+        &["am", patches[0].to_str().expect("utf8 patch")],
+        &[("LIBRA_TEST_AM_FAIL_AFTER_WRITE", "1")],
+    );
+    assert_failure(&interrupted, "test-injected am interruption");
+    assert!(fixture.repo.join("nested/new.txt").is_file());
+
+    fixture.success(&fixture.repo, &["am", "--abort"]);
+    assert!(!fixture.repo.join("nested/new.txt").exists());
+    assert!(!fixture.repo.join("nested").exists());
+    assert_eq!(
+        stdout_trim(&fixture.success(&fixture.repo, &["status", "--short"])),
+        before
+    );
+}
+
+#[test]
+fn continue_retries_mail_after_interruption_following_state_save() {
+    let (fixture, base, patch) = setup_single_patch();
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+
+    let interrupted = fixture.run_env(
+        &fixture.repo,
+        &["am", patch.to_str().expect("utf8 patch")],
+        &[("LIBRA_TEST_AM_FAIL_AFTER_STATE", "1")],
+    );
+    assert_failure(&interrupted, "interruption after saving initial state");
+    assert_eq!(fixture.rev_parse("HEAD"), base);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("read untouched file"),
+        "base\n"
+    );
+
+    fixture.success(&fixture.repo, &["am", "--continue"]);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("file.txt")).expect("read resumed file"),
+        "from mail\n"
+    );
+    assert_eq!(fixture.rev_parse("HEAD^"), base);
+}
+
+#[test]
+fn continue_applies_next_mail_after_interruption_between_commits() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("first.txt", "base\n", "base");
+    fixture.commit_file("first.txt", "first mail\n", "first mail");
+    fixture.commit_file("second.txt", "second mail\n", "second mail");
+    let patches = fixture.format_series(&base);
+    assert_eq!(patches.len(), 2);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    let patch_names: Vec<&str> = patches
+        .iter()
+        .map(|patch| patch.to_str().expect("utf8 patch"))
+        .collect();
+    let mut args = vec!["am"];
+    args.extend(patch_names);
+
+    let interrupted = fixture.run_env(
+        &fixture.repo,
+        &args,
+        &[("LIBRA_TEST_AM_FAIL_AFTER_COMMIT", "1")],
+    );
+    assert_failure(&interrupted, "interruption between commits");
+    assert_eq!(fixture.rev_parse("HEAD^"), base);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("first.txt")).expect("read first result"),
+        "first mail\n"
+    );
+    assert!(!fixture.repo.join("second.txt").exists());
+
+    fixture.success(&fixture.repo, &["am", "--continue"]);
+    assert_eq!(fixture.rev_parse("HEAD^^"), base);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("second.txt")).expect("read second result"),
+        "second mail\n"
+    );
+}
+
+#[test]
+fn untracked_patch_target_is_rejected_before_state_is_saved() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("base.txt", "base\n", "base");
+    fixture.commit_file("new.txt", "from mail\n", "add file");
+    let patches = fixture.format_series(&base);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+    fs::write(fixture.repo.join("new.txt"), "untracked user data\n")
+        .expect("write untracked collision");
+
+    assert_failure(&fixture.am(&patches), "would be overwritten by am");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("new.txt")).expect("read untracked data"),
+        "untracked user data\n"
+    );
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--abort"]),
+        "no am operation",
+    );
+}
+
+#[test]
+fn ignored_untracked_patch_target_is_rejected_before_state_is_saved() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file(".libraignore", "ignored.txt\n", "ignore target");
+    fs::write(fixture.repo.join("ignored.txt"), "ignored user data\n")
+        .expect("write ignored user data");
+    assert!(
+        stdout_trim(&fixture.success(&fixture.repo, &["status", "--short"])).is_empty(),
+        "fixture target must be hidden by ignore rules"
+    );
+    let patch = fixture.root.join("ignored.patch");
+    fs::write(
+        &patch,
+        "From: Mail Author <mail-author@example.com>\n\
+Date: Tue, 14 Jul 2026 10:00:00 +0800\n\
+Subject: [PATCH] overwrite ignored target\n\
+Content-Type: text/plain; charset=UTF-8\n\
+\n\
+---\n\
+diff --git a/ignored.txt b/ignored.txt\n\
+--- a/ignored.txt\n\
++++ b/ignored.txt\n\
+@@ -1 +1 @@\n\
+-ignored user data\n\
++mail data\n",
+    )
+    .expect("write ignored-target mail");
+
+    assert_failure(&fixture.am(&[patch]), "would be overwritten by am");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("ignored.txt")).expect("read ignored user data"),
+        "ignored user data\n"
+    );
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--abort"]),
+        "no am operation",
+    );
+}
+
+#[test]
+fn noncanonical_patch_path_cannot_alias_untracked_user_data() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.commit_file("base.txt", "base\n", "base");
+    fs::create_dir_all(fixture.repo.join("dir")).expect("create untracked dir");
+    fs::write(fixture.repo.join("dir/file.txt"), "user data\n").expect("write untracked user data");
+    let patch = fixture.repo.join("alias.patch");
+    fs::write(
+        &patch,
+        "From: Mail Author <mail-author@example.com>\n\
+Date: Tue, 14 Jul 2026 10:00:00 +0800\n\
+Subject: [PATCH] overwrite alias\n\
+Content-Type: text/plain; charset=UTF-8\n\
+\n\
+---\n\
+diff --git a/dir//file.txt b/dir//file.txt\n\
+--- a/dir//file.txt\n\
++++ b/dir//file.txt\n\
+@@ -1 +1 @@\n\
+-user data\n\
++mail data\n",
+    )
+    .expect("write alias mail");
+
+    assert_failure(&fixture.am(&[patch]), "non-canonical");
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("dir/file.txt")).expect("read preserved data"),
+        "user data\n"
+    );
+    assert_failure(
+        &fixture.run(&fixture.repo, &["am", "--abort"]),
+        "no am operation",
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn content_patch_preserves_executable_permission() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fs::write(fixture.repo.join("script.sh"), "#!/bin/sh\necho base\n").expect("write script");
+    fs::set_permissions(
+        fixture.repo.join("script.sh"),
+        fs::Permissions::from_mode(0o755),
+    )
+    .expect("make executable");
+    fixture.success(&fixture.repo, &["add", "script.sh"]);
+    fixture.success(&fixture.repo, &["commit", "-m", "base script"]);
+    let base = fixture.rev_parse("HEAD");
+    fixture.commit_file("script.sh", "#!/bin/sh\necho mail\n", "edit script");
+    let patches = fixture.format_series(&base);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+
+    let applied = fixture.am(&patches);
+    assert_success(&["am"], &applied);
+    let mode = fs::metadata(fixture.repo.join("script.sh"))
+        .expect("script metadata")
+        .permissions()
+        .mode();
+    assert_ne!(mode & 0o111, 0, "am cleared the executable bits");
+}
+
+#[test]
+fn one_mail_can_add_and_delete_paths() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    let base = fixture.commit_file("old file.txt", "remove me\n", "base");
+    fs::remove_file(fixture.repo.join("old file.txt")).expect("remove tracked file");
+    fs::write(fixture.repo.join("new file.txt"), "new file\n").expect("write new file");
+    fixture.success(&fixture.repo, &["add", "--all"]);
+    fixture.success(&fixture.repo, &["commit", "-m", "replace file"]);
+    let patches = fixture.format_series(&base);
+    assert_eq!(patches.len(), 1);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+
+    assert_success(&["am"], &fixture.am(&patches));
+    assert!(!fixture.repo.join("old file.txt").exists());
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("new file.txt")).expect("read new path"),
+        "new file\n"
+    );
+    assert!(
+        stdout_trim(&fixture.success(&fixture.repo, &["status", "--short"])).is_empty(),
+        "am left the index or worktree dirty"
+    );
+}
+
+#[test]
+fn mail_replay_is_hash_kind_neutral_in_sha256_repo() {
+    let fixture = CliFixture::new();
+    fixture.init_repo_with_format(Some("sha256"));
+    let base = fixture.commit_file("wide.txt", "base\n", "base");
+    fixture.commit_file("wide.txt", "from sha256 mail\n", "wide mail");
+    let patches = fixture.format_series(&base);
+    fixture.success(&fixture.repo, &["reset", "--hard", &base]);
+
+    assert_success(&["am"], &fixture.am(&patches));
+    assert_eq!(fixture.rev_parse("HEAD").len(), 64);
+    assert_eq!(
+        fs::read_to_string(fixture.repo.join("wide.txt")).expect("read sha256 result"),
+        "from sha256 mail\n"
+    );
+}
+
+#[test]
+fn json_output_and_help_expose_the_minimal_surface() {
+    let fixture = CliFixture::new();
+    let help = fixture.success(&fixture.root, &["am", "--help"]);
+    let help = String::from_utf8_lossy(&help.stdout);
+    for expected in ["--continue", "--skip", "--abort", "EXAMPLES:"] {
+        assert!(
+            help.contains(expected),
+            "missing {expected} in help:\n{help}"
+        );
+    }
+
+    fixture.init_repo();
+    let no_state = fixture.run(&fixture.repo, &["--json", "am", "--continue"]);
+    assert!(!no_state.status.success());
+    let error: Value = serde_json::from_slice(&no_state.stderr).expect("JSON error");
+    assert_eq!(error["error_code"], "LBR-CONFLICT-002");
+
+    let (applied_fixture, base, patch) = setup_single_patch();
+    applied_fixture.success(&applied_fixture.repo, &["reset", "--hard", &base]);
+    let applied = applied_fixture.success(
+        &applied_fixture.repo,
+        &["--json", "am", patch.to_str().expect("utf8 patch")],
+    );
+    let response: Value = serde_json::from_slice(&applied.stdout).expect("JSON success");
+    assert_eq!(response["ok"], true);
+    assert_eq!(response["command"], "am");
+    assert_eq!(response["data"]["action"], "apply");
+    assert_eq!(response["data"]["applied"][0]["subject"], "mail change");
+    assert_eq!(
+        response["data"]["applied"][0]["commit"],
+        applied_fixture.rev_parse("HEAD")
+    );
+}

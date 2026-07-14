@@ -127,6 +127,22 @@ fn apply_security_rejects_path_traversal() {
 }
 
 #[test]
+fn apply_security_rejects_noncanonical_alias_components() {
+    let repo = init_repo();
+    for (name, target) in [("double.diff", "b/dir//file"), ("dot.diff", "b/dir/./file")] {
+        let patch = format!("--- /dev/null\n+++ {target}\n@@ -0,0 +1 @@\n+x\n");
+        fs::write(repo.path().join(name), patch).unwrap();
+        let out = run_libra_command(&["apply", "--check", name], repo.path());
+        assert_eq!(
+            out.status.code(),
+            Some(128),
+            "{target} must not alias a canonical worktree path: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn apply_security_rejects_libra_internal_path() {
     let repo = init_repo();
     let patch = "--- /dev/null\n+++ b/.libra/evil\n@@ -0,0 +1,1 @@\n+x\n";
@@ -151,6 +167,31 @@ fn apply_security_rejects_absolute_path_after_strip() {
         Some(128),
         "an absolute patch path must be rejected before stripping: {}",
         String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn apply_security_rejects_symlink_path_components() {
+    use std::os::unix::fs::symlink;
+
+    let repo = init_repo();
+    let outside = tempdir().unwrap();
+    fs::write(outside.path().join("victim.txt"), "old\n").unwrap();
+    symlink(outside.path(), repo.path().join("link")).unwrap();
+    let patch = "--- a/link/victim.txt\n+++ b/link/victim.txt\n@@ -1 +1 @@\n-old\n+new\n";
+    fs::write(repo.path().join("p.diff"), patch).unwrap();
+
+    let out = run_libra_command(&["apply", "--check", "p.diff"], repo.path());
+    assert_eq!(out.status.code(), Some(128));
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("symlink patch path"),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert_eq!(
+        fs::read_to_string(outside.path().join("victim.txt")).unwrap(),
+        "old\n"
     );
 }
 

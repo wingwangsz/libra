@@ -60,6 +60,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "stash",
     "lfs",
     "worktree",
+    "am",
     "log",
     "shortlog",
     "show",
