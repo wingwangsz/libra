@@ -1159,7 +1159,7 @@ async fn write_committed_checkpoint(
                             error = %format!("{err:#}"),
                             "opencode export bridge unavailable; metadata-only capture"
                         );
-                        let _ = export_job::release(
+                        if let Err(release_err) = export_job::release(
                             conn,
                             "opencode",
                             &envelope.session_id,
@@ -1169,7 +1169,14 @@ async fn write_committed_checkpoint(
                             Some("LBR-AGENT-005"),
                             Utc::now().timestamp_millis(),
                         )
-                        .await;
+                        .await
+                        {
+                            tracing::warn!(
+                                error = %format!("{release_err:#}"),
+                                session_id = %libra_session_id,
+                                "failed to release unsuccessful opencode export job"
+                            );
+                        }
                     }
                     Ok(bytes) => {
                         // Digest-bound authorization tag (ADR-DR-02): minted
@@ -1192,7 +1199,7 @@ async fn write_committed_checkpoint(
                             Err(err) => {
                                 // Fail-closed: no ungated append; job released
                                 // dirty so the next idle retries.
-                                let _ = export_job::release(
+                                if let Err(release_err) = export_job::release(
                                     conn,
                                     "opencode",
                                     &envelope.session_id,
@@ -1202,7 +1209,14 @@ async fn write_committed_checkpoint(
                                     None,
                                     Utc::now().timestamp_millis(),
                                 )
-                                .await;
+                                .await
+                                {
+                                    tracing::warn!(
+                                        error = %format!("{release_err:#}"),
+                                        session_id = %libra_session_id,
+                                        "failed to release opencode export job after coverage error"
+                                    );
+                                }
                                 return Err(err.context(
                                     "coverage gate reservation failed; export capture aborted \
                                      (fail-closed)",
@@ -1218,7 +1232,7 @@ async fn write_committed_checkpoint(
                                 "opencode export: every turn already covered; no append"
                             );
                             let done_ms = Utc::now().timestamp_millis();
-                            let _ = export_job::advance_processed(
+                            if let Err(job_err) = export_job::advance_and_release(
                                 conn,
                                 "opencode",
                                 &envelope.session_id,
@@ -1227,18 +1241,14 @@ async fn write_committed_checkpoint(
                                 target_generation,
                                 done_ms,
                             )
-                            .await;
-                            let _ = export_job::release(
-                                conn,
-                                "opencode",
-                                &envelope.session_id,
-                                &owner,
-                                fence_token,
-                                "idle",
-                                None,
-                                done_ms,
-                            )
-                            .await;
+                            .await
+                            {
+                                tracing::warn!(
+                                    error = %format!("{job_err:#}"),
+                                    session_id = %libra_session_id,
+                                    "failed to settle no-op opencode export job"
+                                );
+                            }
                             return Ok(());
                         }
                         // Whole-blob baseline for the checkpoint: the export
@@ -1495,9 +1505,8 @@ async fn write_committed_checkpoint(
     // the run (the next idle picks them up; no unbounded loop on the hook
     // path), `idle` when clean; a fenced-out runner touches nothing.
     if let Some((owner, fence_token, target_generation)) = export_release {
-        use crate::internal::ai::export_job::{self, AdvanceOutcome};
         let done_ms = Utc::now().timestamp_millis();
-        let advance = export_job::advance_processed(
+        if let Err(job_err) = crate::internal::ai::export_job::advance_and_release(
             conn,
             "opencode",
             &envelope.session_id,
@@ -1506,31 +1515,13 @@ async fn write_committed_checkpoint(
             target_generation,
             done_ms,
         )
-        .await;
-        let terminal = match advance {
-            Ok(AdvanceOutcome::Clean) => Some("idle"),
-            Ok(AdvanceOutcome::MoreWork { .. }) => Some("dirty"),
-            Ok(AdvanceOutcome::FencedOut) => None,
-            Err(err) => {
-                tracing::warn!(
-                    error = %format!("{err:#}"),
-                    "failed to advance opencode export generation"
-                );
-                Some("dirty")
-            }
-        };
-        if let Some(state) = terminal {
-            let _ = export_job::release(
-                conn,
-                "opencode",
-                &envelope.session_id,
-                &owner,
-                fence_token,
-                state,
-                None,
-                done_ms,
-            )
-            .await;
+        .await
+        {
+            tracing::warn!(
+                error = %format!("{job_err:#}"),
+                session_id = %libra_session_id,
+                "failed to settle completed opencode export job"
+            );
         }
     }
 
