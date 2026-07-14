@@ -3,7 +3,10 @@
 use std::str::FromStr;
 
 use clap::Parser;
-use git_internal::{hash::ObjectHash, internal::object::commit::Commit};
+use git_internal::{
+    hash::{ObjectHash, get_hash_kind},
+    internal::object::commit::Commit,
+};
 use serde::Serialize;
 
 use crate::{
@@ -16,11 +19,11 @@ use crate::{
     internal::{
         branch::{Branch, BranchStoreError, is_ai_managed_branch},
         head::Head,
+        repo_hooks::{RepoHook, run_advisory_repo_hook},
     },
     utils::{
         error::{CliError, CliResult, StableErrorCode},
         output::{OutputConfig, emit_json_data},
-        util,
         util::get_commit_base,
     },
 };
@@ -36,6 +39,7 @@ NOTE:
 EXAMPLES:
     libra checkout                         Show the current branch
     libra checkout main                    Switch to a branch (prefer: libra switch main)
+    libra checkout -                       Return to the previous checkout target
     libra checkout feature-x               Switch to another branch (prefer: libra switch feature-x)
     libra checkout -b feature-x            Create + switch to a new branch (prefer: libra switch -c feature-x)
     libra checkout --orphan fresh-start    Create an unborn orphan branch (prefer: libra switch --orphan fresh-start)
@@ -49,7 +53,7 @@ EXAMPLES:
 #[derive(Parser, Debug)]
 #[command(after_help = CHECKOUT_EXAMPLES)]
 pub struct CheckoutArgs {
-    /// Target branch, commit, or tag to check out (prefer `libra switch` for branches)
+    /// Target branch, commit, or tag; use `-` for the previous checkout target
     branch: Option<String>,
 
     /// Create and switch to a new branch with the same content as the current branch
@@ -293,15 +297,54 @@ pub async fn execute(args: CheckoutArgs) {
 /// writes fail.
 pub async fn execute_safe(args: CheckoutArgs, output: &OutputConfig) -> CliResult<()> {
     let result = run_checkout(args, output).await.map_err(CliError::from)?;
+    if !matches!(result.action.as_str(), "show-current" | "already-on") {
+        let zero = ObjectHash::zero_str(get_hash_kind()).to_string();
+        let old = result
+            .previous_commit
+            .clone()
+            .unwrap_or_else(|| zero.clone());
+        let new = result.commit.clone().unwrap_or(zero);
+        let branch_checkout = if result.action == "restore-paths" {
+            "0"
+        } else {
+            "1"
+        };
+        run_advisory_repo_hook(
+            RepoHook::PostCheckout,
+            &[old, new, branch_checkout.to_string()],
+            None,
+            output,
+        )
+        .await;
+    }
     render_checkout_output(&result, output)
 }
 
 async fn run_checkout(
-    args: CheckoutArgs,
+    mut args: CheckoutArgs,
     output: &OutputConfig,
 ) -> Result<CheckoutOutput, CheckoutError> {
     if !args.pathspec.is_empty() {
         return restore_checkout_paths(args).await;
+    }
+
+    if args.branch.as_deref() == Some("-")
+        && args.new_branch.is_none()
+        && args.force_new_branch.is_none()
+        && args.orphan_branch.is_none()
+    {
+        match switch::resolve_previous_checkout_target()
+            .await
+            .map_err(map_switch_error)?
+        {
+            switch::PreviousCheckoutTarget::Branch { name, .. } => {
+                args.branch = Some(name);
+            }
+            switch::PreviousCheckoutTarget::Detached { commit } => {
+                args.branch = Some(commit.to_string());
+                args.detach = true;
+            }
+        }
     }
 
     if let Some(ref branch_name) = args.branch
@@ -331,7 +374,7 @@ async fn run_checkout(
         ));
     }
 
-    let previous_branch = get_current_branch().await;
+    let previous_branch = current_branch_result().await?;
     let previous_commit = current_commit_string().await?;
 
     // Match Git behavior: checking out the current branch is a no-op and should
@@ -375,6 +418,7 @@ async fn run_checkout(
             orphan_branch.clone(),
             previous_branch,
             previous_commit,
+            switch::NavigationCommand::Checkout,
             output,
         )
         .await
@@ -436,8 +480,7 @@ async fn run_checkout(
         };
         map_switch_preflight(clean_status)?;
 
-        let previous = get_current_branch().await;
-        if let Some(prev) = previous.as_deref()
+        if let Some(prev) = previous_branch.as_deref()
             && prev == new_branch
         {
             return Err(CheckoutError::CreatingBranchBlocked(new_branch));
@@ -556,7 +599,7 @@ async fn restore_checkout_paths(args: CheckoutArgs) -> Result<CheckoutOutput, Ch
         return Err(CheckoutError::InvalidPathMode("--orphan".to_string()));
     }
 
-    let previous_branch = get_current_branch().await;
+    let previous_branch = current_branch_result().await?;
     let previous_commit = current_commit_string().await?;
     let source = args.branch;
     let restore_args = RestoreArgs {
@@ -624,9 +667,22 @@ fn map_switch_error(err: switch::SwitchError) -> CheckoutError {
 }
 
 pub async fn get_current_branch() -> Option<String> {
-    match Head::current().await {
-        Head::Detached(_) => None,
-        Head::Branch(name) => Some(name),
+    match current_branch_result().await {
+        Ok(branch) => branch,
+        Err(error) => {
+            tracing::error!("failed to resolve current checkout branch: {error}");
+            None
+        }
+    }
+}
+
+async fn current_branch_result() -> Result<Option<String>, CheckoutError> {
+    match Head::current_result()
+        .await
+        .map_err(|error| map_checkout_branch_store_error("resolve HEAD", error))?
+    {
+        Head::Detached(_) => Ok(None),
+        Head::Branch(name) => Ok(Some(name)),
     }
 }
 
@@ -675,12 +731,14 @@ async fn switch_branch_with_output(
         .map_err(|error| map_checkout_branch_store_error("resolve branch", error))?
         .ok_or_else(|| CheckoutError::BranchNotFound(branch_name.to_string()))?;
     let target_commit = target_branch.commit;
-    restore_to_commit(target_branch.commit, output)
-        .await
-        .map_err(CheckoutError::DelegatedCli)?;
-    let head = Head::Branch(branch_name.to_string());
-    Head::update(head, None).await;
-    Ok(target_commit)
+    switch::checkout_to_branch(
+        branch_name.to_string(),
+        target_commit,
+        output,
+        ignore_other_worktrees,
+    )
+    .await
+    .map_err(map_switch_error)
 }
 
 async fn create_and_switch_new_branch(
@@ -805,7 +863,7 @@ async fn check_branch_with_output(
     branch_name: &str,
     output: &OutputConfig,
 ) -> Result<Option<bool>, CheckoutError> {
-    if get_current_branch().await == Some(branch_name.to_string()) {
+    if current_branch_result().await? == Some(branch_name.to_string()) {
         info_println!(output, "Already on {branch_name}");
         return Ok(None);
     }
@@ -904,30 +962,6 @@ async fn check_and_switch_branch(
     }
 }
 
-async fn restore_to_commit(commit_id: ObjectHash, output: &OutputConfig) -> CliResult<()> {
-    // Case-collision preflight (lore.md 1.14) — checkout has its own copy of
-    // this restore path, so it gets its own guard (the review's must-fix:
-    // guarding only switch would leave `libra checkout <branch>` unprotected).
-    crate::command::switch::guard_target_tree_case(&commit_id).await?;
-    let restore_args = RestoreArgs {
-        overlay: false,
-        no_overlay: false,
-        ours: false,
-        theirs: false,
-        ignore_unmerged: false,
-        merge: false,
-        conflict: None,
-        worktree: true,
-        staged: true,
-        source: Some(commit_id.to_string()),
-        pathspec: vec![util::working_dir_string()],
-        pathspec_from_file: None,
-        pathspec_file_nul: false,
-        no_progress: false,
-    };
-    restore::execute_safe(restore_args, &output.child_output_config()).await
-}
-
 async fn checkout_detached(
     _target: String,
     commit_id: ObjectHash,
@@ -935,27 +969,9 @@ async fn checkout_detached(
     previous_commit: Option<String>,
     output: &OutputConfig,
 ) -> Result<CheckoutOutput, CheckoutError> {
-    switch::ensure_clean_status_for_commit(commit_id, output)
+    switch::checkout_to_commit(commit_id, output)
         .await
-        .map_err(|err| match err {
-            switch::SwitchError::DirtyUnstaged => CheckoutError::DirtyUnstaged,
-            switch::SwitchError::DirtyUncommitted => CheckoutError::DirtyUncommitted,
-            switch::SwitchError::UntrackedOverwrite(path) => {
-                CheckoutError::UntrackedOverwrite(path)
-            }
-            other => CheckoutError::DelegatedCli(CliError::from(other)),
-        })?;
-
-    // Case-collision preflight BEFORE the HEAD update — refusing after it
-    // would strand a detached HEAD with an unrestored tree.
-    crate::command::switch::guard_target_tree_case(&commit_id)
-        .await
-        .map_err(CheckoutError::DelegatedCli)?;
-    let head = Head::Detached(commit_id);
-    Head::update(head, None).await;
-    restore_to_commit(commit_id, output)
-        .await
-        .map_err(CheckoutError::DelegatedCli)?;
+        .map_err(map_switch_error)?;
 
     Ok(CheckoutOutput {
         action: "detach".to_string(),
@@ -978,13 +994,19 @@ async fn show_current_branch(
     current_branch: Option<String>,
     current_commit: Option<String>,
 ) -> Result<CheckoutOutput, CheckoutError> {
-    match Head::current().await {
-        Head::Detached(commit_hash) => {
-            let commit = commit_hash.to_string();
+    match current_branch {
+        None => {
+            let commit =
+                current_commit
+                    .clone()
+                    .ok_or_else(|| CheckoutError::BranchStoreCorrupt {
+                        context: "resolve detached HEAD".to_string(),
+                        detail: "HEAD does not point to a commit".to_string(),
+                    })?;
             Ok(CheckoutOutput {
                 action: "show-current".to_string(),
-                previous_branch: current_branch,
-                previous_commit: current_commit,
+                previous_branch: None,
+                previous_commit: Some(commit.clone()),
                 branch: None,
                 commit: Some(commit.clone()),
                 short_commit: Some(short_oid(&commit)),
@@ -997,7 +1019,7 @@ async fn show_current_branch(
                 restore: None,
             })
         }
-        Head::Branch(current_branch) => Ok(CheckoutOutput {
+        Some(current_branch) => Ok(CheckoutOutput {
             action: "show-current".to_string(),
             previous_branch: Some(current_branch.clone()),
             previous_commit: current_commit.clone(),

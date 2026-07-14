@@ -13,15 +13,20 @@ libra diff --old <commit> --new <commit> [<pathspec>...]
 libra diff [--raw | --name-only | --name-status | --numstat | --stat | --shortstat | --summary]
            [-s | --no-patch] [--exit-code] [--check] [-R] [-z]
 libra diff [--compact-summary] [--diff-filter=<FILTER>] [--full-index]
+           [-S <STRING> | -G <REGEX>]
            [--src-prefix=<PREFIX> --dst-prefix=<PREFIX>]
-           [--algorithm <name>] [--output <file>]
+           [--word-diff[=<MODE>]] [--word-diff-regex=<REGEX>]
+           [--color-words[=<REGEX>]]
+           [--algorithm <name>] [--minimal | --patience | --histogram]
+           [--anchored=<text>...]
+           [--output <file>]
 ```
 
 ## Description
 
 `libra diff` shows changes between different states of the repository. By default it compares the index against tracked working-tree paths (unstaged changes). Untracked files are not part of the default diff and therefore do not affect `--quiet`, `--exit-code`, `--name-status`, `--numstat`, or `--shortstat`; use `libra status`, `libra ls-files --others`, or `libra add` to inspect or promote untracked files. With `--staged`, it compares HEAD against the index (staged changes). With `--old` and `--new`, it compares two arbitrary commits.
 
-The diff engine currently uses the histogram backend. The parser accepts the forward-compatible names `myers` and `myersMinimal`, but execution rejects them with `LBR-CLI-002` rather than silently using another algorithm. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity (matching Git's structure; like all Libra diffs, the exact word grouping can differ from Git on ambiguous changes, and hunk headers keep Libra's unified-diff format).
+The diff engine defaults to Myers, matching Git and the underlying built-in engine. `--minimal`/`--algorithm=myersMinimal` select the same no-deadline shortest-edit Myers implementation; `--patience` and `--histogram` (or their `--algorithm` values) select real readability-oriented backends. Repeatable `--anchored=<text>` selects an anchored Patience diff and tries to keep qualifying unique lines as context. Output can be directed to a file with `--output`, and several review and summary formats are available (`--raw`, `--name-only`, `--name-status`, `--numstat`, `--stat`, `--compact-summary`, `--shortstat`, `--summary`). Pickaxe filters `-S <STRING>` and `-G <REGEX>` select file pairs by changed occurrence count or matching added/removed lines. A status-only check is possible with `-s`/`--no-patch` and `--exit-code`, and `-z`/`--null` makes raw/name/numstat output NUL-terminated for safe scripting. `--word-diff[=<mode>]` re-renders the patch at word granularity; `--word-diff-regex=<regex>` defines comparison words, and `--color-words[=<regex>]` is the color shorthand (matching Git's structure; like all Libra diffs, ambiguous word alignments can differ, and hunk headers keep Libra's unified-diff format).
 
 When the working tree contains unmerged conflict entries, the default working-tree diff renders a conflict-aware `diff --cc <path>` record instead of treating the conflict file as a `/dev/null` addition.
 
@@ -44,16 +49,24 @@ normal pipeline termination; no panic/backtrace or `Broken pipe` diagnostic is p
 | Staged | | `--staged` | Compare HEAD against the index (staged changes). Conflicts with `--new`. |
 | Revisions | | positional | Up to two leading revisions, Git-style: `diff A` (A vs worktree), `diff A B` (≡ `A..B`), `diff A..B`, `diff A...B` (merge-base(A,B) vs B), `diff --staged A` (A vs index). Not interpreted when `--old`/`--new` is given. |
 | Pathspec | | positional | One or more files or directories to restrict the diff (after any revisions; use `--` to force the path reading). Supports exact files, directory prefixes, default wildcards, and `:(top)` / `:(exclude)` / `:(icase)` / `:(literal)` / `:(glob)` magic. Pre-`--` paths must exist or carry wildcard syntax / supported pathspec magic; post-`--` paths are taken verbatim. |
-| Algorithm | | `--algorithm <name>` | Diff algorithm. `histogram` is the only implemented backend; `myers` and `myersMinimal` are accepted by the parser but fail explicitly before scanning. |
+| Algorithm | | `--algorithm <name>` | Select `myers` (default), `myersMinimal`, `patience`, or `histogram`. All values select real backends; Myers-minimal is output-equivalent to Myers because Libra does not impose a diff deadline. |
+| Minimal | | `--minimal` | Request the smallest Myers edit script; equivalent to `--algorithm=myersMinimal`. It does not replace an explicitly selected Patience/Histogram/Anchored backend. |
+| Patience | | `--patience` | Select the Patience backend, which uses unique-line anchors for reordered code. |
+| Histogram | | `--histogram` | Select the Histogram backend, which prefers low-frequency anchors in repetitive input. Patience/Histogram/`--algorithm` selectors use last-one-wins precedence. |
+| Anchored | | `--anchored=<TEXT>` | Select anchored Patience diff. A qualifying line must occur exactly once on each side and start with TEXT; repeat the option to provide alternatives. The algorithm tries to keep qualifying lines out of delete/insert pairs. |
 | Output file | | `--output <FILENAME>` | Write human-readable output to a file instead of stdout. Ignored in `--json` mode. |
 | Name only | | `--name-only` | Show only the names of changed files. |
 | Name status | | `--name-status` | Show changed file names with a status letter (A/D/M/R/T/U when applicable). |
 | Raw | | `--raw` | Show Git-shaped `:<oldmode> <newmode> <oldid> <newid> <status>\t<path>` records. IDs are abbreviated to 7 characters; a live worktree or absent side is zero. Renames carry `R<score>` plus old/new paths. Use `-z` for arbitrary path names. |
 | Word diff | | `--word-diff[=<mode>]` | Re-render the patch at word granularity. MODE is `plain` (default; removed words `[-…-]`, added `{+…+}`), `color` (highlight in a terminal, no brackets), `porcelain` (one token per line, `-`/`+`/` ` prefixes, `~` for newlines), or `none` (regular patch). Words are whitespace-delimited. Must be written as `--word-diff` or `--word-diff=<mode>`. |
+| Word regex | | `--word-diff-regex=<REGEX>` | Treat each non-overlapping Rust-regex match as a word; text between matches is ignored for comparison (old delimiters disappear, new delimiters remain visible). A match crossing a newline is truncated at that newline. The option alone implies plain word mode; explicit `--word-diff=none` disables rendering. Invalid regexes fail with `LBR-CLI-002` before config, progress, textconv, or external-driver work. |
+| Color words | | `--color-words[=<REGEX>]` | Shorthand for `--word-diff=color`, optionally with the same custom word regex. Under automatic color selection it emits word colors even when stdout is redirected; explicit global `--color=never` suppresses ANSI. Must be bare or use the equals form. If both regex forms are present, explicit `--word-diff-regex` wins. |
 | Numstat | | `--numstat` | Show insertion/deletion counts in a machine-friendly tab-separated format. |
 | Stat | | `--stat` | Show a diffstat summary with +/- bar graph. |
 | Compact summary | | `--compact-summary` | Show `--stat` with `(new)`, `(gone)`, and executable/symlink metadata such as `(+x)` or `(+l)`. Implies `--stat`. |
 | Diff filter | | `--diff-filter=<FILTER>` | Select A/C/D/M/R/T/U/X/B statuses. Uppercase letters include, lowercase letters exclude; `*` makes the selection all-or-none. Invalid or empty filters fail with `LBR-CLI-002` before scanning/output. |
+| String pickaxe | `-S <STRING>` | | Keep a file pair only when its number of non-overlapping STRING occurrences changes. Equal counts do not match even if the occurrences moved. Uses textconv output when active; otherwise searches raw bytes, including binary content. An empty STRING matches nothing. Mutually exclusive with `-G`. |
+| Regex pickaxe | `-G <REGEX>` | | Keep a file pair when REGEX matches added or removed hunk content (not context or patch headers). Uses the Rust `regex` dialect (linear-time; no look-around or backreferences). Invalid expressions fail with `LBR-CLI-002` before scanning/output. Mutually exclusive with `-S`. |
 | Context lines | `-U<n>` | `--unified=<n>` | Number of context lines around each change in the patch (default 3; when the flag is absent the `diff.context` config default applies — strict local → global → system cascade, non-negative Git integer with optional `k`/`m`/`g` 1024-based suffix, invalid or overflowing values fail closed with `LBR-CLI-002` before progress or diff output). Changes only the surrounding context, not the `+`/`-` lines, so `--stat`/`--name-only`/`--numstat` counts are unaffected; the `--json` hunk ranges and line arrays follow `<n>`. |
 | Ignore whitespace | `-w` | `--ignore-all-space` | Ignore all whitespace when comparing lines. A change that is only whitespace is not reported (the file drops out if that is its only change); context lines are shown from the new side. Affected files are re-diffed, so `--stat`/`--name-only`/`--numstat`/JSON all reflect the whitespace-ignored result. Honors `-U<n>`. |
 | Ignore whitespace amount | `-b` | `--ignore-space-change` | Ignore changes in the *amount* of whitespace: runs of whitespace are treated as a single space and trailing whitespace is ignored, but the presence of whitespace still matters (`a  b` matches `a b`; `a b` still differs from `ab`). Same re-diff/drop behavior as `-w`. `-w` wins if both are given. |
@@ -111,10 +124,15 @@ libra diff --staged src/
 
 **`--algorithm`**
 
-Select the diff algorithm. Histogram is the only implemented backend. The other parser-accepted names fail explicitly with `LBR-CLI-002` before any worktree scan:
+Select Myers (the default), Myers-minimal, Patience, Histogram, or anchored Patience. `--anchored=<text>` is repeatable: a line qualifies only when it exists on both sides, is unique on both sides, and starts with at least one supplied text. Anchored Patience tries to keep each compatible qualifying line as context rather than a delete/insert pair.
+
+Backend selectors otherwise use last-one-wins precedence. Matching Git, anchors are retained while a named `--algorithm` or `--histogram` makes them dormant, so a later `--anchored` reactivates the retained list; the `--patience` shorthand explicitly clears earlier anchors. `--minimal` is an independent quality request: it selects Myers-minimal only when Myers is active.
 
 ```bash
-libra diff --algorithm histogram
+libra diff --algorithm patience
+libra diff --minimal
+libra diff --histogram
+libra diff --anchored='fn ' --anchored='struct '
 ```
 
 **`--output`**
@@ -146,6 +164,25 @@ libra diff --stat
 # Output:  src/main.rs | 7 +++++--
 ```
 
+**Pickaxe filters:**
+
+```bash
+# Files where the literal's occurrence count changed
+libra diff -S'old_api' --name-only
+
+# Files with matching added or removed lines
+libra diff -G'unsafe\(' --name-status
+```
+
+`-S` and `-G` compose with pathspecs, `--diff-filter`, review output modes,
+JSON, and exit-code checks. Filtering happens before a configured external diff
+driver runs, so the driver is invoked only for selected file pairs. Textconv is
+on by default and `-S` reuses the already-converted side content without running
+the command twice; pass `--no-textconv` to search raw bytes. In AI-mediated
+`run_libra_vcs`, pickaxe remains approval-gated unless both `--no-textconv` and
+`--no-ext-diff` are present, because those configured filters can execute shell
+commands.
+
 ## Common Commands
 
 ```bash
@@ -164,6 +201,10 @@ libra diff --stat src/
 # Emit NUL-safe object/mode metadata and filter review paths
 libra diff --raw -z
 libra diff --name-only --diff-filter=AM
+
+# Search changed file pairs by literal count or changed-line regex
+libra diff -S'old_api' --name-only
+libra diff -G'handler_v[0-9]+' --name-status
 
 # Show full patch object IDs with explicit path prefixes
 libra diff --full-index --src-prefix=old/ --dst-prefix=new/
@@ -299,9 +340,9 @@ Git-style positional revisions are supported: `libra diff A` (A vs working tree)
 
 The Libra-only named flags (`--old`, `--new`) remain the ambiguity-free programmatic form — when either is given, every positional is a pathspec and no revision interpretation happens at all. This is valuable for AI agents constructing commands: there is exactly one way to express each intent, with no name-collision hazard.
 
-### Why histogram as the default algorithm?
+### Why Myers as the default algorithm?
 
-Git defaults to the Myers algorithm for historical reasons. Libra currently has one wired backend, histogram, chosen for readable source-code diffs. The parser reserves `myers` and `myersMinimal` for future compatibility, but execution rejects them explicitly so they cannot become silent no-ops.
+Myers is both Git's default and the algorithm used by Libra's underlying built-in diff before any post-processing. Keeping it as the public default makes the documented and actual behavior agree and avoids a redundant second pass. Patience is useful for reordered code, Histogram favors uncommon anchors in repetitive files, and Anchored lets callers name unique line prefixes that should remain stable boundaries. Libra's Myers implementation runs without a deadline and finds a shortest edit script, so `--minimal`/`myersMinimal` intentionally produce the same output as ordinary Myers rather than acting as a silent approximation.
 
 ### The `--cached` alias
 
@@ -313,7 +354,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 
 ### `--word-diff` and `--color-words`
 
-`--word-diff[=<mode>]` is supported (see the option above): it re-renders the patch at word granularity in `plain` (default), `color`, `porcelain`, or `none` mode, with whitespace-delimited words. The shorthand `--color-words` and a custom `--word-diff-regex` are not yet implemented.
+`--word-diff[=<mode>]` re-renders at word granularity in `plain` (default), `color`, `porcelain`, or `none` mode. By default words are whitespace-delimited. `--word-diff-regex=<regex>` instead treats every non-overlapping Rust-regex match as a word and implies plain mode when no mode was selected; unmatched text is ignored for comparison but the new side's delimiters remain visible. `--color-words[=<regex>]` combines color mode with the optional tokenizer and forces word colors under the automatic color policy even through redirected stdout; global `--color=never` still wins. Explicit `--word-diff-regex` takes precedence when both regex forms are supplied.
 
 ## Parameter Comparison: Libra vs Git vs jj
 
@@ -323,7 +364,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Staged changes | `--staged` | `--staged` / `--cached` | N/A (no staging area) |
 | Two commits | `--old <A> --new <B>` | `<A> <B>` or `<A>..<B>` | `--from <A> --to <B>` |
 | Pathspec filter | `<pathspec>...` | `-- <pathspec>...` | `<paths>...` |
-| Algorithm | `--algorithm=histogram` (only implemented backend; other accepted names fail) | `--diff-algorithm` (patience/histogram/myers/minimal) | N/A (uses internal algorithm) |
+| Algorithm | `--algorithm=<myers|myersMinimal|patience|histogram>` plus `--minimal`/`--patience`/`--histogram`/repeatable `--anchored=<text>` | `--diff-algorithm` (patience/histogram/myers/minimal) plus shorthands including `--anchored` | N/A (uses internal algorithm) |
 | Output to file | `--output <file>` | `--output <file>` | N/A (use shell redirect) |
 | Name only | `--name-only` | `--name-only` | `--name-only` |
 | Name with status | `--name-status` | `--name-status` | N/A |
@@ -333,6 +374,8 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Summary | `--summary` | `--summary` | `--summary` |
 | Raw metadata | `--raw` (`-z` supported) | `--raw` (`-z` supported) | N/A |
 | Change filter | `--diff-filter=<FILTER>` | `--diff-filter=<FILTER>` | N/A |
+| String pickaxe | `-S <STRING>` | `-S <STRING>` | N/A |
+| Regex pickaxe | `-G <REGEX>` (Rust regex dialect) | `-G <REGEX>` | N/A |
 | Compact stat | `--compact-summary` | `--compact-summary` | N/A |
 | Full patch IDs | `--full-index` (`--binary` implies it) | `--full-index` | N/A |
 | Patch prefixes | `--src-prefix` / `--dst-prefix` | `--src-prefix` / `--dst-prefix` | N/A |
@@ -342,7 +385,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 | Whitespace check | `--check` (trailing-ws / space-before-tab / conflict markers / blank-at-eof) | `--check` | N/A |
 | Reverse diff | `-R` / `--reverse` | `-R` | N/A |
 | Treat as text | `-a` / `--text` (force content diff of binary files) | `-a` / `--text` | N/A |
-| Word diff | `--word-diff[=<mode>]` (no `--color-words`/`--word-diff-regex`) | `--word-diff` / `--color-words` | N/A |
+| Word diff | `--word-diff[=<mode>]` / `--word-diff-regex=<regex>` / `--color-words[=<regex>]` (Rust regex dialect) | `--word-diff` / `--word-diff-regex` / `--color-words` | N/A |
 | Binary diff (binary patch) | `--binary` (valid/appliable; compressed bytes differ from Git's) | `--binary` | N/A |
 | Context lines | `-U<n>` / `--unified=<n>` (default 3) | `-U<n>` / `--unified=<n>` | `--context <n>` |
 | Ignore whitespace | `-w` / `--ignore-all-space` | `-w` / `--ignore-all-space` | N/A |
@@ -366,6 +409,7 @@ Allowing `--new` without `--old` would create an ambiguous comparison (new compa
 |----------|-----------------|------|
 | Outside a repository | `LBR-REPO-001` | 128 |
 | Invalid revision | `LBR-CLI-003` | 129 |
+| Invalid `-G` regular expression | `LBR-CLI-002` | 129 |
 | Failed to read the index or object store | `LBR-REPO-002` | 128 |
 | Failed to read a file | `LBR-IO-001` | 128 |
 | Failed to write the output file | `LBR-IO-002` | 128 |

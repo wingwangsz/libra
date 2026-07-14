@@ -17,7 +17,8 @@
 - 源码分层：`src/command/apply.rs`：`ApplyArgs`（`check`/`strip`(`-p<n>` 默认 1)/`patches`）、`execute`/`execute_safe`、`ApplyOutput`（`--json`：`applies`/`files`）、`read_patch`/`split_file_patches`/`patch_target`/`strip_path`/`resolve_safe`。
 - 合并/补丁核心：`diffy::Patch::from_str`（跳过 `diff --git`/`index` 前导）+ `diffy::apply(base, &patch)`（Ok=可应用 / Err=不可应用）。与 `merge`/`merge-file` 同一 `diffy` 引擎。
 - 多文件拆分（`split_file_patches`）：含 `diff --git ` 则按其行拆；否则按「`--- ` 行且下一行 `+++ `」拆（避免把内容里的 `--- ...` 删除行误判为文件头）。
-- 路径解析与安全（`patch_target` + `strip_path` + `resolve_safe`）：目标取 modified 侧（删除取 original 侧），`-p<n>` 剥离前导组件；`resolve_safe` 拒绝绝对路径、`..`、NUL、`.libra/` 内部，并用 `util::is_sub_path` 守卫越出工作树 → 128。
+- 路径解析与安全（`patch_target` + `strip_path` + `resolve_safe`）：目标取 modified 侧（删除取 original 侧），`-p<n>` 剥离前导组件；`resolve_safe` 拒绝绝对路径、空/`.`/`..` component、NUL、`.libra/` 内部，防止 path alias 绕过 collision check，并用 `util::is_sub_path` 守卫越出工作树；`reject_symlink_components` 拒绝通过已有 symlink 逃逸 → 128。
+- 内部复用 seam：`prepare_patch` 先在 memory 中算出所有 target 结果，`PreparedPatch::write` 才以 atomic rename 写入并恢复已有 permissions；仅供 `am` 使用，公开 `apply` 仍严格 check-only。
 - 资源边界：补丁 > 64 MiB → 128（`MAX_PATCH_BYTES`，stdin 用 `take(cap+1)`）。
 - 输入：positional 补丁文件（拼接）或 stdin（无文件时）。
 - 退出语义：任一文件不可应用 → `silent_exit(1)`（工作树未触碰）；解析/路径/大小错误 → 128。
@@ -30,7 +31,7 @@
 ## 当前状态
 
 - 公开状态：已公开（`Commands::Apply`）。
-- 测试：`tests/command/apply_test.rs`（干净修改 exit 0、上下文不符 exit 1、新文件、多文件、`-p0`、stdin、路径越界 128、`.libra/` 越界 128、缺 `--check` 128、格式错误 128、`--json`、非仓库 128）。
+- 测试：`tests/command/apply_test.rs`（干净修改 exit 0、上下文不符 exit 1、新文件、多文件、`-p0`、stdin、路径越界/非规范 alias/symlink component/`.libra/` 128、缺 `--check` 128、格式错误 128、`--json`、非仓库 128）。
 - 用户文档：`docs/commands/apply.md`（EN + zh-CN）。
 
 ## 还未实现的功能

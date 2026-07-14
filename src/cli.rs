@@ -54,7 +54,7 @@ Command Groups:
     media_group_entry!(),
     ", lfs, ls-files, check-ignore, check-attr, check-mailmap, worktree
   History Inspection      log, shortlog, show, show-ref, format-patch, ls-remote, ls-tree, diff, grep, blame, describe, notes, archive, revision
-  Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, rerere, metadata
+  Commit And Branching    commit, branch, switch, checkout, tag, merge, rebase, reset, cherry-pick, revert, am, rerere, metadata
   Remote And Cloud        remote, fetch, pull, push, open, cloud, cache, publish, credential, bundle, auth, login, logout, whoami
   AI And Automation       code, code-control, automation, usage, graph, sandbox, agent, review, investigate, service
   Maintenance And Plumbing fsck, maintenance, repack, logfile, cat-file, hash-object, write-tree, read-tree, update-index, update-ref, merge-file, merge-base, apply, diff-tree, diff-index, diff-files, fast-export, fast-import, replace, verify-pack, rev-parse, rev-list, symbolic-ref, reflog, bisect, for-each-ref, commit-tree, file, alternates, deps
@@ -463,6 +463,11 @@ enum Commands {
         after_help = command::format_patch::FORMAT_PATCH_EXAMPLES
     )]
     FormatPatch(command::format_patch::FormatPatchArgs),
+    #[command(
+        about = "Apply plain-text format-patch mail messages",
+        after_help = command::am::AM_EXAMPLES
+    )]
+    Am(command::am::AmArgs),
     #[command(
         about = "Iterate over refs in a local repository with formatting and filtering",
         after_help = command::for_each_ref::FOR_EACH_REF_EXAMPLES
@@ -1729,7 +1734,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
     if is_error_codes_help_topic(&argv) {
         return print_error_codes_help();
     }
-    let args = match Cli::try_parse_from(argv.clone()) {
+    let mut args = match Cli::try_parse_from(argv.clone()) {
         Ok(args) => args,
         Err(err) => match err.kind() {
             ErrorKind::DisplayHelp
@@ -1743,6 +1748,9 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
             _ => return Err(classify_parse_error(&argv, &err)),
         },
     };
+    if let Commands::Diff(diff_args) = &mut args.command {
+        command::diff::record_algorithm_selector_events(diff_args, &argv);
+    }
     apply_global_runtime_flags(&args)?;
     enforce_global_config_schema_policy(&args.command).await?;
     if let Commands::Tag(tag_args) = &args.command {
@@ -1853,6 +1861,7 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Commands::FormatPatch(cmd_args) => {
             command::format_patch::execute_safe(cmd_args, &output).await?
         }
+        Commands::Am(cmd_args) => command::am::execute_safe(cmd_args, &output).await?,
         Commands::ForEachRef(cmd_args) => {
             command::for_each_ref::execute_safe(cmd_args, &output).await?
         }

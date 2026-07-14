@@ -7,6 +7,7 @@ Compatible with `git checkout` for common branch operations and explicit path re
 
 ```
 libra checkout [<branch>]
+libra checkout -
 libra checkout -b <name> [<start-point>]
 libra checkout -B <name> [<start-point>]
 libra checkout --orphan <name>
@@ -15,7 +16,9 @@ libra checkout [<tree-ish>] -- <pathspec>...
 
 ## Description
 
-`libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, creating a new branch with `-b` from HEAD or an explicit start-point, force-creating or resetting a branch with `-B` from HEAD or an explicit start-point, creating an unborn orphan branch with `--orphan`, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
+`libra checkout` is a Git-compatibility surface that delegates to `switch` and `restore` internally. It supports the most common `git checkout` patterns: showing the current branch, switching to an existing branch, returning to the previous checkout target with `-`, creating a new branch with `-b` from HEAD or an explicit start-point, force-creating or resetting a branch with `-B` from HEAD or an explicit start-point, creating an unborn orphan branch with `--orphan`, checking out a commit to enter detached HEAD, auto-tracking remote branches, and restoring paths when an explicit `--` separator is present.
+
+`libra checkout -` shares the worktree-scoped HEAD navigation history used by `switch -`. A branch source follows the current tip of that local branch, while a detached source returns to the full stored commit ID. Repeating the shortcut toggles between targets. Missing, deleted, or corrupt latest navigation targets fail closed without moving HEAD or changing the index/worktree.
 
 This command exists so that developers migrating from Git can use familiar muscle memory. For new workflows, prefer `libra switch` (for branch operations) and `libra restore` (for file operations), which provide richer error messages, structured JSON output, and clearer semantics.
 
@@ -28,11 +31,18 @@ symlink on Unix using the stored link target bytes. Platforms without symlink
 support return an explicit unsupported-symlink diagnostic instead of silently
 writing a regular file that contains the target path.
 
+After a state-changing checkout, advisory `.libra/hooks/post-checkout` receives
+`<old-oid> <new-oid> <flag>`; the flag is `1` for branch/detached checkout and `0`
+for path restoration. Showing the current branch or checking out the
+already-current branch does not invoke it. Set
+`LIBRA_NO_HOOKS=1` only for an explicit policy bypass. See
+[Repository hooks](repository-hooks.md).
+
 ## Options
 
 | Flag | Long | Value | Description |
 |------|------|-------|-------------|
-| | `<branch>` | positional (optional) | Target branch to switch to. Omit to show current branch. |
+| | `<branch>` | positional (optional) | Target branch, or `-` for the previous checkout target. Omit to show current branch. |
 | `-b` | | `<name>` | Create a new branch from `[<start-point>]` or the current HEAD and switch to it |
 | `-B` | | `<name>` | Force-create a branch from `[<start-point>]` or the current HEAD and switch to it; resets an existing branch to that commit |
 | | `[<start-point>]` | positional | Optional commit, tag, or branch used with `-b` / `-B` as the new branch tip |
@@ -52,6 +62,9 @@ libra checkout
 
 # Switch to an existing local branch
 libra checkout main
+
+# Return to the previous checkout target
+libra checkout -
 
 # Create and switch to a new branch
 libra checkout -b feature-x
@@ -85,6 +98,7 @@ libra checkout HEAD -- link-to-target
 ```bash
 libra checkout                         # Show the current branch
 libra checkout main                    # Switch to an existing local branch
+libra checkout -                       # Return to the previous checkout target
 libra checkout feature-x               # Switch to another branch
 libra checkout -b feature-x            # Create and switch to a new branch
 libra checkout -b fix-123 abc1234      # Create and switch from a start-point
@@ -259,6 +273,7 @@ When `libra checkout feature` finds `origin/feature` but no local `feature` bran
 |---------|-----|-------|----|
 | Show current branch | `git branch --show-current` | `libra checkout` (no args) | `jj log -r @` |
 | Switch branch | `git checkout main` | `libra checkout main` | `jj edit <rev>` |
+| Previous checkout target | `git checkout -` | `libra checkout -` | N/A |
 | Create and switch | `git checkout -b feature` | `libra checkout -b feature` | `jj new` + `jj branch create` |
 | Create from commit | `git checkout -b fix abc1234` | `libra checkout -b fix abc1234` | `jj new abc1234` + `jj branch create fix` |
 | Force-create / reset branch | `git checkout -B feature main` | `libra checkout -B feature main` | N/A |
@@ -280,6 +295,9 @@ When `libra checkout feature` finds `origin/feature` but no local `feature` bran
 | Internal branch blocked | `LBR-CLI-003` | "checking out '{name}' branch is not allowed" | 128 |
 | Create internal branch blocked | `LBR-CLI-003` | "creating/switching to '{name}' branch is not allowed" | 128 |
 | Branch or start-point not found (no remote match) | `LBR-CLI-003` | "path specification '{name}' did not match any files known to libra" | 129 |
+| No resolvable previous checkout target | `LBR-CLI-003` | "no previous checkout target is available" | 129 |
+| Previous checkout reflog read failed | `LBR-IO-001` | "failed to read the current worktree HEAD reflog: ..." | 128 |
+| Previous checkout record is malformed or unreadable | `LBR-REPO-002` | "the current worktree HEAD navigation record is invalid: ..." | 128 |
 | Pathspec not matched in path mode | `LBR-CLI-003` | "pathspec '{path}' did not match any files" | 128 |
 | `-b` combined with path mode | `LBR-CLI-002` | "checkout path mode cannot be combined with -b" | 128 |
 | Current branch (no-op) | N/A | Prints "Already on {branch}" and succeeds | 0 |

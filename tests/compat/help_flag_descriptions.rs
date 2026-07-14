@@ -53,6 +53,7 @@ const COMMANDS: &[&str] = &[
     "mv",
     "restore",
     "clean",
+    "am",
     "log",
     "shortlog",
     "show",

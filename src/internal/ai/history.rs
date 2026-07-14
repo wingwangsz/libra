@@ -150,6 +150,13 @@ pub struct HistoryManager {
     db_conn: Arc<DatabaseConnection>,
     /// The reference name this manager writes to (e.g. "libra/intent").
     ref_name: String,
+    /// Test-only injection point: runs right after the checkpoint CAS loop
+    /// reads the head, BEFORE objects are spliced/committed against it —
+    /// the deterministic window for `ref_cas_head_changed_rebuilds_commit_
+    /// before_retry` to move the head under a competing writer.
+    #[cfg(test)]
+    pub(crate) test_after_head_read:
+        Option<Arc<dyn Fn() -> futures::future::BoxFuture<'static, Result<()>> + Send + Sync>>,
 }
 
 impl HistoryManager {
@@ -188,6 +195,8 @@ impl HistoryManager {
             repo_path,
             db_conn,
             ref_name: ref_name.into(),
+            #[cfg(test)]
+            test_after_head_read: None,
         }
     }
 
@@ -752,6 +761,24 @@ impl HistoryManager {
         expected_head: Option<ObjectHash>,
         new_hash: ObjectHash,
     ) -> Result<RefUpdateOutcome> {
+        self.update_ref_if_matches_with_extra(ref_name, expected_head, new_hash, None)
+            .await
+    }
+
+    /// Conditional ref update with optional transactional companion writes
+    /// (plan-20260713 ADR-DR-10). When `extra` is provided, its SQL runs in
+    /// the SAME transaction as the ref write — after the CAS row update
+    /// succeeds, before COMMIT — so catalog/claim/revision state can never
+    /// diverge from the ref. An `extra` error rolls the whole transaction
+    /// back (the ref does not move) and propagates as a hard error, not a
+    /// `HeadChanged` retry.
+    async fn update_ref_if_matches_with_extra(
+        &self,
+        ref_name: &str,
+        expected_head: Option<ObjectHash>,
+        new_hash: ObjectHash,
+        extra: Option<(&dyn TracesTxnExtra, &TracesCommitCtx)>,
+    ) -> Result<RefUpdateOutcome> {
         let expected_commit = expected_head.map(|hash| hash.to_string());
         let new_commit = new_hash.to_string();
 
@@ -849,6 +876,19 @@ impl HistoryManager {
             if rows_affected.is_some_and(|result| result.rows_affected != 1) {
                 let _ = txn.rollback().await;
                 return Ok(RefUpdateOutcome::HeadChanged);
+            }
+
+            // ADR-DR-10: companion writes ride the ref transaction. A
+            // failure here must NOT move the ref — roll back and fail
+            // closed (no HeadChanged retry: the failure is a gate/fence
+            // violation or DB fault, not a CAS race).
+            if let Some((extra, ctx)) = extra
+                && let Err(err) = extra.apply(&txn, ctx).await
+            {
+                let _ = txn.rollback().await;
+                return Err(
+                    err.context("transactional companion writes failed; ref update rolled back")
+                );
             }
 
             match txn.commit().await {
@@ -1055,6 +1095,12 @@ impl HistoryManager {
         let rest = params.checkpoint_id[2..].to_string();
         for attempt in 0..=HISTORY_HEAD_CONFLICT_MAX_RETRIES {
             let parent = self.resolve_history_head().await?;
+            // Test-only: deterministic head-moved-between-read-and-CAS
+            // injection (see the struct field's doc).
+            #[cfg(test)]
+            if let Some(hook) = &self.test_after_head_read {
+                hook().await?;
+            }
             let new_root = self.splice_checkpoint_tree(parent, &prefix, &rest, inner_tree)?;
             // splice_checkpoint_tree writes exactly three trees
             // (rest→prefix→checkpoint→root splice) per attempt; +1 commit.
@@ -1094,8 +1140,20 @@ impl HistoryManager {
                 commit_data.len() as i64,
             );
 
+            // Per-attempt ctx: commit hash and root tree change on every CAS
+            // rebuild, so the companion writes get the values of THIS attempt.
+            let commit_ctx = TracesCommitCtx {
+                commit_hash: commit_hash.to_string(),
+                tree_oid: new_root.to_string(),
+                metadata_blob_oid: metadata_blob_oid.to_string(),
+            };
             match self
-                .update_ref_if_matches(&self.ref_name, parent, commit_hash)
+                .update_ref_if_matches_with_extra(
+                    &self.ref_name,
+                    parent,
+                    commit_hash,
+                    params.txn_extra.map(|extra| (extra, &commit_ctx)),
+                )
                 .await?
             {
                 RefUpdateOutcome::Updated => {
@@ -1852,6 +1910,122 @@ pub struct CheckpointCommitParams<'a> {
     /// Typed as [`RedactedBytes`] (AG-19 / G4) to keep the whole checkpoint
     /// tree behind the redaction type.
     pub redaction_report_json: &'a RedactedBytes,
+    /// plan-20260713 DR-05c-0 (ADR-DR-10): extra SQL applied INSIDE the
+    /// winning ref-CAS transaction — catalog row, coverage revision inserts
+    /// and claim advances commit atomically with the ref update, or the
+    /// whole transaction (ref included) rolls back. `None` keeps the legacy
+    /// behavior (catalog inserted separately after the CAS).
+    pub txn_extra: Option<&'a dyn TracesTxnExtra>,
+}
+
+/// Per-attempt commit identifiers handed to [`TracesTxnExtra::apply`] — the
+/// commit hash and root tree change on every CAS rebuild, so the extra must
+/// receive them at apply time rather than capture them up front.
+#[derive(Debug, Clone)]
+pub struct TracesCommitCtx {
+    pub commit_hash: String,
+    pub tree_oid: String,
+    pub metadata_blob_oid: String,
+}
+
+/// A catalog row reconstructed from a `refs/libra/traces` checkpoint commit
+/// (plan-20260713 DR-05c-0): the SHARED classification boundary used by
+/// doctor's class-2 repair and by claim recovery, so both apply the same
+/// fail-closed rules instead of duplicating them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RebuiltCatalogRow {
+    Committed {
+        checkpoint_id: String,
+        session_id: String,
+        parent_commit: Option<String>,
+        tree_oid: String,
+        metadata_blob_oid: String,
+        traces_commit: String,
+        created_at: i64,
+    },
+    Subagent {
+        checkpoint_id: String,
+        session_id: String,
+        parent_commit: Option<String>,
+        parent_checkpoint_id: Option<String>,
+        subagent_session_id: Option<String>,
+        tool_use_id: Option<String>,
+        description: Option<String>,
+        tree_oid: String,
+        metadata_blob_oid: String,
+        traces_commit: String,
+        created_at: i64,
+    },
+}
+
+/// Inputs for [`rebuild_catalog_row_from_traces_ref`] — the fields both a
+/// checkpoint commit's `metadata.json` and its ref position provide.
+#[derive(Debug, Clone, Default)]
+pub struct RebuildCatalogRowInputs {
+    pub scope: String,
+    pub checkpoint_id: String,
+    pub session_id: String,
+    pub parent_commit: Option<String>,
+    pub parent_checkpoint_id: Option<String>,
+    pub subagent_session_id: Option<String>,
+    pub tool_use_id: Option<String>,
+    pub description: Option<String>,
+    pub tree_oid: String,
+    pub metadata_blob_oid: String,
+    pub traces_commit: String,
+    pub created_at: i64,
+}
+
+/// Classify + assemble a rebuildable catalog row from traces-ref evidence.
+/// Fail-closed: any scope other than `committed` / `subagent` is an error —
+/// the caller must route it to manual review, never guess a row shape.
+pub fn rebuild_catalog_row_from_traces_ref(
+    inputs: RebuildCatalogRowInputs,
+) -> Result<RebuiltCatalogRow> {
+    match inputs.scope.as_str() {
+        "committed" => Ok(RebuiltCatalogRow::Committed {
+            checkpoint_id: inputs.checkpoint_id,
+            session_id: inputs.session_id,
+            parent_commit: inputs.parent_commit,
+            tree_oid: inputs.tree_oid,
+            metadata_blob_oid: inputs.metadata_blob_oid,
+            traces_commit: inputs.traces_commit,
+            created_at: inputs.created_at,
+        }),
+        "subagent" => Ok(RebuiltCatalogRow::Subagent {
+            checkpoint_id: inputs.checkpoint_id,
+            session_id: inputs.session_id,
+            parent_commit: inputs.parent_commit,
+            parent_checkpoint_id: inputs.parent_checkpoint_id,
+            subagent_session_id: inputs.subagent_session_id,
+            tool_use_id: inputs.tool_use_id,
+            description: inputs.description,
+            tree_oid: inputs.tree_oid,
+            metadata_blob_oid: inputs.metadata_blob_oid,
+            traces_commit: inputs.traces_commit,
+            created_at: inputs.created_at,
+        }),
+        other => Err(anyhow!(
+            "checkpoint scope '{other}' is not auto-rebuildable (fail-closed; manual review)"
+        )),
+    }
+}
+
+/// Transactional companion writes for a traces ref update (ADR-DR-10).
+///
+/// `apply` runs inside the SAME SQLite transaction as the successful ref
+/// CAS, after the ref row write and before COMMIT. Returning an error rolls
+/// the entire transaction back — the ref does not move, and the caller's
+/// checkpoint write fails closed.
+#[async_trait::async_trait]
+pub trait TracesTxnExtra: Send + Sync {
+    async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()>;
+}
+
+impl std::fmt::Debug for dyn TracesTxnExtra + '_ {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("TracesTxnExtra")
+    }
 }
 
 /// Scope tag stamped on each checkpoint, mirroring the
@@ -2577,6 +2751,61 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::sleep;
 
+    /// plan-20260713 DR-05c-0: the shared rebuild boundary classifies both
+    /// auto-rebuildable scopes and fails closed on anything else.
+    #[test]
+    fn rebuilt_catalog_row_committed_and_subagent() {
+        let base = RebuildCatalogRowInputs {
+            scope: "committed".to_string(),
+            checkpoint_id: "cp1".to_string(),
+            session_id: "s1".to_string(),
+            parent_commit: Some("p".to_string()),
+            tree_oid: "t".to_string(),
+            metadata_blob_oid: "m".to_string(),
+            traces_commit: "c".to_string(),
+            created_at: 7,
+            ..Default::default()
+        };
+        match rebuild_catalog_row_from_traces_ref(base.clone()).expect("committed rebuilds") {
+            RebuiltCatalogRow::Committed {
+                checkpoint_id,
+                session_id,
+                created_at,
+                ..
+            } => {
+                assert_eq!(checkpoint_id, "cp1");
+                assert_eq!(session_id, "s1");
+                assert_eq!(created_at, 7);
+            }
+            other => panic!("expected Committed, got {other:?}"),
+        }
+
+        let sub = RebuildCatalogRowInputs {
+            scope: "subagent".to_string(),
+            parent_checkpoint_id: Some("parent-cp".to_string()),
+            tool_use_id: Some("tool-1".to_string()),
+            ..base.clone()
+        };
+        match rebuild_catalog_row_from_traces_ref(sub).expect("subagent rebuilds") {
+            RebuiltCatalogRow::Subagent {
+                parent_checkpoint_id,
+                tool_use_id,
+                ..
+            } => {
+                assert_eq!(parent_checkpoint_id.as_deref(), Some("parent-cp"));
+                assert_eq!(tool_use_id.as_deref(), Some("tool-1"));
+            }
+            other => panic!("expected Subagent, got {other:?}"),
+        }
+
+        // Fail-closed: unknown scopes are an error, never a guessed shape.
+        let weird = RebuildCatalogRowInputs {
+            scope: "temporary".to_string(),
+            ..base
+        };
+        assert!(rebuild_catalog_row_from_traces_ref(weird).is_err());
+    }
+
     use super::*;
     use crate::{internal::db, utils::storage::local::LocalStorage};
 
@@ -2747,6 +2976,229 @@ mod tests {
             .expect("history head should be readable after retry")
             .expect("history head should exist");
         assert_eq!(resolved, hash);
+    }
+
+    // -- plan-20260713 DR-05c-0 required M1 tests ---------------------------
+
+    fn traces_manager(dir: &tempfile::TempDir, db_conn: Arc<DatabaseConnection>) -> HistoryManager {
+        let repo_path = dir.path().join(".libra");
+        std::fs::create_dir_all(repo_path.join("objects")).unwrap();
+        let storage = Arc::new(LocalStorage::new(repo_path.join("objects")));
+        HistoryManager::new_with_ref(
+            storage,
+            repo_path,
+            db_conn,
+            crate::internal::branch::TRACES_BRANCH,
+        )
+    }
+
+    fn checkpoint_params<'a>(
+        checkpoint_id: &'a str,
+        blobs: &'a RedactedBytes,
+        txn_extra: Option<&'a dyn TracesTxnExtra>,
+    ) -> CheckpointCommitParams<'a> {
+        CheckpointCommitParams {
+            checkpoint_id,
+            session_id: "claude_code__s1",
+            agent_kind: "claude_code",
+            parent_commit: None,
+            scope: CheckpointScope::Committed,
+            tool_use_id: None,
+            metadata_json: blobs,
+            transcript_redacted: blobs,
+            lifecycle_events_jsonl: blobs,
+            redaction_report_json: blobs,
+            txn_extra,
+        }
+    }
+
+    /// ref_cas_head_changed_rebuilds_commit_before_retry: a competing commit
+    /// lands BETWEEN the loop's head read and its CAS (deterministically, via
+    /// the test-only injection hook) — the CAS must reject the stale attempt,
+    /// the loop must RETRY (cas_retries > 0) and REBUILD the commit parented
+    /// on the freshly-read head, keeping the chain linear.
+    #[tokio::test]
+    async fn ref_cas_head_changed_rebuilds_commit_before_retry() {
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        let mut manager = traces_manager(&dir, db_conn.clone());
+        let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
+
+        // Seed head H0.
+        let seeded = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "aaaa0000-0000-0000-0000-000000000001",
+                &blobs,
+                None,
+            ))
+            .await
+            .expect("seed checkpoint");
+        let h0 = seeded.commit_hash;
+
+        // Competing writer, fired from INSIDE the tested append's
+        // read→CAS window (first attempt only) via the injection hook.
+        let interloper = Arc::new(traces_manager(&dir, db_conn.clone()));
+        let fired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let interloper_commit: Arc<std::sync::Mutex<Option<ObjectHash>>> =
+            Arc::new(std::sync::Mutex::new(None));
+        {
+            let interloper = interloper.clone();
+            let fired = fired.clone();
+            let interloper_commit = interloper_commit.clone();
+            manager.test_after_head_read = Some(Arc::new(move || {
+                let interloper = interloper.clone();
+                let fired = fired.clone();
+                let interloper_commit = interloper_commit.clone();
+                Box::pin(async move {
+                    if fired.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                        return Ok(()); // only the first attempt races
+                    }
+                    let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
+                    let won = interloper
+                        .append_checkpoint_commit(checkpoint_params(
+                            "bbbb0000-0000-0000-0000-000000000002",
+                            &blobs,
+                            None,
+                        ))
+                        .await?;
+                    *interloper_commit.lock().unwrap() = Some(won.commit_hash);
+                    Ok(())
+                })
+            }));
+        }
+
+        let rebuilt = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "cccc0000-0000-0000-0000-000000000003",
+                &blobs,
+                None,
+            ))
+            .await
+            .expect("append survives the mid-window head move");
+        let h1 = interloper_commit
+            .lock()
+            .unwrap()
+            .expect("interloper committed");
+
+        // A real retry happened …
+        assert!(
+            rebuilt.cas_retries > 0,
+            "the first attempt must lose the CAS and retry, got cas_retries = {}",
+            rebuilt.cas_retries
+        );
+        // … and the rebuilt commit parents the interloper's head, not H0.
+        let data = read_git_object(&manager.repo_path, &rebuilt.commit_hash).unwrap();
+        let content = String::from_utf8_lossy(&data);
+        assert!(
+            content.contains(&format!("parent {h1}")),
+            "rebuilt commit must parent the NEW head {h1}, got:\n{content}"
+        );
+        assert!(
+            !content.contains(&format!("parent {h0}")),
+            "rebuilt commit must not still parent the stale head {h0}"
+        );
+        let head = manager.resolve_history_head().await.unwrap().unwrap();
+        assert_eq!(head, rebuilt.commit_hash, "chain stays linear");
+    }
+
+    /// crash_after_objects_before_ref_leaves_only_gc_objects AND
+    /// crash_after_ref_before_catalog_is_impossible_or_atomically_recovers:
+    /// with a transactional extra, ref + companion writes are one atomic
+    /// unit. A failing extra (simulating the claim/catalog write dying after
+    /// objects were built) must leave the ref UNMOVED — only unreachable
+    /// loose objects remain; the success path lands ref + companion row
+    /// together, so a "ref moved but catalog missing" window cannot exist.
+    #[tokio::test]
+    async fn crash_between_objects_ref_and_catalog_is_atomic() {
+        struct FailingExtra;
+        #[async_trait::async_trait]
+        impl TracesTxnExtra for FailingExtra {
+            async fn apply(
+                &self,
+                _txn: &DatabaseTransaction,
+                _ctx: &TracesCommitCtx,
+            ) -> Result<()> {
+                anyhow::bail!("simulated crash after objects, inside the final transaction")
+            }
+        }
+        struct MarkerExtra;
+        #[async_trait::async_trait]
+        impl TracesTxnExtra for MarkerExtra {
+            async fn apply(&self, txn: &DatabaseTransaction, ctx: &TracesCommitCtx) -> Result<()> {
+                // Stand-in for the catalog INSERT: a reference row keyed by
+                // the commit, written in the SAME transaction as the ref.
+                let marker = reference::ActiveModel {
+                    name: Set(Some(format!("marker/{}", ctx.commit_hash))),
+                    kind: Set(ConfigKind::Branch),
+                    commit: Set(Some(ctx.commit_hash.clone())),
+                    remote: Set(None),
+                    ..Default::default()
+                };
+                marker.insert(txn).await?;
+                Ok(())
+            }
+        }
+
+        let dir = tempdir().unwrap();
+        let db_conn = Arc::new(setup_test_db().await);
+        let manager = traces_manager(&dir, db_conn.clone());
+        let blobs = RedactedBytes::new_unchecked(b"{}".to_vec());
+
+        // Seed head H0.
+        let seeded = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "aaaa0000-0000-0000-0000-00000000000a",
+                &blobs,
+                None,
+            ))
+            .await
+            .expect("seed");
+        let h0 = seeded.commit_hash;
+
+        // Failing extra: append errors, ref must NOT move (objects on disk
+        // are the only residue — the documented GC-only window).
+        let failing = FailingExtra;
+        let err = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "bbbb0000-0000-0000-0000-00000000000b",
+                &blobs,
+                Some(&failing),
+            ))
+            .await
+            .expect_err("failing extra must fail the append closed");
+        assert!(
+            format!("{err:#}").contains("simulated crash"),
+            "got {err:#}"
+        );
+        assert_eq!(
+            manager.resolve_history_head().await.unwrap().unwrap(),
+            h0,
+            "ref must not move when the companion transaction fails"
+        );
+
+        // Success path: ref + companion row land atomically.
+        let marker = MarkerExtra;
+        let committed = manager
+            .append_checkpoint_commit(checkpoint_params(
+                "cccc0000-0000-0000-0000-00000000000c",
+                &blobs,
+                Some(&marker),
+            ))
+            .await
+            .expect("append with marker extra");
+        assert_eq!(
+            manager.resolve_history_head().await.unwrap().unwrap(),
+            committed.commit_hash
+        );
+        let marker_row = reference::Entity::find()
+            .filter(reference::Column::Name.eq(format!("marker/{}", committed.commit_hash)))
+            .one(&*db_conn)
+            .await
+            .unwrap();
+        assert!(
+            marker_row.is_some(),
+            "companion row must exist the instant the ref moved (same txn)"
+        );
     }
 
     #[tokio::test]

@@ -72,9 +72,11 @@
 | `diff --raw -z` | `cli.restore-reset-diff`, `compat_diff_review_options` | NUL-safe mode/object/status 记录；rename 分离旧/新路径字段，工作树侧 ID 为零 |
 | `diff --compact-summary` | `cli.restore-reset-diff`, `compat_diff_review_options` | 隐含 stat；create/delete 与 executable/symlink mode 注记可观察 |
 | `diff --diff-filter=<FILTER>` | `cli.restore-reset-diff`, `compat_diff_review_options` | include/exclude/`*` all-or-none，非法值输出前 fail-closed，sparse-view 后重新判定 |
+| `diff -S <STRING>` / `-G <REGEX>` | `cli.restore-reset-diff`, `compat_diff_review_options`, `ai_libra_vcs_safety_test` | 每 file pair literal 次数变化 / 增删 hunk 行正则过滤；textconv 结果一次复用，external driver 前过滤，无效 regex pre-progress fail-closed，AI 默认过滤器审批边界不放宽 |
+| `diff --word-diff-regex=<REGEX>` / `--color-words[=<REGEX>]` | `cli.restore-reset-diff`, `command_test::test_diff_word_diff_modes`, `ai_libra_vcs_safety_test` | regex 非重叠匹配定义比较词，standalone regex 隐含 plain；valued color shorthand 进入同一 tokenizer + color mode，显式 word regex 优先；无效 regex pre-progress fail-closed，AI 默认过滤器审批边界不放宽 |
+| `diff --algorithm=<NAME>` / `--minimal` / `--patience` / `--histogram` / `--anchored=<TEXT>` | `cli.restore-reset-diff`, `command_test::test_diff_algorithms`, `compat_diff_review_options`, `ai_libra_vcs_safety_test` | 默认与实际底层均为 Myers；MyersMinimal/Patience/Histogram 命名与简写进入真实 backend；可重复 Anchored 要求两侧唯一+prefix 匹配并使用 Git anchor-locked Patience LIS。selector retention/clear 与 Git 一致，minimal 不覆盖显式 Patience/Histogram/Anchored；AI 仍要求 `--no-textconv --no-ext-diff` 双门 |
 | `diff --full-index --src-prefix --dst-prefix` | `cli.restore-reset-diff`, `compat_diff_review_options` | patch 使用完整对象 ID 与 CLI 指定前缀；`-R` 交换前缀 |
 | `diff --output <file>` | `cli.restore-reset-diff` | patch 写入文件，stdout 不输出 hunk |
-| `diff --algorithm=histogram` | `cli.restore-reset-diff` | 当前唯一实现算法可用，其他算法负向断言 |
 | `restore --staged <path>` | `cli.restore-reset-diff` | index 恢复到 HEAD，工作区保持修改 |
 | `restore --worktree <path>` | `cli.restore-reset-diff` | 工作区文件恢复到 index 或 source 内容 |
 | `restore --source <rev>` | `cli.restore-reset-diff` | source revision 可恢复文件；不存在时失败且不改写文件 |
@@ -148,8 +150,8 @@
 | `blame` / `blame -L` / `blame <file> <commit>` / `blame --porcelain` | `cli.grep-blame-describe-shortlog` | 行级作者、提交、范围限制和 porcelain 头部可观察 |
 | `describe --tags/--always/--abbrev/--exact-match/--dirty[=<mark>]` | `cli.grep-blame-describe-shortlog` | tag 描述、hash fallback、exact match 和 tracked dirty 后缀可观察；HEAD 越过 tag 后的 `--exact-match` 为负向断言 |
 | `shortlog` / `shortlog -s` / `shortlog -n` / `shortlog -e` | `cli.grep-blame-describe-shortlog` | 作者汇总、排序、邮箱和 revision 限制可观察；扩展 flags 为负向断言 |
-| `rev-parse HEAD` / `--short` / `--show-toplevel` | `cli.object-readback` | 完整哈希、短哈希和工作树根路径可传递给后续 plumbing 命令 |
-| `rev-parse --verify` / `--verify --short` / `--default` | `cli.object-readback` | 单对象断言、短哈希断言、默认 revision 回退和 quiet 失败退出 1 可观察 |
+| `rev-parse HEAD` / `@` / `^N` / `~N` / `^{type}` / `^{}` / `REV:path` / numeric `@{N}` / `--short` / `--show-toplevel` | `cli.object-readback`、`cli.sha256-object-readback` | 完整/短哈希、typed/recursive peel、数字 reflog、tree path 和 SHA-1/SHA-256 解析可传递给 plumbing 命令 |
+| `rev-parse --verify` / `--verify --short` / `--default` | `cli.object-readback` | 单对象存在性断言、短哈希断言、默认 revision 回退和 quiet 失败退出 1 可观察；不存在的完整 OID 不得通过 `--verify` |
 | `show --no-patch` / `--stat` / `<rev>:<path>` / `<blob>` | `cli.object-readback` | commit 元数据、统计、历史文件内容、文本 blob 与 binary blob 元数据可观察 |
 | `show-ref --head` / `--no-head` / `--heads` / `--branches` / `--no-branches` / `--tags` / `--no-tags` / `--hash[=<n>]` / `--no-hash` / `--abbrev[=<n>]` / `--no-abbrev` / `--dereference` / `--no-dereference` / `--exists` / `--no-exists` / `--verify` / `--no-verify` / `--exclude-existing[=<pattern>]` / pattern | `cli.object-readback`, `cli.show-ref-exclude-existing` | HEAD/分支引用可列出且 reset aliases 可恢复默认范围，annotated tag peel、完整 refname 存在性、精确验证、hash-only/abbrev 输出、stdin filter、pattern 过滤和缺失 ref 退出码可观察 |
 | `for-each-ref --points-at <object>` | `cli.object-readback` | branch、lightweight tag 和 annotated tag peeled target 过滤可观察，JSON envelope 可用 |
@@ -215,7 +217,7 @@
 |---|---|---|
 | `notes add/show/list/remove` `--ref` | `cli.notes-smoke` | 已注册：add + show/list（文本与 `--json`）、自定义 `--ref` 命名空间、无 `-f` 重复 add 的 'already has a note' 稳定错误、remove 后清空，并运行 fsck |
 | `ls-tree` | `cli.ls-tree-smoke` | 已公开基础 tree inspection：默认输出、递归路径过滤、`--name-only`、JSON envelope、缺失路径负向和 fsck |
-| `cat-file -t/-s/-p/-e <object>` | `cli.object-readback` | object 类型、大小、内容和存在性退出码可观察 |
+| `cat-file -t/-s/-p/-e <object>` / typed peel / `REV:path` | `cli.object-readback`、`cli.sha256-object-readback` | object 类型、大小、内容、存在性退出码和共享严格 resolver 可观察 |
 | `cat-file --ai*` | 无（显式排除） | AI object inspection 属 Libra AI 扩展，不纳入 Git 兼容黑盒计划 |
 | `hash-object -w` / `--stdin` / `--path` / `--no-filters` / `-t` | `cli.object-readback`、`cli.sha256-object-readback` | blob 写入、stdin 输入、路径上下文/no-filters 兼容入口、类型校验和 sha256 object id 可观察 |
 | `show --no-patch` / `<rev>:<path>` / `<blob>` | `cli.object-readback` | commit 元数据、历史文件内容和 blob 内容可观察 |

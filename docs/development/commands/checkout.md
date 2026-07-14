@@ -2,7 +2,7 @@
 
 ## 命令实现目标
 
-`libra checkout` 的目标是保留 Git 兼容入口，同时把分支切换和文件恢复分别引导到 `switch` 与 `restore` 的清晰模型。当前实现覆盖分支切换、`-b <name> [<start-point>]` 创建并切换、`-B <name> [<start-point>]` 强制创建/重置并切换、`--orphan <name>` unborn root 分支创建、`checkout <commit>` detached HEAD，以及 `checkout -- <path>` 恢复别名。
+`libra checkout` 的目标是保留 Git 兼容入口，同时把分支切换和文件恢复分别引导到 `switch` 与 `restore` 的清晰模型。当前实现覆盖分支切换、previous-checkout `-`、`-b <name> [<start-point>]` 创建并切换、`-B <name> [<start-point>]` 强制创建/重置并切换、`--orphan <name>` unborn root 分支创建、`checkout <commit>` detached HEAD，以及 `checkout -- <path>` 恢复别名。
 
 ## 对比 Git 与兼容性
 
@@ -35,6 +35,8 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-07-14（plan-20260708 P1-12）：branch/detached checkout 改用 switch 模块的共享导航 helper，以单一 DB transaction 更新 HEAD 并写 `checkout` action 的 worktree-scoped reflog；`checkout -` 复用 `resolve_previous_checkout_target`，分支来源跟随当前 tip、detached 来源用完整 `old_oid`，且能与 `switch -` 跨命令切换。无可解析目标或损坏/读取失败均不修改 HEAD/index/worktree。回归 target：`compat_previous_branch_shortcut`。
+- 2026-07-14（plan-20260708 P1-10）：branch/detached checkout 与显式路径恢复成功后 advisory 运行 `.libra/hooks/post-checkout <old> <new> <flag>`（branch=`1`、path=`0`）；show-current 与 already-on no-op 不运行，`LIBRA_NO_HOOKS=1` 显式绕过。回归 target：`compat_libra_hooks_lifecycle`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-05-17 `d11ed7ca`（`feat(checkout): complete CheckoutError typed enum + remote proxy error layering`）：基础实现节点：complete CheckoutError typed enum + remote proxy error layering；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-04 `b00c9532`（`feat(checkout): implement --ours, --theirs conflict path checkout and --force switch (v0.17.1304)`）：功能演进：implement --ours, --theirs conflict path checkout and --force switch (v0.17.1304)；该节点扩展了当前命令可用的参数或行为。
@@ -52,7 +54,7 @@ flowchart TD
 - 公开状态：已公开；模块状态：已导出。
 - 用户文档：`docs/commands/checkout.md`。
 - Synopsis：`libra checkout [-b <new_branch> [<start-point>]] [-B <new_branch> [<start-point>]] [--orphan <new_branch>] [-t] [--ignore-other-worktrees] [--no-progress] [--no-overlay] [<branch>] [-- <pathspec>...]`。
-- 公开参数/子命令包括：`[<branch>]`、`-b <new_branch> [<start-point>]`、`-B <new_branch> [<start-point>]`、`--orphan <new_branch>`、`-f, --force`、`-d, --detach`、`-t, --track`、`--ignore-other-worktrees`（实际 bypass：`switch_branch_with_output` 默认拒绝切到另一个 linked worktree 已 checkout 的共享分支；该标志把 `ignore_other_worktrees` 传入分支切换路径并跳过该保护）、`--no-progress`（接受式 no-op：Libra 的 checkout 从不渲染进度条；字段 `no_progress` 解析后不被读取）、`--no-overlay`（接受式 no-op：Libra 的 checkout 从不处于 overlay 模式，已是 Git 默认；字段 `no_overlay` 解析后不被读取。Git 的反向 `--overlay` 未实现）、`-- <pathspec>...`。`-b` / `-B` 先解析可选 start-point（提交、标签或分支）并完成工作树预检，成功后 `HEAD` 必须是 `refs/heads/<new_branch>`；无效 start-point 或预检失败不会移动 `HEAD`。`--orphan` 通过 `switch::switch_to_orphan_branch` 设置 unborn symbolic HEAD，不生成占位 commit，不恢复空树；首个用户提交从保留的 index 生成无 parent root commit。当前 checkout orphan 不支持额外 start-point，传入时按 usage error fail-closed 且不移动 HEAD。`-d`/`--detach` 让分支名也走 detached 路径：`checkout --detach <branch>` 在该分支的提交处 detach HEAD（而非切换到分支），复用现有 `checkout_detached`；同时跳过 "already-on" 短路（`--detach <当前分支>` 仍会 detach）。`-t`/`--track` 为接受式 no-op：Libra 在 checkout 远程跟踪分支时本就通过 DWIM 配置 upstream（`set_upstream_safe_with_output`，action `track`），故 `--track` 请求的正是已有行为；对非远程目标无效果（与 Git 严格语义略有差异）；独立显式跟踪请用 `switch --track`。
+- 公开参数/子命令包括：`[<branch>]`（字面量 `-` 表示上一 checkout 目标）、`-b <new_branch> [<start-point>]`、`-B <new_branch> [<start-point>]`、`--orphan <new_branch>`、`-f, --force`、`-d, --detach`、`-t, --track`、`--ignore-other-worktrees`（实际 bypass：`switch_branch_with_output` 默认拒绝切到另一个 linked worktree 已 checkout 的共享分支；该标志把 `ignore_other_worktrees` 传入分支切换路径并跳过该保护）、`--no-progress`（接受式 no-op：Libra 的 checkout 从不渲染进度条；字段 `no_progress` 解析后不被读取）、`--no-overlay`（接受式 no-op：Libra 的 checkout 从不处于 overlay 模式，已是 Git 默认；字段 `no_overlay` 解析后不被读取。Git 的反向 `--overlay` 未实现）、`-- <pathspec>...`。branch/detached navigation 使用共享 `checkout_to_branch` / `checkout_to_commit` 路径写正确 `checkout` reflog；`checkout -` 因而可重复或与 `switch -` 交替切换。`-b` / `-B` 先解析可选 start-point（提交、标签或分支）并完成工作树预检，成功后 `HEAD` 必须是 `refs/heads/<new_branch>`；无效 start-point 或预检失败不会移动 `HEAD`。`--orphan` 通过 `switch::switch_to_orphan_branch` 设置 unborn symbolic HEAD，不生成占位 commit，不恢复空树；首个用户提交从保留的 index 生成无 parent root commit。当前 checkout orphan 不支持额外 start-point，传入时按 usage error fail-closed 且不移动 HEAD。`-d`/`--detach` 让分支名也走 detached 路径：`checkout --detach <branch>` 在该分支的提交处 detach HEAD（而非切换到分支），复用现有 `checkout_detached`；同时跳过 "already-on" 短路（`--detach <当前分支>` 仍会 detach）。`-t`/`--track` 为接受式 no-op：Libra 在 checkout 远程跟踪分支时本就通过 DWIM 配置 upstream（`set_upstream_safe_with_output`，action `track`），故 `--track` 请求的正是已有行为；对非远程目标无效果（与 Git 严格语义略有差异）；独立显式跟踪请用 `switch --track`。
 - `-f`/`--force`：在工作树/索引与 HEAD 有差异时仍切换，丢弃对**已跟踪**文件的本地修改（由 `restore_to_commit` 覆盖写回目标内容）。**有意安全差异**：即使带 `-f` 也仍拒绝覆盖会被目标分支写入的**未跟踪**文件（独立调用 `switch::ensure_no_untracked_overwrite`，避免静默丢失未跟踪数据），返回 128。
 - 显式路径恢复（`checkout [<tree-ish>] -- <pathspec>...`）复用 restore 的 typed target 路径与共享 pathspec matcher：source tree 中 mode `120000` 的条目恢复为 symlink；非 Unix / 不支持平台返回明确 unsupported 诊断，不写普通文件替代；pathspec magic 支持 plain prefix、wildcard、`top`/`glob`/`literal`/`icase`/`exclude` 等高价值 magic。
 

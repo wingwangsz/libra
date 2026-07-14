@@ -170,29 +170,21 @@ fn test_diff_progress_none_suppresses_scan_progress() {
 }
 
 #[test]
-fn test_diff_non_default_algorithm_fails_instead_of_silent_noop() {
+fn test_diff_non_default_algorithm_executes() {
     let repo = create_committed_repo_via_cli();
     fs::write(repo.path().join("tracked.txt"), "tracked\nupdated\n").unwrap();
 
-    let output = run_libra_command(&["diff", "--algorithm", "myers"], repo.path());
-    assert_eq!(output.status.code(), Some(129));
+    let output = run_libra_command(&["diff", "--algorithm", "patience"], repo.path());
+    assert_cli_success(&output, "diff --algorithm patience");
     assert!(
-        output.stdout.is_empty(),
-        "unsupported algorithm must not emit a best-effort diff to stdout: {}",
+        String::from_utf8_lossy(&output.stdout).contains("diff --git"),
+        "non-default algorithm should emit a patch: {}",
         String::from_utf8_lossy(&output.stdout)
     );
     let stderr = String::from_utf8_lossy(&output.stderr);
     assert!(
-        stderr.contains("diff --algorithm=myers is not supported yet"),
-        "unsupported algorithm should be explicit, stderr={stderr}"
-    );
-    assert!(
-        stderr.contains("Error-Code: LBR-CLI-002"),
-        "unsupported algorithm should carry a stable CLI error code, stderr={stderr}"
-    );
-    assert!(
-        !stderr.contains("Scanning working tree"),
-        "algorithm validation should fail before the worktree scan, stderr={stderr}"
+        stderr.contains("Scanning working tree"),
+        "algorithm should reach the normal worktree scan, stderr={stderr}"
     );
 }
 
@@ -947,7 +939,7 @@ async fn test_diff_algorithms() {
     // Create a file with some content to make a non-trivial diff
     create_file(
         "file1.txt",
-        "Line 1\nLine 2\nLine 3\nLine 4\nLine 5\nLine 6\nLine 7\n",
+        "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n",
     );
 
     add::execute(AddArgs {
@@ -986,58 +978,57 @@ async fn test_diff_algorithms() {
     // Make complex changes to test different algorithms
     modify_file(
         "file1.txt",
-        "Line 1\nModified Line\nLine 3\nNew Line\nLine 5\nLine 6\nDeleted Line 7\n",
+        "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n",
     );
 
-    // Test histogram algorithm
-    let histogram_file = output_dir.path().join("histogram_diff.txt");
-    let histogram_str = histogram_file.to_str().unwrap();
-    let args = DiffArgs::parse_from([
-        "diff",
-        "--algorithm",
-        "histogram",
-        "--output",
-        histogram_str,
-    ]);
-    diff::execute(args).await;
-
-    // Non-default algorithms are accepted by clap for forward
-    // compatibility but fail closed until the backend is actually wired.
+    // Every named backend must execute, and the readability-oriented Patience
+    // backend must not silently reuse Myers on this reordered-function fixture.
     let myers_file = output_dir.path().join("myers_diff.txt");
     let myers_str = myers_file.to_str().unwrap();
     let args = DiffArgs::parse_from(["diff", "--algorithm", "myers", "--output", myers_str]);
-    let myers_result = diff::execute_safe(args, &OutputConfig::default()).await;
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Myers backend should execute");
 
     let myers_min_file = output_dir.path().join("myersMinimal_diff.txt");
     let myers_min_str = myers_min_file.to_str().unwrap();
-    let args = DiffArgs::parse_from([
-        "diff",
-        "--algorithm",
-        "myersMinimal",
-        "--output",
-        myers_min_str,
-    ]);
-    let myers_min_result = diff::execute_safe(args, &OutputConfig::default()).await;
+    let args = DiffArgs::parse_from(["diff", "--minimal", "--output", myers_min_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("minimal Myers backend should execute");
 
+    let patience_file = output_dir.path().join("patience_diff.txt");
+    let patience_str = patience_file.to_str().unwrap();
+    let args = DiffArgs::parse_from(["diff", "--patience", "--output", patience_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Patience backend should execute");
+
+    let histogram_file = output_dir.path().join("histogram_diff.txt");
+    let histogram_str = histogram_file.to_str().unwrap();
+    let args = DiffArgs::parse_from(["diff", "--histogram", "--output", histogram_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Histogram backend should execute");
+
+    let anchored_file = output_dir.path().join("anchored_diff.txt");
+    let anchored_str = anchored_file.to_str().unwrap();
+    let args = DiffArgs::parse_from(["diff", "--anchored=void alpha", "--output", anchored_str]);
+    diff::execute_safe(args, &OutputConfig::default())
+        .await
+        .expect("Anchored backend should execute");
+
+    let myers = fs::read_to_string(&myers_file).unwrap();
+    let myers_min = fs::read_to_string(&myers_min_file).unwrap();
+    let patience = fs::read_to_string(&patience_file).unwrap();
+    let histogram = fs::read_to_string(&histogram_file).unwrap();
+    let anchored = fs::read_to_string(&anchored_file).unwrap();
+    assert_eq!(myers_min, myers, "minimal uses the exact Myers edit script");
+    assert_ne!(patience, myers, "Patience must use different anchors here");
+    assert!(histogram.contains("diff --git"), "Histogram emits a patch");
     assert!(
-        fs::metadata(&histogram_file).is_ok(),
-        "Histogram output file should exist"
-    );
-    assert!(
-        myers_result.is_err(),
-        "Myers should fail closed until a real backend is wired"
-    );
-    assert!(
-        myers_min_result.is_err(),
-        "MyersMinimal should fail closed until a real backend is wired"
-    );
-    assert!(
-        !myers_file.exists(),
-        "unsupported Myers should not write a default diff to the output file"
-    );
-    assert!(
-        !myers_min_file.exists(),
-        "unsupported MyersMinimal should not write a default diff to the output file"
+        anchored.lines().any(|line| line == " void alpha() {"),
+        "Anchored keeps the selected unique line as context:\n{anchored}"
     );
 }
 
@@ -2057,6 +2048,101 @@ fn test_diff_word_diff_modes() {
     );
     // `--word-diff=plain` is identical to the default.
     assert_eq!(plain, body(&["--word-diff=plain"]));
+
+    // Plain mode stays bracketed even when global color is forced. Previously
+    // terminal/color state leaked into the renderer and silently changed plain
+    // mode into a bracket-less color diff.
+    let forced_plain =
+        run_libra_command(&["--color=always", "diff", "--word-diff=plain", "w.txt"], p);
+    assert_cli_success(&forced_plain, "forced-color plain word-diff");
+    let forced_plain = String::from_utf8_lossy(&forced_plain.stdout);
+    assert!(
+        forced_plain.contains("[-beta-]{+BETA+}"),
+        "plain mode remains bracketed: {forced_plain}"
+    );
+    assert!(
+        !forced_plain.contains("\u{1b}["),
+        "plain word-diff bypasses line colorization: {forced_plain}"
+    );
+
+    // The bare Git-compatible shorthand selects color word diff and forces
+    // word colors under the automatic policy even though the test captures
+    // (redirects) stdout. Explicit global --color=never remains authoritative.
+    let color_words = run_libra_command(&["diff", "--color-words", "w.txt"], p);
+    assert_cli_success(&color_words, "diff --color-words");
+    let color_words = String::from_utf8_lossy(&color_words.stdout);
+    assert!(
+        color_words.contains("\u{1b}["),
+        "--color-words forces ANSI under auto: {color_words}"
+    );
+    assert!(
+        !color_words.contains("[-") && !color_words.contains("{+"),
+        "color shorthand has no plain markers: {color_words}"
+    );
+    let no_color_words = run_libra_command(&["--color=never", "diff", "--color-words", "w.txt"], p);
+    assert_cli_success(&no_color_words, "diff --color=never --color-words");
+    assert!(
+        !String::from_utf8_lossy(&no_color_words.stdout).contains("\u{1b}["),
+        "explicit --color=never suppresses shorthand ANSI"
+    );
+
+    // Regex-valued shorthand is accepted and retains color mode.
+    let color_words_regex = run_libra_command(&["diff", "--color-words=\\w+", "w.txt"], p);
+    assert_cli_success(&color_words_regex, "regex-valued --color-words");
+    assert!(
+        String::from_utf8_lossy(&color_words_regex.stdout).contains("\u{1b}["),
+        "regex-valued shorthand keeps forced word color"
+    );
+
+    // Custom regex matches define words; old unmatched delimiters disappear,
+    // new delimiters remain visible, and the option alone implies plain mode.
+    fs::write(p.join("regex.txt"), "foo.bar\n").expect("write regex fixture");
+    assert_cli_success(
+        &run_libra_command(&["add", "regex.txt"], p),
+        "add regex fixture",
+    );
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "regex1", "--no-verify"], p),
+        "commit regex fixture",
+    );
+    fs::write(p.join("regex.txt"), "foo,baz\n").expect("modify regex fixture");
+    let regex_plain =
+        run_libra_command(&["diff", "--word-diff-regex", "[A-Za-z]+", "regex.txt"], p);
+    assert_cli_success(&regex_plain, "diff --word-diff-regex");
+    assert!(
+        String::from_utf8_lossy(&regex_plain.stdout).contains("foo,[-bar-]{+baz+}"),
+        "regex words use the new delimiter: {}",
+        String::from_utf8_lossy(&regex_plain.stdout)
+    );
+    let regex_porcelain = run_libra_command(
+        &[
+            "diff",
+            "--word-diff=porcelain",
+            "--word-diff-regex=[A-Za-z]+",
+            "regex.txt",
+        ],
+        p,
+    );
+    assert_cli_success(&regex_porcelain, "porcelain regex word diff");
+    let regex_porcelain = String::from_utf8_lossy(&regex_porcelain.stdout);
+    assert!(
+        regex_porcelain.contains("\n foo,\n-bar\n+baz\n~\n"),
+        "regex porcelain output: {regex_porcelain}"
+    );
+
+    // Compile regexes before progress/config/diff work and fail closed.
+    let invalid_regex = run_libra_command(&["diff", "--word-diff-regex", "[", "regex.txt"], p);
+    assert_eq!(invalid_regex.status.code(), Some(129));
+    let invalid_output = format!(
+        "{}{}",
+        String::from_utf8_lossy(&invalid_regex.stdout),
+        String::from_utf8_lossy(&invalid_regex.stderr)
+    );
+    assert!(invalid_output.contains("invalid --word-diff-regex"));
+    assert!(
+        !invalid_output.contains("Scanning working tree"),
+        "invalid regex must fail before progress: {invalid_output}"
+    );
 
     // porcelain: one token per line with ` `/`-`/`+` prefixes and `~` newlines.
     let porcelain = body(&["--word-diff=porcelain"]);

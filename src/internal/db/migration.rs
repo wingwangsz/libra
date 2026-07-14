@@ -316,6 +316,12 @@ impl MigrationRunner {
     /// the down DDL entirely, so no down DDL ever runs twice for the
     /// same version. The returned `Vec` for the loser may therefore be a
     /// strict subset of `(target, current]`.
+    ///
+    /// A caller whose initial current-version read is scheduled only after
+    /// another caller has emptied the registry still receives
+    /// [`MigrationError::RollbackOnEmptyDatabase`]. At that point it did not
+    /// observe an applied version and is indistinguishable from an ordinary
+    /// rollback request against an empty database.
     pub async fn rollback_to(
         &self,
         conn: &DatabaseConnection,
@@ -747,6 +753,27 @@ pub fn builtin_migrations() -> Vec<Migration> {
             include_str!("../../../sql/migrations/2026070803_agent_audit_log.sql"),
             include_str!("../../../sql/migrations/2026070803_agent_audit_log_down.sql"),
         ),
+        // plan-20260713 DR-05c-0 (M1): per-turn coverage claim/revision gate.
+        // `agent_coverage_claim` is the write-front idempotence gate every
+        // checkpoint writer (live now, import in M4) must pass before
+        // appending to `refs/libra/traces`; `agent_coverage_revision` is the
+        // append-only per-turn version history that carries supersede
+        // relations (never `agent_checkpoint` — ADR-DR-16).
+        sql_migration(
+            2026071301,
+            "agent_coverage_gate",
+            include_str!("../../../sql/migrations/2026071301_agent_coverage_gate.sql"),
+            include_str!("../../../sql/migrations/2026071301_agent_coverage_gate_down.sql"),
+        ),
+        // plan-20260713 DR-04b (M3): OpenCode export-bridge job state —
+        // observed/processed generation counters + owner/fence lease + TTL
+        // (ADR-DR-11). Cleanup is TTL/app-driven, never session cascade.
+        sql_migration(
+            2026071401,
+            "agent_export_job",
+            include_str!("../../../sql/migrations/2026071401_agent_export_job.sql"),
+            include_str!("../../../sql/migrations/2026071401_agent_export_job_down.sql"),
+        ),
     ]
 }
 
@@ -875,9 +902,9 @@ mod tests {
         // `builtin_migrations()` so silent registry regressions surface
         // here in addition to `tests/db_migration_test.rs`.
         let runner = builtin_runner().expect("CEX-12.5 builtin registry must build clean");
-        assert_eq!(runner.len(), 23);
+        assert_eq!(runner.len(), 25);
         assert!(!runner.is_empty());
-        assert_eq!(runner.max_registered_version(), Some(2026070803));
+        assert_eq!(runner.max_registered_version(), Some(2026071401));
     }
 
     #[test]

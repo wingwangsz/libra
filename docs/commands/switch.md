@@ -8,6 +8,7 @@ Switch branches, create and switch to a new branch, or detach HEAD at a specific
 
 ```
 libra switch <branch>
+libra switch -
 libra switch -c <name> [<start-point>]
 libra switch -C <name> [<start-point>]
 libra switch --orphan <name>
@@ -20,15 +21,22 @@ libra switch [--guess | --no-guess] <branch>
 
 `libra switch` is the primary command for changing branches. It validates that the working tree is clean before switching, updates HEAD and the index, and restores the working tree to match the target commit. Unlike `libra checkout`, which exists as a Git-compatibility surface, `switch` is the recommended command for branch operations.
 
-The command supports multiple modes: switching to an existing local branch (default), creating a new branch with `-c`, force-creating or resetting a branch with `-C`, creating an unborn orphan branch with `--orphan`, detaching HEAD with `-d`, and tracking a remote branch with `--track`. When the target branch is already the current branch, the command is a no-op and skips the cleanliness check entirely.
+The command supports multiple modes: switching to an existing local branch (default), returning to the previous checkout target with `-`, creating a new branch with `-c`, force-creating or resetting a branch with `-C`, creating an unborn orphan branch with `--orphan`, detaching HEAD with `-d`, and tracking a remote branch with `--track`. When the target branch is already the current branch, the command is a no-op and skips the cleanliness check entirely.
+
+`libra switch -` selects the source of the most recent `switch` or `checkout` movement in this worktree's HEAD reflog. A branch source follows that local branch's current tip; a detached source uses the full stored object ID. Every successful movement is recorded, so repeating `switch -` toggles between the two targets. If there is no navigation record, the recorded branch was deleted, or the newest record is malformed, Libra fails before changing HEAD, the index, or the working tree.
 
 Fuzzy branch name suggestions are provided via Levenshtein distance when a branch is not found, helping catch typos without requiring exact matches.
+
+After a state-changing switch, advisory `.libra/hooks/post-checkout` receives the old
+OID, new OID, and branch flag `1`. Already-on no-ops do not invoke it. Set
+`LIBRA_NO_HOOKS=1` only for an explicit policy bypass. See
+[Repository hooks](repository-hooks.md) for sandbox and output behavior.
 
 ## Options
 
 | Flag | Long | Value | Description |
 |------|------|-------|-------------|
-| | `<branch>` | positional (optional) | Target local branch to switch to, or a commit/tag/branch when used with `--detach` |
+| | `<branch>` | positional (optional) | Target local branch, `-` for the previous checkout target, or a commit/tag/branch with `--detach` |
 | `-c` | `--create` | `<name>` | Create a new branch and switch to it |
 | `-C` | `--force-create` | `<name>` | Create a new branch or reset an existing one and switch to it |
 | | `--orphan` | `<name>` | Create a new unborn orphan branch with no parents and switch to it |
@@ -70,6 +78,14 @@ libra switch --detach v1.0             # Detach at a tag
 libra switch --detach abc1234          # Detach at a commit
 ```
 
+**`-`**: Returns to the previous branch or detached commit recorded by the latest HEAD navigation entry. The shortcut is shared with `checkout -`, so either command can toggle a movement made by the other.
+
+```bash
+libra switch topic
+libra switch -                         # Return to the prior branch
+libra switch -                         # Return to topic
+```
+
 **`--track`**: Looks up the remote-tracking reference, creates a local branch with the same name, sets upstream tracking, and switches to it. Conflicts with `--create` and `--detach`.
 
 ```bash
@@ -88,6 +104,7 @@ libra switch --no-guess feature        # Fail instead of guessing a remote branc
 
 ```bash
 libra switch main                      # Switch to an existing branch
+libra switch -                         # Return to the previous checkout target
 libra switch -c feature-x              # Create and switch to a new branch
 libra switch -c fix-123 abc1234        # Create branch from specific commit
 libra switch -C feature-x              # Reset branch to HEAD and switch
@@ -272,6 +289,7 @@ When a branch name is not found, Libra computes Levenshtein distance against all
 | Feature | Git | Libra | jj |
 |---------|-----|-------|----|
 | Switch branch | `git switch main` | `libra switch main` | `jj edit <rev>` |
+| Previous checkout target | `git switch -` | `libra switch -` | N/A |
 | Create and switch | `git switch -c feature` | `libra switch -c feature` | `jj new -m "feature"` + `jj branch create feature` |
 | Create from commit | `git switch -c fix abc1234` | `libra switch -c fix abc1234` | `jj new abc1234` + `jj branch create fix` |
 | Detach HEAD | `git switch --detach v1.0` | `libra switch --detach v1.0` | `jj edit <rev>` (always detached-like) |
@@ -292,6 +310,9 @@ Every `SwitchError` variant maps to an explicit `StableErrorCode`.
 | Missing detach target | `LBR-CLI-002` | 129 | "provide a commit, tag, or branch to detach at." |
 | Missing branch name | `LBR-CLI-002` | 129 | "provide a branch name." |
 | Branch not found | `LBR-CLI-003` | 129 | "create it with 'libra switch -c {name}'." + fuzzy suggestions |
+| No resolvable previous checkout target | `LBR-CLI-003` | 129 | "switch to another branch or commit first." |
+| Previous checkout reflog read failed | `LBR-IO-001` | 128 | Check `.libra/libra.db` permissions and retry. |
+| Previous checkout record is malformed or unreadable | `LBR-REPO-002` | 128 | Inspect `libra reflog show HEAD` and remove or repair the newest corrupt navigation entry. |
 | Got remote branch | `LBR-CLI-003` | 129 | "use 'libra switch --track ...' to create a local tracking branch." |
 | Remote branch not found | `LBR-CLI-003` | 129 | "Run 'libra fetch {remote}' to update remote-tracking branches." |
 | Invalid remote branch | `LBR-CLI-003` | 129 | "expected format: 'remote/branch'." |

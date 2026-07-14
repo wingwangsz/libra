@@ -30,13 +30,16 @@ pub mod adapter;
 pub mod builtin;
 pub mod capability;
 pub mod compliance;
+pub mod coverage;
 pub mod derived;
 pub mod extract;
+pub mod opencode_export;
 pub mod preview;
 pub mod redaction;
 pub mod registry;
 pub mod rpc;
 pub mod skill_projection;
+pub mod transcript_source;
 pub mod trust;
 
 pub use adapter::{
@@ -48,14 +51,21 @@ use builtin::stable_promoted::{
     FACTORY_AI_STABLE_PROMOTED_SPEC, OPENCODE_STABLE_PROMOTED_SPEC,
 };
 pub use builtin::{
-    ClaudeCodeObservedAgent, GeminiObservedAgent, STABLE_PROMOTED_SPECS, StablePromotedAgent,
-    rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for, write_truncated_transcript,
+    ClaudeCodeObservedAgent, FlushOutcome, GeminiObservedAgent, STABLE_PROMOTED_SPECS,
+    StablePromotedAgent, claude_project_slug, claude_session_dir, find_codex_rollout, flush_wait,
+    resolve_session_file, rfc3339_boundary_for_unix_seconds, stable_promoted_spec_for,
+    write_truncated_transcript,
 };
 pub use capability::{
     CapabilityDeclarer, DeclaredAgentCaps, HookResponseWriter, ModelExtractor, PromptExtractor,
     SkillEvent, SkillEventExtractor, SkillEventSignal, SkillEventSource, SkillEventType, SkillRef,
     SubagentAwareExtractor, TextGenerator, TokenCalculator, TranscriptAnalyzer,
     TranscriptCompactor, TranscriptPreparer,
+};
+pub use coverage::{
+    COVERAGE_SCHEMA_VERSION, CanonValue, Completeness, NormalizedTurn, SemanticRecord,
+    canonical_turn_bytes, coverage_digest_hex, normalize_claude_transcript,
+    normalize_opencode_export, parse_canon_value,
 };
 pub use derived::derive_tool_call_records;
 pub use preview::{PREVIEW_SPECS, PreviewAgent, PreviewSpec, is_preview, preview_spec_for};
@@ -73,6 +83,11 @@ pub use rpc::{
 pub use skill_projection::{
     DiscoveredSkill, IndexedSkillEvent, SKILL_PROJECTION_SCHEMA_VERSION, SkillEventProjection,
     SkillQuery, discover_skills,
+};
+pub use transcript_source::{
+    AuthorizedTranscriptFile, ExportAuthorized, ProviderRootAuthorized,
+    TRANSCRIPT_READ_HARD_CAP_BYTES, TranscriptSource, resolve_transcript_source,
+    transcript_path_within_provider_root,
 };
 pub use trust::{
     DEFAULT_TRUSTED_DIRS, ENV_ALLOWLIST_EXTRA_KEY, EXTERNAL_AGENTS_ENABLED_KEY, Provenance,

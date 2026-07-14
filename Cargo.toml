@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.65"
+version = "0.18.84"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -18,6 +18,7 @@ test-network   = []   # L2: tests requiring outbound network but no secrets
 test-live-ai   = []   # L3: tests calling real LLM APIs
 test-live-cloud = []  # L3: tests hitting real D1/R2 endpoints
 test-provider  = []   # deterministic hidden provider for local TUI automation tests
+test-live-agent = [] # plan-20260713 live agent gate: real local claude/codex/opencode CLI data (dev machine acceptance; env LIBRA_RUN_LIVE_AGENT_GATE=1)
 fastcdc        = []   # lore.md §6: default-OFF FastCDC LFS media chunking client substrate (no new deps; reuses ring sha256; server protocol frozen)
 subagent-scaffold = []  # CEX-S2-10 schema-only scaffold (Step 2 sub-agent contracts; gated on CP-4 in production — see docs/development/tracing/agent.md "Step 2 audit closure")
 otlp = ["dep:opentelemetry", "dep:opentelemetry_sdk", "dep:opentelemetry-otlp", "dep:tracing-opentelemetry"]  # lore.md 1.7: OTLP trace export (default binary unaffected)
@@ -91,7 +92,7 @@ url = "2.5.8"
 walkdir = "2.5.0"
 wax = "0.7.0"
 diffs = "0.5.1"
-similar = "2.7.0"
+similar = "3.1.1"
 path-absolutize = "3.1.1"
 infer = "0.19.0"
 pathdiff = "0.2.3"
@@ -321,6 +322,14 @@ name = "compat_checkout_branch_startpoint"
 path = "tests/compat/checkout_branch_startpoint_test.rs"
 
 [[test]]
+name = "compat_previous_branch_shortcut"
+path = "tests/compat/previous_branch_shortcut_test.rs"
+
+[[test]]
+name = "compat_mail_am_basic"
+path = "tests/compat/mail_am_basic_test.rs"
+
+[[test]]
 name = "compat_switch_orphan_root"
 path = "tests/compat/switch_orphan_root_test.rs"
 
@@ -396,6 +405,18 @@ path = "tests/compat/noninteractive_history_controls_test.rs"
 name = "compat_diff_review_options"
 path = "tests/compat/diff_review_options_test.rs"
 
+[[test]]
+name = "compat_rev_parse_peel_selectors"
+path = "tests/compat/rev_parse_peel_selectors_test.rs"
+
+[[test]]
+name = "compat_libra_hooks_lifecycle"
+path = "tests/compat/libra_hooks_lifecycle_test.rs"
+
+[[test]]
+name = "compat_import_export_roundtrip"
+path = "tests/compat/import_export_roundtrip_test.rs"
+
 # OTLP integration tests need the feature (excluded from `cargo test --all`
 # under default features via required-features).
 [[test]]
@@ -413,6 +434,11 @@ required-features = ["keyring"]
 # `test-live-ai` feature), require the feature so a bare `cargo test --all`
 # excludes them — a machine with DEEPSEEK_API_KEY / LIBRA_AI_LIVE_OLLAMA set
 # can no longer hit live providers in default L1 (C3, codex review).
+[[test]]
+name = "agent_live_gate_test"
+path = "tests/agent_live_gate_test.rs"
+required-features = ["test-live-agent"]
+
 [[test]]
 name = "ai_agent_test"
 path = "tests/ai_agent_test.rs"

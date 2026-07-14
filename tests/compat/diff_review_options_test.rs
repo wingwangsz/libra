@@ -101,6 +101,227 @@ fn staged_change_matrix(fixture: &Fixture, name: &str) -> PathBuf {
 }
 
 #[test]
+fn algorithm_selectors_execute_real_backends_and_obey_precedence() {
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("algorithms");
+    let old = "void alpha() {\n    one();\n}\n\nvoid beta() {\n    two();\n}\n";
+    let new = "void beta() {\n    two();\n}\n\nvoid alpha() {\n    one();\n}\n";
+    fs::write(repo.join("code.c"), old).expect("write algorithm base");
+    fixture.commit_all(&repo, "algorithm base");
+    fs::write(repo.join("code.c"), new).expect("reorder functions");
+
+    let default = stdout(&fixture.success(&repo, &["diff", "--", "code.c"]));
+    let myers = stdout(&fixture.success(&repo, &["diff", "--algorithm=myers", "--", "code.c"]));
+    let minimal = stdout(&fixture.success(&repo, &["diff", "--minimal", "--", "code.c"]));
+    let named_minimal =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=myersMinimal", "--", "code.c"]));
+    let patience = stdout(&fixture.success(&repo, &["diff", "--patience", "--", "code.c"]));
+    let named_patience =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=patience", "--", "code.c"]));
+    let histogram = stdout(&fixture.success(&repo, &["diff", "--histogram", "--", "code.c"]));
+    let named_histogram =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=histogram", "--", "code.c"]));
+    let anchored_alpha =
+        stdout(&fixture.success(&repo, &["diff", "--anchored=void alpha", "--", "code.c"]));
+    let anchored_beta =
+        stdout(&fixture.success(&repo, &["diff", "--anchored=void beta", "--", "code.c"]));
+
+    assert_eq!(default, myers, "Myers is the truthful default");
+    assert_eq!(minimal, myers, "Myers already computes a shortest script");
+    assert_eq!(named_minimal, minimal, "named and shorthand minimal agree");
+    assert_ne!(patience, myers, "Patience uses different anchors here");
+    assert_eq!(
+        named_patience, patience,
+        "named and shorthand Patience agree"
+    );
+    assert_eq!(
+        named_histogram, histogram,
+        "named and shorthand Histogram agree"
+    );
+    assert!(
+        anchored_alpha.lines().any(|line| line == " void alpha() {"),
+        "the unique alpha line stays context:\n{anchored_alpha}"
+    );
+    assert!(
+        !anchored_alpha
+            .lines()
+            .any(|line| line == "-void alpha() {" || line == "+void alpha() {"),
+        "the selected anchor must not surface as delete+insert:\n{anchored_alpha}"
+    );
+
+    let retained_across_histogram = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--anchored=void alpha",
+            "--histogram",
+            "--anchored=void beta",
+            "--",
+            "code.c",
+        ],
+    ));
+    let cleared_by_patience = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--anchored=void alpha",
+            "--patience",
+            "--anchored=void beta",
+            "--",
+            "code.c",
+        ],
+    ));
+    assert_eq!(
+        retained_across_histogram, anchored_alpha,
+        "histogram leaves the earlier alpha anchor available when anchored is reselected"
+    );
+    assert_eq!(
+        cleared_by_patience, anchored_beta,
+        "the patience shorthand clears the earlier alpha anchor"
+    );
+
+    let histogram_last = stdout(&fixture.success(
+        &repo,
+        &["diff", "--patience", "--histogram", "--", "code.c"],
+    ));
+    let patience_last = stdout(&fixture.success(
+        &repo,
+        &["diff", "--histogram", "--patience", "--", "code.c"],
+    ));
+    assert_eq!(histogram_last, histogram, "last algorithm selector wins");
+    assert_eq!(patience_last, patience, "last algorithm selector wins");
+
+    let myers_filtered = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--algorithm=myers",
+            "-w",
+            "--ignore-blank-lines",
+            "--",
+            "code.c",
+        ],
+    ));
+    let patience_filtered = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--patience",
+            "-w",
+            "--ignore-blank-lines",
+            "--",
+            "code.c",
+        ],
+    ));
+    assert_ne!(
+        patience_filtered, myers_filtered,
+        "whitespace/blank re-diff must retain the selected backend"
+    );
+    let anchored_filtered = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--anchored=void alpha",
+            "-w",
+            "--ignore-blank-lines",
+            "--",
+            "code.c",
+        ],
+    ));
+    assert!(
+        anchored_filtered
+            .lines()
+            .any(|line| line == " void alpha() {"),
+        "whitespace/blank re-diff must retain anchors:\n{anchored_filtered}"
+    );
+
+    fs::write(repo.join(".libra_attributes"), "*.c diff=identity\n")
+        .expect("write textconv attributes");
+    fixture.success(&repo, &["config", "set", "diff.identity.textconv", "cat"]);
+    let myers_textconv =
+        stdout(&fixture.success(&repo, &["diff", "--algorithm=myers", "--", "code.c"]));
+    let patience_textconv =
+        stdout(&fixture.success(&repo, &["diff", "--patience", "--", "code.c"]));
+    assert_ne!(
+        patience_textconv, myers_textconv,
+        "textconv re-diff must retain the selected backend"
+    );
+    let anchored_textconv =
+        stdout(&fixture.success(&repo, &["diff", "--anchored=void alpha", "--", "code.c"]));
+    assert!(
+        anchored_textconv
+            .lines()
+            .any(|line| line == " void alpha() {"),
+        "textconv re-diff must retain anchors:\n{anchored_textconv}"
+    );
+
+    fs::rename(repo.join("code.c"), repo.join("moved.c")).expect("rename changed file");
+    fixture.success(&repo, &["add", "-A"]);
+    let myers_rename = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--algorithm=myers",
+            "--no-textconv",
+            "--",
+            "code.c",
+            "moved.c",
+        ],
+    ));
+    let patience_rename = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--patience",
+            "--no-textconv",
+            "--",
+            "code.c",
+            "moved.c",
+        ],
+    ));
+    assert!(
+        patience_rename.contains("rename from code.c"),
+        "{patience_rename}"
+    );
+    assert_ne!(
+        patience_rename, myers_rename,
+        "rename body must retain the selected backend"
+    );
+    let anchored_rename = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--anchored=void alpha",
+            "--no-textconv",
+            "--",
+            "code.c",
+            "moved.c",
+        ],
+    ));
+    assert!(anchored_rename.contains("rename from code.c"));
+    assert!(
+        anchored_rename
+            .lines()
+            .any(|line| line == " void alpha() {"),
+        "rename body must retain anchors:\n{anchored_rename}"
+    );
+
+    let invalid = fixture.run(&repo, &["diff", "--algorithm=bogus", "--", "code.c"]);
+    assert_eq!(invalid.status.code(), Some(129));
+    assert!(invalid.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(
+        stderr.contains("invalid diff algorithm 'bogus'"),
+        "{stderr}"
+    );
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    assert!(!stderr.contains("Scanning working tree"), "{stderr}");
+}
+
+#[test]
 fn raw_records_cover_add_delete_modify_rename_and_nul_mode() {
     let fixture = Fixture::new();
     let repo = staged_change_matrix(&fixture, "raw-matrix");
@@ -511,4 +732,166 @@ fn rename_detection_does_not_pair_different_file_types() {
         !output.lines().any(|line| line.starts_with('R')),
         "{output}"
     );
+}
+
+#[test]
+fn pickaxe_string_and_regex_filter_file_pairs_and_compose_with_status_filter() {
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("pickaxe-file-pairs");
+    for (path, content) in [
+        ("count.txt", "needle\n"),
+        ("moved.txt", "needle old\n"),
+        ("regex.txt", "handler_v1\n"),
+        ("unrelated.txt", "old\n"),
+        ("rename-old.txt", "stable rename needle\n"),
+    ] {
+        fs::write(repo.join(path), content).expect("write pickaxe base");
+    }
+    fs::write(repo.join("binary.bin"), b"\0binary-only").expect("write binary base");
+    fixture.commit_all(&repo, "base");
+
+    fs::write(repo.join("count.txt"), "needle\nneedle\n").expect("change count");
+    fs::write(repo.join("moved.txt"), "needle new\n").expect("edit around stable literal");
+    fs::write(repo.join("regex.txt"), "handler_v2\n").expect("change regex line");
+    fs::write(repo.join("unrelated.txt"), "new\n").expect("change unrelated file");
+    fs::write(repo.join("binary.bin"), b"\0binary-only binary-only")
+        .expect("change binary literal count");
+    fs::rename(repo.join("rename-old.txt"), repo.join("rename-new.txt"))
+        .expect("rename stable literal");
+    fs::write(repo.join("added.txt"), "new needle\n").expect("add literal");
+    fixture.success(&repo, &["add", "-A"]);
+
+    let string =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-S", "needle", "--name-only"]));
+    let selected = string.lines().collect::<Vec<_>>();
+    assert_eq!(selected.len(), 2, "{string}");
+    assert!(selected.contains(&"added.txt"), "{string}");
+    assert!(selected.contains(&"count.txt"), "{string}");
+    assert!(
+        !string.contains("moved.txt"),
+        "equal counts must not match: {string}"
+    );
+    assert!(
+        !string.contains("rename-new.txt"),
+        "exact rename must not match: {string}"
+    );
+
+    let raw = stdout(&fixture.success(&repo, &["diff", "--cached", "-Sneedle", "--raw"]));
+    assert_eq!(raw.lines().count(), 2, "{raw}");
+    assert!(raw.contains(" A\tadded.txt"), "{raw}");
+    assert!(raw.contains(" M\tcount.txt"), "{raw}");
+
+    let regex = stdout(&fixture.success(
+        &repo,
+        &["diff", "--cached", "-Ghandler_v[0-9]", "--name-only"],
+    ));
+    assert_eq!(regex.trim(), "regex.txt");
+
+    let changed_line =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-G", "needle", "--name-only"]));
+    assert!(changed_line.contains("moved.txt"), "{changed_line}");
+
+    let modified_only = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "-Sneedle",
+            "--diff-filter=M",
+            "--name-only",
+        ],
+    ));
+    assert_eq!(modified_only.trim(), "count.txt");
+
+    let binary =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-Sbinary-only", "--name-only"]));
+    assert_eq!(binary.trim(), "binary.bin", "{binary}");
+}
+
+#[test]
+fn pickaxe_validation_fails_before_worktree_progress() {
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("pickaxe-validation");
+    fs::write(repo.join("file.txt"), "content\n").expect("write fixture");
+    fixture.commit_all(&repo, "base");
+    fs::write(repo.join("file.txt"), "changed\n").expect("change fixture");
+
+    let invalid = fixture.run(&repo, &["diff", "-G", "["]);
+    assert_eq!(invalid.status.code(), Some(129));
+    assert!(invalid.stdout.is_empty());
+    let stderr = String::from_utf8_lossy(&invalid.stderr);
+    assert!(stderr.contains("LBR-CLI-002"), "{stderr}");
+    assert!(stderr.contains("invalid -G regex"), "{stderr}");
+    assert!(!stderr.contains("Scanning working tree"), "{stderr}");
+
+    let conflicting = fixture.run(&repo, &["diff", "-S", "x", "-G", "x"]);
+    assert!(!conflicting.status.success());
+
+    let empty = stdout(&fixture.success(&repo, &["diff", "-S", "", "--name-only"]));
+    assert!(empty.is_empty(), "an empty literal never matches: {empty}");
+}
+
+#[cfg(unix)]
+#[test]
+fn pickaxe_reuses_textconv_and_filters_before_external_driver() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let fixture = Fixture::new();
+    let repo = fixture.init_repo("pickaxe-drivers");
+    fs::write(repo.join(".gitattributes"), "*.dat diff=upper\n").expect("write attributes");
+    fs::write(repo.join("pick.dat"), "token\n").expect("write textconv base");
+    fs::write(repo.join("match.txt"), "old\n").expect("write match base");
+    fs::write(repo.join("other.txt"), "before\n").expect("write other base");
+    fixture.commit_all(&repo, "base");
+
+    fs::write(repo.join("pick.dat"), "token token\n").expect("change textconv file");
+    fs::write(repo.join("match.txt"), "new needle\n").expect("change matching file");
+    fs::write(repo.join("other.txt"), "after\n").expect("change other file");
+    fixture.success(&repo, &["add", "-A"]);
+    fixture.success(
+        &repo,
+        &["config", "set", "diff.upper.textconv", "tr a-z A-Z <"],
+    );
+
+    let converted =
+        stdout(&fixture.success(&repo, &["diff", "--cached", "-S", "TOKEN", "--name-only"]));
+    assert_eq!(converted.trim(), "pick.dat", "{converted}");
+    let raw = stdout(&fixture.success(
+        &repo,
+        &[
+            "diff",
+            "--cached",
+            "--no-textconv",
+            "-S",
+            "TOKEN",
+            "--name-only",
+        ],
+    ));
+    assert!(
+        raw.is_empty(),
+        "raw lowercase content must not match TOKEN: {raw}"
+    );
+
+    let driver = repo.join("path-driver.sh");
+    fs::write(&driver, "#!/bin/sh\nprintf '%s\\n' \"$1\"\n").expect("write external driver");
+    let mut permissions = fs::metadata(&driver)
+        .expect("stat external driver")
+        .permissions();
+    permissions.set_mode(0o755);
+    fs::set_permissions(&driver, permissions).expect("chmod external driver");
+    fixture.success(
+        &repo,
+        &[
+            "config",
+            "set",
+            "diff.external",
+            driver.to_str().expect("utf8 driver path"),
+        ],
+    );
+
+    let external = stdout(&fixture.success(
+        &repo,
+        &["diff", "--cached", "--no-textconv", "-S", "needle"],
+    ));
+    assert_eq!(external.trim(), "match.txt", "{external}");
 }

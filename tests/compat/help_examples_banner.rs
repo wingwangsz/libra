@@ -64,6 +64,7 @@ const VISIBLE_COMMANDS: &[&str] = &[
     "lfs",
     "ls-files",
     "worktree",
+    "am",
     "log",
     "shortlog",
     "show",
