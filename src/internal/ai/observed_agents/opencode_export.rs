@@ -467,29 +467,19 @@ pub async fn run_export_subprocess_sandboxed(
         // dir read-write (mounted after the ro HOME bind so it wins);
         // network stays unshared and everything else read-only.
         //
-        // The store is resolved rejecting a symlinked `opencode` entry, then
-        // PINNED by an O_PATH fd and bound via `/proc/self/fd/N` (Codex M3 R3
-        // P1): the RW bind references the exact validated inode, so neither a
-        // `…/opencode -> ~/.ssh` symlink nor a post-check path swap can
-        // redirect an arbitrary target into the sandbox read-write.
+        // The store is resolved and PINNED in a SINGLE atomic `openat`
+        // (Codex M3 R4 P1) that rejects a symlinked `opencode` entry
+        // (`O_NOFOLLOW`) and requires a directory (`O_DIRECTORY`); the pinned
+        // fd IS the validated directory, so a concurrent rename/exchange of
+        // `opencode` cannot make the bound directory differ from the checked
+        // one. It is bound via `/proc/self/fd/N` so the RW mount references the
+        // exact pinned inode.
         let mut keep_fds: Vec<std::os::fd::OwnedFd> = Vec::new();
-        if let Some(store) = resolve_opencode_store() {
-            match open_pinned_store(&store) {
-                Ok(fd) => {
-                    use std::os::fd::AsRawFd;
-                    let src = format!("/proc/self/fd/{}", fd.as_raw_fd());
-                    let dest = store.to_string_lossy().into_owned();
-                    extra.extend(["--bind".to_string(), src, dest]);
-                    keep_fds.push(fd);
-                }
-                Err(err) => {
-                    tracing::warn!(
-                        error = %format!("{err:#}"),
-                        store = %store.display(),
-                        "cannot pin opencode data dir for RW bind; skipping (export may degrade)"
-                    );
-                }
-            }
+        if let Some((fd, dest)) = pin_opencode_store() {
+            use std::os::fd::AsRawFd;
+            let src = format!("/proc/self/fd/{}", fd.as_raw_fd());
+            extra.extend(["--bind".to_string(), src, dest]);
+            keep_fds.push(fd);
         }
         // The trusted binary itself may live outside the standard host paths
         // (e.g. ~/.opencode/bin) — HOME ro-bind above usually covers it; add
@@ -607,12 +597,33 @@ fn validate_trusted_bwrap(candidate: &std::path::Path) -> Result<std::path::Path
     Ok(canonical)
 }
 
-/// Whether a trusted, usable bubblewrap sandbox is available on this host
-/// (resolves + integrity-validates the bwrap binary). Tests gate on this so
-/// they detect "trusted AND usable", not merely "bwrap present" (Codex M3 R3).
+/// Whether a trusted, usable bubblewrap sandbox is available on this host:
+/// the bwrap binary passes the integrity policy AND can actually create its
+/// namespaces (a bounded `--unshare-all … /bin/true` no-op probe). Tests gate
+/// on this so they detect "trusted AND usable", not merely "bwrap present" —
+/// on a host with unprivileged user namespaces disabled the probe fails and
+/// the tests skip instead of running and failing (Codex M3 R4 P2).
 #[cfg(target_os = "linux")]
 pub fn trusted_bwrap_available() -> bool {
-    resolve_trusted_bwrap().is_ok()
+    let Ok(bwrap) = resolve_trusted_bwrap() else {
+        return false;
+    };
+    std::process::Command::new(&bwrap)
+        .args([
+            "--unshare-all",
+            "--die-with-parent",
+            "--ro-bind",
+            "/",
+            "/",
+            "--",
+            "/bin/true",
+        ])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|status| status.success())
+        .unwrap_or(false)
 }
 
 /// Non-Linux hosts have no bwrap sandbox — the export capability is
@@ -622,14 +633,11 @@ pub fn trusted_bwrap_available() -> bool {
     false
 }
 
-/// Resolve the OpenCode WAL store to a CANONICAL directory strictly contained
-/// under the approved data root (Codex M3 R2 P1-5). A bare `is_dir()` follows
-/// symlinks, so a planted `…/opencode -> ~/.ssh` would be bound READ-WRITE.
-/// Canonicalizing both the base and the store and requiring containment
-/// rejects that (and `..`-based escapes); on rejection we skip the RW bind and
-/// let the export fail closed rather than expose an arbitrary target.
+/// Pin the OpenCode WAL store for a race-safe RW bind, returning the pinned fd
+/// and the sandbox destination path (where the exporter expects its store).
+/// Reads the data root from `XDG_DATA_HOME` (absolute) or `HOME/.local/share`.
 #[cfg(target_os = "linux")]
-fn resolve_opencode_store() -> Option<std::path::PathBuf> {
+fn pin_opencode_store() -> Option<(std::os::fd::OwnedFd, String)> {
     let base = std::env::var_os("XDG_DATA_HOME")
         .map(std::path::PathBuf::from)
         .filter(|p| p.is_absolute())
@@ -638,57 +646,75 @@ fn resolve_opencode_store() -> Option<std::path::PathBuf> {
                 .map(std::path::PathBuf::from)
                 .map(|h| h.join(".local/share"))
         })?;
-    resolve_opencode_store_under(&base)
-}
-
-/// Resolution core (testable without env mutation): canonicalize `base`, then
-/// stat its literal `opencode` child WITHOUT following a final symlink. A
-/// symlinked `opencode` entry (e.g. `-> ~/.ssh` or `-> .`) is rejected here
-/// rather than canonicalized-and-contained — canonicalize FOLLOWS the symlink,
-/// so a `-> ~/.ssh` under an attacker-set `XDG_DATA_HOME=$HOME` would spuriously
-/// pass a "contained under base" test. Returns the real directory path; the
-/// caller pins it by fd before binding (Codex M3 R3 P1).
-#[cfg(target_os = "linux")]
-fn resolve_opencode_store_under(base: &std::path::Path) -> Option<std::path::PathBuf> {
-    let base = std::fs::canonicalize(base).ok()?;
-    let entry = base.join("opencode");
-    let meta = std::fs::symlink_metadata(&entry).ok()?;
-    if meta.file_type().is_symlink() || !meta.is_dir() {
-        tracing::warn!(
-            entry = %entry.display(),
-            "opencode data dir is a symlink or not a directory; refusing RW bind"
-        );
-        return None;
+    match pin_store_under(&base) {
+        Ok(fd) => {
+            let dest = base.join("opencode").to_string_lossy().into_owned();
+            Some((fd, dest))
+        }
+        Err(err) => {
+            tracing::warn!(
+                error = %format!("{err:#}"),
+                base = %base.display(),
+                "cannot pin opencode data dir for RW bind; skipping (export may degrade)"
+            );
+            None
+        }
     }
-    Some(entry)
 }
 
-/// Pin a directory by an `O_PATH` fd for a race-safe `/proc/self/fd/N` bind
-/// (Codex M3 R3 P1). `O_NOFOLLOW` rejects a final-component symlink swapped in
-/// after resolution, `O_DIRECTORY` requires a directory, and CLOEXEC is
-/// cleared so the bwrap child inherits the fd and can resolve `/proc/self/fd/N`
-/// when it establishes the bind mount.
+/// Resolution + pin as ONE atomic `openat` (Codex M3 R4 P1): open the data
+/// root, then `openat` the literal `opencode` entry with
+/// `O_PATH|O_DIRECTORY|O_NOFOLLOW`. Because the returned fd IS the validated
+/// directory — there is no separate `stat` then re-`open` of the same path —
+/// a concurrent rename/exchange of `opencode` between validation and bind
+/// cannot make the bound directory differ from the checked one. `O_NOFOLLOW`
+/// rejects a symlinked entry; `O_DIRECTORY` requires a directory. CLOEXEC is
+/// cleared so the bwrap child inherits the fd for `/proc/self/fd/N` resolution.
 #[cfg(target_os = "linux")]
-fn open_pinned_store(dir: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
-    use std::os::{fd::FromRawFd, unix::ffi::OsStrExt};
+fn pin_store_under(base: &std::path::Path) -> Result<std::os::fd::OwnedFd> {
+    use std::os::{
+        fd::{AsRawFd, FromRawFd},
+        unix::ffi::OsStrExt,
+    };
 
-    let cpath =
-        std::ffi::CString::new(dir.as_os_str().as_bytes()).context("store path contains NUL")?;
-    // SAFETY: `cpath` is a valid NUL-terminated C string for the duration of
-    // the call; the returned fd is wrapped in OwnedFd for RAII.
-    let raw = unsafe {
+    let base_c = std::ffi::CString::new(base.as_os_str().as_bytes())
+        .context("data root path contains NUL")?;
+    // Anchor the child lookup to a handle on the data root. Following symlinks
+    // in the root's own ancestry is fine — only the final `opencode` component
+    // must not be a symlink, which the openat below enforces.
+    // SAFETY: base_c is a valid C string; the fd is wrapped for RAII below.
+    let base_raw = unsafe {
         libc::open(
-            cpath.as_ptr(),
+            base_c.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if base_raw < 0 {
+        return Err(std::io::Error::last_os_error())
+            .with_context(|| format!("open opencode data root {}", base.display()));
+    }
+    // SAFETY: fresh owned fd from open(2).
+    let base_fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(base_raw) };
+
+    // INVARIANT: a constant literal with no interior NUL.
+    let name = std::ffi::CString::new("opencode").expect("literal has no NUL");
+    // SAFETY: base_fd is a valid dir fd; name is a valid C string; the result
+    // is wrapped for RAII.
+    let raw = unsafe {
+        libc::openat(
+            base_fd.as_raw_fd(),
+            name.as_ptr(),
             libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         )
     };
     if raw < 0 {
         return Err(std::io::Error::last_os_error())
-            .with_context(|| format!("pin opencode data dir {}", dir.display()));
+            .context("pin opencode store (openat, no-follow directory)");
     }
-    // SAFETY: `raw` is a fresh, owned fd we just obtained from open(2).
+    // SAFETY: fresh owned fd from openat(2).
     let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(raw) };
-    use std::os::fd::AsRawFd;
+    // Clear CLOEXEC so the bwrap child inherits it and can resolve
+    // /proc/self/fd/N when it establishes the bind mount.
     // SAFETY: fcntl on our own fd; F_GETFD/F_SETFD have no memory effects.
     let flags = unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_GETFD) };
     if flags < 0 {
@@ -897,24 +923,78 @@ mod tests {
         }
     }
 
-    /// Codex M3 R3 P1: the pinned-fd RW bind works through real bwrap — a file
-    /// the child writes inside the `/proc/self/fd/N`-bound directory lands on
-    /// the host at the pinned inode — and a symlinked entry is refused at pin
-    /// time (`O_NOFOLLOW`), so no swap can redirect the RW mount. Skips without
-    /// a trusted bwrap.
+    #[cfg(target_os = "linux")]
+    fn fd_inode(fd: &std::os::fd::OwnedFd) -> u64 {
+        use std::os::fd::AsRawFd;
+        // SAFETY: fstat on our own valid fd into a zeroed stat buffer.
+        let mut st: libc::stat = unsafe { std::mem::zeroed() };
+        assert_eq!(unsafe { libc::fstat(fd.as_raw_fd(), &mut st) }, 0, "fstat");
+        st.st_ino as u64
+    }
+
+    /// Codex M3 R4 P1: the store pin is a SINGLE atomic `openat`, so a
+    /// concurrent rename of `opencode` AFTER the pin cannot make the pinned fd
+    /// refer to a different directory — the bound inode stays the checked one.
+    /// A symlinked entry is refused at pin time (`O_NOFOLLOW`).
     #[cfg(target_os = "linux")]
     #[test]
-    fn open_pinned_store_binds_rw_through_bwrap() {
-        use std::os::fd::AsRawFd;
-        let Some(bwrap) = which_bwrap().filter(|b| validate_trusted_bwrap(b).is_ok()) else {
-            eprintln!("skipped (no trusted bwrap)");
-            return;
-        };
+    fn pin_store_under_captures_inode_atomically() {
+        use std::os::unix::fs::MetadataExt;
         let tmp = tempfile::tempdir().unwrap();
-        let store = tmp.path().join("opencode");
+        let base = tmp.path();
+        let store = base.join("opencode");
         std::fs::create_dir(&store).unwrap();
+        let original_ino = std::fs::metadata(&store).unwrap().ino();
 
-        let fd = open_pinned_store(&store).expect("pin real dir");
+        let fd = pin_store_under(base).expect("pin real opencode dir");
+        assert_eq!(
+            fd_inode(&fd),
+            original_ino,
+            "pin must capture the real store"
+        );
+
+        // Swap a DIFFERENT directory over `opencode` after the pin (the empty
+        // target dir is replaced by rename). The pinned fd must not follow it.
+        let sensitive = base.join("sensitive");
+        std::fs::create_dir(&sensitive).unwrap();
+        std::fs::write(sensitive.join("secret"), "s").unwrap();
+        std::fs::rename(&sensitive, &store).unwrap();
+        assert_ne!(
+            std::fs::metadata(&store).unwrap().ino(),
+            original_ino,
+            "the swap must have replaced the path's inode"
+        );
+        assert_eq!(
+            fd_inode(&fd),
+            original_ino,
+            "pinned fd must still refer to the ORIGINAL store, not the swapped-in dir"
+        );
+
+        // A symlinked `opencode` entry is refused at pin time (O_NOFOLLOW).
+        std::fs::remove_dir_all(&store).unwrap();
+        std::os::unix::fs::symlink(base.join("elsewhere"), &store).unwrap();
+        assert!(
+            pin_store_under(base).is_err(),
+            "symlinked opencode entry must be refused at pin time"
+        );
+    }
+
+    /// Codex M3 R4 P1: the pinned-fd RW bind works through real bwrap — a file
+    /// the child writes inside the `/proc/self/fd/N`-bound directory lands on
+    /// the host at the pinned inode. Skips without a trusted, usable bwrap.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pin_store_binds_rw_through_bwrap() {
+        use std::os::fd::AsRawFd;
+        if !trusted_bwrap_available() {
+            eprintln!("skipped (no trusted, usable bwrap)");
+            return;
+        }
+        let bwrap = resolve_trusted_bwrap().expect("resolve trusted bwrap");
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("opencode")).unwrap();
+
+        let fd = pin_store_under(tmp.path()).expect("pin real dir");
         let src = format!("/proc/self/fd/{}", fd.as_raw_fd());
         let status = std::process::Command::new(&bwrap)
             .args([
@@ -936,41 +1016,9 @@ mod tests {
         drop(fd);
         assert!(status.success(), "pinned RW bind must let the child write");
         assert!(
-            store.join("probe").exists(),
+            tmp.path().join("opencode/probe").exists(),
             "child write must land on the host store via the pinned fd"
         );
-
-        // A symlinked entry is refused at pin time (O_NOFOLLOW → ELOOP).
-        let link = tmp.path().join("opencode-link");
-        std::os::unix::fs::symlink(&store, &link).unwrap();
-        assert!(
-            open_pinned_store(&link).is_err(),
-            "symlinked store must be refused at pin time"
-        );
-    }
-
-    /// Codex M3 R2/R3 P1-5: an `opencode` data dir that is a symlink must NOT
-    /// be resolved for the RW bind; a real directory is.
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn resolve_opencode_store_refuses_symlink_escape() {
-        use std::os::unix::fs::symlink;
-        let tmp = tempfile::tempdir().unwrap();
-        let base = tmp.path().join("share");
-        let secret = tmp.path().join("secret");
-        std::fs::create_dir_all(&base).unwrap();
-        std::fs::create_dir_all(&secret).unwrap();
-        // base/opencode -> ../secret : canonical target escapes the data root.
-        symlink(&secret, base.join("opencode")).unwrap();
-        assert!(
-            resolve_opencode_store_under(&base).is_none(),
-            "symlink escaping the data root must be refused"
-        );
-        // A real contained directory is accepted (canonical, under base).
-        std::fs::remove_file(base.join("opencode")).unwrap();
-        std::fs::create_dir(base.join("opencode")).unwrap();
-        let got = resolve_opencode_store_under(&base).expect("contained store accepted");
-        assert!(got.starts_with(std::fs::canonicalize(&base).unwrap()));
     }
 
     /// Deadline kills a hung exporter; the wait stays bounded.
