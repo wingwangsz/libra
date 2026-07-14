@@ -24,6 +24,19 @@ As AI becomes the primary producer of software, Libra provides the foundational 
 
 ---
 
+## Key Differentiators
+
+| Capability | Traditional VCS (Git) | Libra |
+|-----------|----------------------|-------|
+| **Versioned Artifacts** | Source code only | Code + AI reasoning + decisions + validation reports + session transcripts |
+| **AI Collaboration** | Manual commit messages | Native AI agent threads with full audit trail |
+| **Knowledge Reuse** | Code snapshots | Reusable intelligence assets across projects |
+| **Security** | External GPG/SSH setup | Built-in vault with per-repo key isolation |
+| **Provider Lock-in** | N/A | 7+ AI providers, switch freely |
+| **Automation** | External CI/CD | Built-in cron-driven agent automation |
+
+---
+
 ## Quick Start
 
 ### Install
