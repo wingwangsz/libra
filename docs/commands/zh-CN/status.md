@@ -30,7 +30,7 @@ libra status [OPTIONS] [pathspec]...
 - `status.showStash=true|false` 在长格式中显示 stash 数量提示；`--no-show-stash` 覆盖配置的 `true`。
 - `status.relativePaths=true|false`（仅配置项，与 Git 一致）：`true`——默认值——将人类可读长/短格式的路径渲染为相对当前目录；`false` 保持相对仓库根的路径。
 
-五个键都会在前置阶段统一校验：无效值以 `LBR-CLI-002` fail-closed，local/global scope 不可读以 `LBR-IO-001` 失败，二者都发生在产生任何 status 输出之前。布尔值使用完整的 Git 语法（`true`/`yes`/`on`、`false`/`no`/`off`，以及整数——非零为 true——可带可选 `k`/`m`/`g` 后缀）；空值会被拒绝。
+五个键都会在前置阶段统一校验：无效值以 `LBR-CLI-002` fail-closed，local/global scope 不可读以 `LBR-IO-001` 失败，二者都发生在产生任何 status 输出之前。例外：全局配置库 schema 比当前 Libra 二进制更新时不会因此失败，而是打印一次去重警告后跳过 global scope（真正需要全局存储配置的 `pull`/`push`/`fetch`/`clone`/`cloud` 仍以 `LBR-CONFIG-001` fail-closed）。布尔值使用完整的 Git 语法（`true`/`yes`/`on`、`false`/`no`/`off`，以及整数——非零为 true——可带可选 `k`/`m`/`g` 后缀）；空值会被拒绝。
 
 ## 选项
 

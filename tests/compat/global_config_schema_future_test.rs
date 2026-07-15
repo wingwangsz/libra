@@ -440,6 +440,69 @@ fn local_command_warns_once_and_continues() {
     assert_eq!(count, 1, "schema warning should be deduplicated:\n{stderr}");
 }
 
+/// End-to-end: a local `commit` (which reads config through both the strict
+/// `commit.gpgSign` cascade and the error-swallowing non-strict
+/// `commit.cleanup` read) succeeds against a future-schema global store with
+/// one deduplicated warning (P0-12). The non-strict `global_config_value`
+/// carve-out itself is pinned directly by the
+/// `internal::config::tests::global_config_value_skips_future_schema_and_keeps_other_errors`
+/// unit test — this test guards the command-level outcome.
+#[test]
+fn non_strict_cascade_local_command_warns_once_and_continues() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.success(&fixture.repo, &["config", "set", "user.name", "Schema T"]);
+    fixture.success(&fixture.repo, &["config", "set", "user.email", "t@t.io"]);
+    fixture.write_future_global_config();
+
+    let args = ["commit", "--allow-empty", "-m", "future schema commit"];
+    let output = fixture.run(&fixture.repo, &args);
+    assert_success(&args, &output);
+    let stderr = stderr_text(&output);
+
+    assert_schema_future_diagnostic(&fixture, &stderr);
+    let count = stderr
+        .matches("global config database schema is newer")
+        .count();
+    assert_eq!(count, 1, "schema warning should be deduplicated:\n{stderr}");
+}
+
+/// A global config store that is unreadable for any reason OTHER than a
+/// future schema keeps the original fail-closed `LBR-IO-001` contract:
+/// `status --short` pins the strict cascade, and `commit` pins the
+/// command-level outcome (its failure travels through the strict
+/// `commit.gpgSign` read; the non-strict corruption path is pinned by the
+/// `internal::config` unit test). The schema carve-out must not swallow
+/// corruption.
+#[test]
+fn corrupt_global_config_store_keeps_io_error_for_local_commands() {
+    let fixture = CliFixture::new();
+    fixture.init_repo();
+    fixture.success(&fixture.repo, &["config", "set", "user.name", "Schema T"]);
+    fixture.success(&fixture.repo, &["config", "set", "user.email", "t@t.io"]);
+    fs::create_dir_all(fixture.global_db.parent().expect("global db parent"))
+        .expect("create global config dir");
+    fs::write(&fixture.global_db, b"this is not a sqlite database")
+        .expect("write corrupt global config db");
+
+    // Strict cascade (status.* defaults).
+    let status = fixture.run(&fixture.repo, &["status", "--short"]);
+    assert_not_success(&["status", "--short"], &status);
+    let stderr = stderr_text(&status);
+    assert!(stderr.contains("LBR-IO-001"), "stderr was: {stderr}");
+    assert!(
+        !stderr.contains("global config database schema is newer"),
+        "corruption must not be misclassified as a future schema:\n{stderr}"
+    );
+
+    // Non-strict cascade (commit.cleanup and friends).
+    let commit_args = ["commit", "--allow-empty", "-m", "corrupt global"];
+    let commit = fixture.run(&fixture.repo, &commit_args);
+    assert_not_success(&commit_args, &commit);
+    let stderr = stderr_text(&commit);
+    assert!(stderr.contains("LBR-IO-001"), "stderr was: {stderr}");
+}
+
 #[test]
 fn json_error_reports_config_schema_future_details() {
     let fixture = CliFixture::new();

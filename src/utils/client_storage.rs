@@ -250,12 +250,21 @@ pub(crate) fn reset_global_config_schema_future_warning_for_invocation() {
     GLOBAL_CONFIG_SCHEMA_FUTURE_WARNING_EMITTED.store(false, Ordering::Relaxed);
 }
 
+/// Whether resolving the storage config for this process could fall through
+/// to the global config DB. Used by the P0-12 dispatch guard to decide if a
+/// remote-facing command must fail closed on a future-schema global store.
+///
+/// Fail-closed bias: an error while reading the process/repo-local scopes
+/// means we cannot PROVE resolution stops before the global scope, so this
+/// answers `true` (the guard errs on the side of failing the remote command
+/// closed) instead of letting an unreadable local store silently bypass the
+/// guard and degrade to local storage.
 pub async fn storage_config_resolution_may_read_global_config() -> bool {
     let storage_type = match resolve_env_for_storage_init_without_global("LIBRA_STORAGE_TYPE").await
     {
         Ok(Some(storage_type)) => storage_type,
         Ok(None) => return true,
-        Err(_) => return false,
+        Err(_) => return true,
     };
     match storage_type.as_str() {
         "s3" | "r2" => {
@@ -263,7 +272,7 @@ pub async fn storage_config_resolution_may_read_global_config() -> bool {
                 match resolve_env_for_storage_init_without_global(name).await {
                     Ok(Some(_)) => {}
                     Ok(None) => return true,
-                    Err(_) => return false,
+                    Err(_) => return true,
                 }
             }
             false
@@ -272,12 +281,14 @@ pub async fn storage_config_resolution_may_read_global_config() -> bool {
     }
 }
 
+/// See [`storage_config_resolution_may_read_global_config`] — same
+/// fail-closed bias on local-scope read errors.
 pub async fn env_resolution_may_read_global_config(names: &[&str]) -> bool {
     for name in names {
         match resolve_env_for_storage_init_without_global(name).await {
             Ok(Some(_)) => {}
             Ok(None) => return true,
-            Err(_) => return false,
+            Err(_) => return true,
         }
     }
     false
@@ -1485,7 +1496,7 @@ pub async fn inspect_global_config_schema_future() -> Option<GlobalConfigSchemaF
     inspect_global_config_schema_future_at_path(&global_db_path).await
 }
 
-async fn inspect_global_config_schema_future_at_path(
+pub(crate) async fn inspect_global_config_schema_future_at_path(
     global_db_path: &Path,
 ) -> Option<GlobalConfigSchemaFuture> {
     match db::inspect_database_schema(global_db_path).await {

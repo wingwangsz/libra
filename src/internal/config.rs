@@ -1272,12 +1272,16 @@ pub async fn read_cascaded_config_value_strict(
         ));
     }
 
-    if let Some(path) = global_config_path()
-        && let Some(entry) = read_config_entry_from_db_path_case_insensitive(&path, key).await?
-    {
-        return Ok(Some(
-            decrypt_strict_config_entry(entry, StrictConfigScope::Global).await?,
-        ));
+    if let Some(path) = global_config_path() {
+        match read_config_entry_from_db_path_case_insensitive(&path, key).await {
+            Ok(Some(entry)) => {
+                return Ok(Some(
+                    decrypt_strict_config_entry(entry, StrictConfigScope::Global).await?,
+                ));
+            }
+            Ok(None) => {}
+            Err(error) => skip_global_scope_if_schema_future(&path, error).await?,
+        }
     }
 
     if let Some(path) = system_config_path() {
@@ -1588,7 +1592,39 @@ async fn global_config_value(key: &str) -> Result<Option<String>> {
     if !db_path.exists() {
         return Ok(None);
     }
-    read_config_value_from_db_path(&db_path, key).await
+    global_config_value_at(&db_path, key).await
+}
+
+/// Path-parameterised body of [`global_config_value`] so the P0-12
+/// future-schema carve-out is unit-testable without mutating process env.
+async fn global_config_value_at(db_path: &Path, key: &str) -> Result<Option<String>> {
+    match read_config_value_from_db_path(db_path, key).await {
+        Ok(value) => Ok(value),
+        Err(error) => {
+            skip_global_scope_if_schema_future(db_path, error).await?;
+            Ok(None)
+        }
+    }
+}
+
+/// Decide whether a failed global-config read may be skipped (plan-20260708
+/// P0-12): a global config DB whose schema is newer than this binary must not
+/// hard-fail commands that only consult it for config defaults — the
+/// dispatch-level guard has already fail-closed the commands that genuinely
+/// need global storage config, and every other command continues with the
+/// global scope ignored after the deduplicated schema warning. Any other read
+/// failure stays fail-closed with the original error.
+async fn skip_global_scope_if_schema_future(db_path: &Path, error: anyhow::Error) -> Result<()> {
+    match crate::utils::client_storage::inspect_global_config_schema_future_at_path(db_path).await {
+        Some(future) => {
+            crate::utils::client_storage::emit_global_config_schema_future_warning(
+                &future,
+                "ignoring global config values for this command",
+            );
+            Ok(())
+        }
+        None => Err(error),
+    }
 }
 
 /// Read a config value from `db_path`, trimming whitespace and treating empty
@@ -2400,5 +2436,69 @@ impl Config {
     pub async fn branch_config(name: &str) -> Option<BranchConfig> {
         let db = get_db_conn_instance().await;
         Self::branch_config_with_conn(&db, name).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use sea_orm::Statement;
+
+    use super::*;
+
+    async fn write_schema_version(db_path: &Path, version: i64) {
+        let conn = crate::internal::db::create_database(db_path.to_str().expect("utf8 db path"))
+            .await
+            .expect("create config db");
+        let backend = conn.get_database_backend();
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            "DELETE FROM schema_versions",
+            [],
+        ))
+        .await
+        .expect("clear schema versions");
+        conn.execute(Statement::from_sql_and_values(
+            backend,
+            "INSERT INTO schema_versions (version, name, applied_at) VALUES (?, ?, ?)",
+            [
+                version.into(),
+                "test_future_schema".into(),
+                "2026-07-15T00:00:00Z".into(),
+            ],
+        ))
+        .await
+        .expect("insert schema version");
+        conn.close().await.expect("close config db");
+    }
+
+    /// P0-12 carve-out on the non-strict cascade: a global config DB whose
+    /// schema is newer than this binary reads as "scope unset" instead of
+    /// erroring, while any other unreadable store keeps the original error.
+    /// Pins `global_config_value_at` directly so the regression cannot hide
+    /// behind the CLI dispatch warning or a strict-cascade read (Codex
+    /// re-review P1, 2026-07-15).
+    #[tokio::test]
+    async fn global_config_value_skips_future_schema_and_keeps_other_errors() {
+        let temp = tempfile::tempdir().expect("create tempdir");
+
+        let future_db = temp.path().join("future-config.db");
+        let latest = crate::internal::db::migration::latest_builtin_schema_version()
+            .expect("read latest schema version")
+            .expect("built-in migrations have a latest version");
+        write_schema_version(&future_db, latest + 1).await;
+        let value = global_config_value_at(&future_db, "commit.cleanup")
+            .await
+            .expect("future schema must degrade to unset, not error");
+        assert_eq!(value, None);
+
+        let corrupt_db = temp.path().join("corrupt-config.db");
+        std::fs::write(&corrupt_db, b"this is not a sqlite database").expect("write corrupt db");
+        let error = global_config_value_at(&corrupt_db, "commit.cleanup")
+            .await
+            .expect_err("a corrupt global store must keep failing");
+        assert!(
+            !format!("{error:#}").contains("newer than this Libra binary"),
+            "corruption must not be classified as future schema: {error:#}"
+        );
     }
 }

@@ -242,6 +242,9 @@ are used verbatim, so include a trailing slash if desired. The precedence is
 `noPrefix` → `mnemonicPrefix` → custom prefixes → `a/`/`b/`. Invalid booleans and
 unreadable local/global config fail before progress/output; unreadable or
 unsupported system scope is skipped under the established config contract.
+Exception: a global config store whose schema is newer than this Libra binary
+is skipped with a one-time deduplicated warning instead of failing (see
+`LBR-CONFIG-001`).
 Prefix rewriting happens after
 `--relative`, applies to built-in rename/binary and `commit -v` patches, and does
 not alter verbatim external-diff output. Like Git, `commit -v` always uses the

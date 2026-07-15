@@ -25,7 +25,7 @@ Fetch 支持 SSH、HTTPS、本地文件和 `git://` 传输。配置了 `vault.ss
 
 ### 抓取相关的 config 默认值（`fetch.prune`、`remote.<name>.prune`）
 
-未传 `--prune`/`--no-prune` 时，Libra 按严格的 local → global → system 级联读取 Git 兼容的修剪默认值：`fetch.prune=true|false` 让每次 fetch 之后默认修剪该远程已不再通告的远程跟踪引用；`remote.<name>.prune=true|false` 针对单个远程覆盖它（远程作用域的键优先，与 Git 一致）。命令行的 `--prune`/`--no-prune` 始终优先于配置。无效值会在联系远程、下载对象或写任何引用之前以 `LBR-CLI-002` fail-closed（带 `--all` 时，会先校验所有远程的修剪模式再开始第一个 fetch）；local/global 配置读取失败以 `LBR-IO-001` 失败。local/global 的加密值先解密再校验；不可读或不支持的 system scope 会被跳过（system 是级联的最后一个 scope，跳过即视该键在此 scope 未设置）。两个键都未设置时默认为 false（不修剪），与 Git 出厂默认一致。
+未传 `--prune`/`--no-prune` 时，Libra 按严格的 local → global → system 级联读取 Git 兼容的修剪默认值：`fetch.prune=true|false` 让每次 fetch 之后默认修剪该远程已不再通告的远程跟踪引用；`remote.<name>.prune=true|false` 针对单个远程覆盖它（远程作用域的键优先，与 Git 一致）。命令行的 `--prune`/`--no-prune` 始终优先于配置。无效值会在联系远程、下载对象或写任何引用之前以 `LBR-CLI-002` fail-closed（带 `--all` 时，会先校验所有远程的修剪模式再开始第一个 fetch）；local/global 配置读取失败以 `LBR-IO-001` 失败。local/global 的加密值先解密再校验；不可读或不支持的 system scope 会被跳过（system 是级联的最后一个 scope，跳过即视该键在此 scope 未设置）。例外：全局配置库 schema 比当前 Libra 二进制更新时，这些默认值读取会在一次性去重警告后跳过 global scope 而不失败；当 `fetch` 真正需要全局存储配置时，dispatch 层守卫仍以 `LBR-CONFIG-001` fail-closed。两个键都未设置时默认为 false（不修剪），与 Git 出厂默认一致。
 
 ### Fetch refspec
 

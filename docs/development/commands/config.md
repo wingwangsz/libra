@@ -36,6 +36,7 @@ flowchart TD
 ## 实现历史
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
+- 2026-07-15（plan-20260708 P0-12 回归修复）：`internal::config` 的两条级联读取（`read_cascaded_config_value_strict` 与 `global_config_value`）在 global scope 读取失败时，改为先经 `utils::client_storage::inspect_global_config_schema_future_at_path` 做类型化 future-schema 探测：命中则复用 P0-12 的去重警告（`emit_global_config_schema_future_warning`）并把 global scope 视为未设置继续级联；其它失败保持 fail-closed 原样传播（`LBR-IO-001` 契约不变）。此前 P1-05 家族给 `status`/`branch`/`tag`/`merge`/`commit`/`fetch`/`init`/`diff`/`log` 等命令加的配置默认读取会把 schema-newer 的全局库当普通 I/O 失败，破坏 P0-12「本地命令警告一次并继续」的既定行为（回归由 `compat_global_config_schema_future::local_command_warns_once_and_continues` 钉住）。
 - 2026-01-07 `a1366d77`（`feat(config): add --global/--local/--system scope support (#108)`）：基础实现节点：add --global/--local/--system scope support (#108)；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-03 `05250fe2`（`feat(config): implement git config parity — multi-value, sections, typed values, output flags (v0.17.1277)`）：功能演进：implement git config parity — multi-value, sections, typed values, output flags (v0.17.1277)；该节点扩展了当前命令可用的参数或行为。
 - 2026-05-18 `d1f61a92`（`feat(config): expose resolve_env_sync + wire into libra code provider bootstrap`）：功能演进：expose resolve_env_sync + wire into libra code provider bootstrap；该节点扩展了当前命令可用的参数或行为。

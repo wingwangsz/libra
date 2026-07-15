@@ -53,7 +53,11 @@ An invalid value fails closed with `LBR-CLI-002` and an unreadable local/global
 scope with `LBR-IO-001`, in both cases **before the fetch touches the network**
 (with `--all`, every remote's prune mode is validated before the first fetch),
 so a bad config can never produce a fetch whose prune semantics silently
-diverge from what was configured.
+diverge from what was configured. Exception: a global config store whose
+schema is newer than this Libra binary is skipped for these defaults with a
+one-time deduplicated warning; the dispatch-level guard still fails `fetch`
+closed with `LBR-CONFIG-001` when the command genuinely needs global storage
+config.
 
 ### Fetch refspecs
 

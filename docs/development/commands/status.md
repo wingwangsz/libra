@@ -37,6 +37,7 @@ flowchart TD
 ## 实现历史
 
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
+- 2026-07-15（plan-20260708 P0-12 回归修复）：`status.*` 配置默认的 global scope 读取遇到 schema 比二进制新的全局配置库时，不再以 `LBR-IO-001` fail-closed，而是打印一次去重的 P0-12 诊断后跳过 global scope 继续（共享级联层修复，见 `docs/development/commands/config.md` 同日条目）；其它 local/global 读取失败仍为 `LBR-IO-001`。回归：`compat_global_config_schema_future::local_command_warns_once_and_continues`。
 - 2025-11-11 `926b2c38`（`Add --ignored arg for libra status (#35)`）：基础实现节点：Add --ignored arg for libra status (#35)；当前实现的主要轮廓可追溯到该提交。
 - 2026-06-06 `7d985dec`（`feat(status): add -z NUL-terminated porcelain output (implies v1)`）：当前 HEAD 已保留 `-z` / `--null` NUL-terminated 输出，`StatusArgs::null_terminated` 贯穿 short/porcelain 渲染路径；该能力不再作为缺口处理。
 - 2025-12-10 `22ecce78`（`feat(status): support --porcelain=v2 and --untracked-files modes (#78) (#82)`）：功能演进：support --porcelain=v2 and --untracked-files modes (#78) (#82)；该节点扩展了当前命令可用的参数或行为。

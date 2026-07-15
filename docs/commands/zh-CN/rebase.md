@@ -109,7 +109,7 @@ libra rebase --update-refs main
 libra rebase --fork-point origin/main
 ```
 
-Exec 命令是用户可控 shell 输入。只有内部 sandbox 能强制 workspace-only 写入且禁止网络时 Libra 才会执行；若所需 backend 不可用，则以 `LBR-CONFLICT-002` fail-closed，并保留可续作的 rebase 状态。
+Exec 命令是用户可控 shell 输入。只有内部 sandbox 能强制 workspace-only 写入且禁止网络时 Libra 才会执行；若所需 backend 不可用，则以 `LBR-CONFLICT-002` fail-closed，并保留可续作的 rebase 状态。workspace 之外的写入永远不会到达宿主文件系统：取决于 sandbox backend，写入要么被拒绝（exec 命令失败），要么落在命令退出即丢弃的 sandbox 私有挂载脚手架中；`/tmp` 在 sandbox 内始终是私有的临时 tmpfs。
 
 ## 仓库 hooks
 

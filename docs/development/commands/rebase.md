@@ -36,6 +36,7 @@ flowchart TD
 
 ## 实现历史
 
+- 2026-07-15（plan-20260708 P1-07a 测试确定性修复）：`compat_noninteractive_history_controls::rebase_exec_cannot_write_outside_the_repository_workspace` 原断言 exec 越界写必须使 rebase 失败，但该拒绝语义只在系统沙箱（bwrap）无法启动、Required enforcement fail-closed 的机器上成立；bwrap 可用时（`--unshare-all` + `--tmpfs /tmp` + 挂载脚手架），越界写会被**包含在 sandbox 私有命名空间内并在退出时丢弃**（touch 退出 0、宿主无文件）。测试改为钉住真正的安全不变量——逃逸文件绝不出现在宿主文件系统——并对两种合法结局分支断言（包含丢弃 → rebase 完成且无 sequencer 残留；拒绝/fail-closed → `LBR-CONFLICT-002` 且可 `--abort`）；任何真实 fail-open 逃逸仍会失败。用户文档 EN/zh 已同步包含语义说明。
 - 2026-07-14（plan-20260708 P1-10）：新增 required-sandbox `pre-rebase` 与 advisory `post-rewrite rebase`；public rebase 与 `pull --rebase` 都在本地历史修改前运行同一 blocking pre hook，quiet/JSON parent 不重放 child hook 输出，post hook failure 不回滚已完成重写。回归：`compat_libra_hooks_lifecycle` 与 `command_test::test_pull_rebase_runs_pre_rebase_before_moving_local_history`。
 - 本节依据本地 main 分支提交历史重写，筛选与该命令实现、测试或文档路径直接相关的提交；以下是归纳后的实现脉络。
 - 2026-01-04 `1089fd43`（`feat(rebase): add --continue/--abort/--skip for conflict handling (#100)`）：基础实现节点：add --continue/--abort/--skip for conflict handling (#100)；当前实现的主要轮廓可追溯到该提交。

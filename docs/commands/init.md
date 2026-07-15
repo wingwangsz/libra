@@ -62,7 +62,9 @@ Override the name of the initial branch. When the flag is omitted for a new repo
 reads `init.defaultBranch` from local, global, then system config (Git-style variable-name
 case-insensitive lookup) and falls back to `main` if that key is unset. Local and global
 encrypted values are decrypted before validation. An unreadable local or global config fails
-with `LBR-IO-001`; an unreadable or unsupported system config scope is skipped. For
+with `LBR-IO-001` — except a future-schema global store (newer than this binary), which is
+skipped with a one-time warning (see `LBR-CONFIG-001`); an unreadable or unsupported system
+config scope is skipped. For
 `--from-git-repository`, the source repository's `HEAD` branch wins so the import cannot claim
 a configured default that differs from the converted refs.
 The branch name is validated against the same rules as `git check-ref-format`: no spaces,
@@ -268,7 +270,9 @@ branch name. `init.defaultBranch` supplies the default when configured, and `-b`
 `--initial-branch` overrides all config scopes for one new-repository invocation. Local/global
 encrypted values are decrypted before validation. An empty or invalid configured branch fails
 with `LBR-CLI-002` before repository layout is written; unreadable local/global config fails
-with `LBR-IO-001`, while an unreadable or unsupported system scope is skipped. A Git conversion
+with `LBR-IO-001`, while an unreadable or unsupported system scope is skipped. Exception: a
+global config store whose schema is newer than this Libra binary is skipped with a one-time
+deduplicated warning instead of failing (see `LBR-CONFIG-001`). A Git conversion
 reports the source `HEAD` branch instead of using this default.
 
 ### jj comparison

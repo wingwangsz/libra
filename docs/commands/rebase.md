@@ -79,7 +79,7 @@ libra rebase --update-refs main
 libra rebase --fork-point origin/main
 ```
 
-Exec commands are user-controlled shell input. Libra runs them only when its internal sandbox can enforce workspace-only writes and denied network access; if the required backend is unavailable, the command fails closed with `LBR-CONFLICT-002` and leaves the rebase resumable.
+Exec commands are user-controlled shell input. Libra runs them only when its internal sandbox can enforce workspace-only writes and denied network access; if the required backend is unavailable, the command fails closed with `LBR-CONFLICT-002` and leaves the rebase resumable. Writes outside the workspace never reach the host filesystem: depending on the sandbox backend they are either denied (the exec command fails) or land in sandbox-private mount scaffolding that is discarded when the command exits, and `/tmp` is always a private ephemeral tmpfs inside the sandbox.
 
 ## Repository hooks
 

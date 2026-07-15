@@ -62,7 +62,11 @@ honored; an unreadable or unsupported system scope skipped):
 
 All five keys are validated up front: an invalid value fails closed with
 `LBR-CLI-002` and an unreadable local/global scope with `LBR-IO-001`, before
-any status output is produced. Boolean values use the full Git grammar
+any status output is produced. Exception: a global config store whose schema
+is newer than this Libra binary is skipped with a one-time deduplicated
+warning instead of failing; only commands that genuinely need global storage
+config (`pull`/`push`/`fetch`/`clone`/`cloud`) fail closed with
+`LBR-CONFIG-001`. Boolean values use the full Git grammar
 (`true`/`yes`/`on`, `false`/`no`/`off`, and integers — non-zero is true — with
 optional `k`/`m`/`g` suffixes); an empty value is rejected.
 

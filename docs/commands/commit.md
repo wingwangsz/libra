@@ -286,7 +286,9 @@ strip — so the status stays omitted under those modes even with `-v`.
 Git boolean (including numeric forms such as `0k` and `2`). When an editor status
 template can actually be generated, an invalid value fails with `LBR-CLI-002`,
 and an unreadable local/global config store fails with `LBR-IO-001`, before `-a`,
-hooks, object writes, or history updates. `-m`, dry-run/porcelain, JSON, and
+hooks, object writes, or history updates — except a future-schema global store
+(newer than this binary), which is skipped with a one-time warning (see
+`LBR-CONFIG-001`). `-m`, dry-run/porcelain, JSON, and
 non-comment-stripping cleanup bypass the key because no template can exist. An explicit
 `--status` or `--no-status` bypasses the matching config read. When the status
 section is enabled, failures from its `status.*` config, collection, or rendering

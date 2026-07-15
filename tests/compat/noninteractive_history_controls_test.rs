@@ -386,18 +386,33 @@ fn rebase_exec_cannot_write_outside_the_repository_workspace() {
     let (repo, _) = divergent_feature(&fixture, "exec-sandbox", 1);
     let escaped = fixture.root.join("sandbox-escape");
 
-    let failed = fixture.run_with_required_system_sandbox(
+    let outcome = fixture.run_with_required_system_sandbox(
         &repo,
         &["rebase", "--exec", "touch ../sandbox-escape", "main"],
     );
-    assert!(!failed.status.success());
+    // The non-negotiable security property: the write must never reach the
+    // host filesystem outside the writable workspace root, in every
+    // environment. How the sandbox achieves that is environment-dependent:
+    // when bubblewrap can run, the repository's parent directory exists only
+    // as sandbox-private mount scaffolding, so the write is contained inside
+    // the namespace and discarded (the exec command itself succeeds); when
+    // the system sandbox cannot start, the required enforcement fails the
+    // exec closed and the rebase stops.
     assert!(
         !escaped.exists(),
         "sandbox command escaped its writable root"
     );
-    let stderr = String::from_utf8_lossy(&failed.stderr);
-    assert!(stderr.contains("LBR-CONFLICT-002"), "stderr was: {stderr}");
-    fixture.success(&repo, &["rebase", "--abort"]);
+    if outcome.status.success() {
+        // Contained-and-discarded: the rebase completed, nothing leaked, and
+        // no sequencer state is left behind.
+        assert!(!repo.join(".libra/rebase-aux.json").exists());
+    } else {
+        // Denied or fail-closed: the exec failure must stop the rebase with
+        // the stable conflict code and remain abortable.
+        let stderr = String::from_utf8_lossy(&outcome.stderr);
+        assert!(stderr.contains("LBR-CONFLICT-002"), "stderr was: {stderr}");
+        fixture.success(&repo, &["rebase", "--abort"]);
+    }
 }
 
 #[test]
