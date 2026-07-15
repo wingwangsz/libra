@@ -50,7 +50,8 @@ flowchart TD
 | pull | partial | partial | fetch + fast-forward/three-way merge supported; `pull.rebase`/`branch.<name>.rebase`/`pull.ff` defaults are config-aware with local/global decryption, system-scope skip, and explicit unsupported diagnostics for interactive/rebase-merges modes; advanced strategy flags still partial |
 | push | partial | partial | branch/tag update, multi-refspec, delete, `--tags`, and `--mirror` supported; local file remote rejected intentionally |
 | checkout | partial | partial | visible branch compatibility surface including worktree-scoped `checkout -` previous-target toggling shared with `switch -`, `-b`/`-B <branch> [<start-point>]` symbolic-HEAD branch creation, `--orphan <branch>` unborn root branch creation (start-point currently rejected), plus explicit `checkout -- <path>` restoration alias; prefer `switch` / `restore` |
-| am | partial | partial | P2-01 exposes ordered plain-text patch files plus continue/skip/abort with bounded internal mail parsing and rollback; public mailinfo, multipart/binary/3-way/hooks and the wider Git option surface remain P2-02/P2-03 follow-ups |
+| am | partial | partial | P2-01 exposes ordered plain-text patch files plus continue/skip/abort with the P2-02 shared bounded mail parser and rollback; multipart/binary/3-way/hooks and the wider Git option surface remain P2-03 follow-ups |
+| mailinfo | partial | partial | P2-02 exposes repo-independent `mailinfo <msg> <patch> < mail`, Git-shaped basic metadata, shared transfer/RFC 2047 cleanup, body/patch split, and JSON/quiet; wider flags, MIME, non-UTF-8, binary, and multi-message mbox remain deferred |
 
 ## 子面兼容分级（CG-01）
 
@@ -205,6 +206,13 @@ unsupported 子面。
 - 状态：延后。`clone --deps-of`（lore.md 3.2）在**全量、commit-safe 的 checkout** 之后，只把只读 sparse VIEW（2.2）scope 到依赖闭包——**整棵树仍在磁盘上**，对象也从不 wire 过滤（与 `clone --filter` "不排除对象" 同等诚实）。真正按依赖闭包**收窄工作树磁盘占用**（只物化闭包文件）尚未支持。
 - 原因：commit-safe 地收窄工作树需要 **skip-worktree/materializing-sparse 机制**（Libra 至今无此索引位——正是 D10 延后的 materializing 形）：HEAD 是完整提交树，任何窄于 HEAD 的索引都会让 `commit` 丢文件，而全索引+窄工作树在没有 skip-worktree 位时会让 `status` 谎报删除。因此磁盘收窄与 D10 绑定，不能在 v1 单独安全交付。
 - 重启条件：先落地 D10 的 materializing sparse-checkout / skip-worktree 索引位（含 status/add/commit/checkout 全链一致性与测试），再让 `--deps-of` 复用其物化路径实现磁盘收窄。
+
+### D19：`send-email` SMTP 传输
+
+- 状态：P2-04 明确维持 `unsupported`。`src/cli.rs::Commands` 不暴露 `send-email`，Libra 不读取 `sendemail.*` 配置、不管理 SMTP 凭据，也不联系邮件服务器。
+- 原因：仅提供一个 `--dry-run` / `--validate-only` 壳会让用户误以为 Git 的 recipient/config/alias/credential/TLS/SMTP 语义已接入。P2-03 已证明 `libra format-patch` 产物可由 Git 消费，所以安全边界是让 Libra 只生成邮件，将校验和投递交给 stock `git send-email` 或其他专用 mailer。
+- 测试证据：`compat_matrix_alignment::send_email_policy_is_explicit_and_non_sending` 钉死 CLI 无此 variant、`LBR-CLI-001` 失败面、用户/开发/兼容文档一致性；P2-03 的 `compat_format_patch_mail_roundtrip` 继续守卫交接产物。
+- 重启条件：有明确的内建投递需求，并完成 SMTP/TLS 威胁模型、凭据存储与日志脱敏、Git `sendemail.*`/alias/recipient 语义、timeout/retry/idempotency 边界，以及可控邮件服务器端到端测试后，再以新 RFC 重启。
 
 ## 维护要求
 

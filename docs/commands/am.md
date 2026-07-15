@@ -88,5 +88,5 @@ stdin, mbox files containing multiple messages, MIME multipart/attached
 patches, binary patches, rename-only or mode-only patches, or Git's wider flag
 set (`-3`/`--3way`, `--signoff`, `--keep`, `--scissors`, and others). Existing
 file permissions are retained for content patches, but mail mode changes are
-not applied. Applypatch/commit hooks are not run. `mailinfo` is not yet exposed
-as a separate command.
+not applied. Applypatch/commit hooks are not run. The shared parser is also
+available as the standalone [`libra mailinfo`](mailinfo.md) command.

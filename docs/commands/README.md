@@ -64,6 +64,7 @@ Every Libra command accepts the following global flags:
 |---------|-------|-------------|-----|
 | `libra commit` | `ci` | Record staged changes as a new commit with optional vault signing and conventional format | [commit.md](commit.md) |
 | `libra am` | | Apply plain-text format-patch mails with continue/skip/abort recovery | [am.md](am.md) |
+| `libra format-patch` | | Generate Git-consumable plain or MIME mbox patch series | [format-patch.md](format-patch.md) |
 | `libra log` | `hist`, `history` | Show commit history with graph, patch, stat, and custom format support | [log.md](log.md) |
 | `libra logfile` | | Inspect the tracing log-file configuration (path, rotation, filter, size) | [logfile.md](logfile.md) |
 | `libra shortlog` | `slog` | Summarize reachable commits grouped by author | [shortlog.md](shortlog.md) |
@@ -150,6 +151,7 @@ Every Libra command accepts the following global flags:
 | Command | Alias | Description | Doc |
 |---------|-------|-------------|-----|
 | `libra apply` | | Check whether a unified-diff patch applies (`--check`) | [apply.md](apply.md) |
+| `libra mailinfo` | | Extract metadata, message body, and patch text from one email patch | [mailinfo.md](mailinfo.md) |
 | `libra cat-file` | | Inspect Git objects and AI objects by type, size, or pretty-printed content | [cat-file.md](cat-file.md) |
 | `libra check-attr` | | Report Git/Libra attributes (e.g. `filter`, `diff`, `export-ignore`) for pathnames | [check-attr.md](check-attr.md) |
 | `libra check-mailmap` | | Resolve `Name <email>` contacts through `.mailmap` | [check-mailmap.md](check-mailmap.md) |
@@ -165,6 +167,12 @@ Every Libra command accepts the following global flags:
 | `libra symbolic-ref` | | Read or update the symbolic HEAD ref | [symbolic-ref.md](symbolic-ref.md) |
 | `libra index-pack` | | Build a `.idx` pack index file for an existing `.pack` archive (hidden) | [index-pack.md](index-pack.md) |
 | `libra hooks` | | External AI agent (Claude Code / Gemini) hook entry point; called by configs installed by `libra agent enable` (hidden) | [hooks.md](hooks.md) |
+
+## Unsupported Git Transport Commands
+
+| Git command | Libra status | Safe workflow | Doc |
+|-------------|--------------|---------------|-----|
+| `git send-email` | No `libra send-email`; Libra performs no SMTP delivery | Generate with `libra format-patch`, then validate/send with stock Git or another mailer | [send-email.md](send-email.md) |
 
 ## Structured Output Envelope
 

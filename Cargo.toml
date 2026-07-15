@@ -1,6 +1,6 @@
 [package]
 name = "libra"
-version = "0.18.84"
+version = "0.18.88"
 edition = "2024"
 license = "MIT"
 description = "AI agent-native version control system with Git on-disk compatibility, SQLite-backed metadata, and tiered cloud storage"
@@ -214,6 +214,10 @@ name = "compat_matrix_alignment"
 path = "tests/compat/matrix_alignment.rs"
 
 [[test]]
+name = "compat_install_alias"
+path = "tests/compat/install_alias_test.rs"
+
+[[test]]
 name = "compat_live_compat_workflow"
 path = "tests/compat/live_compat_workflow.rs"
 
@@ -282,6 +286,10 @@ name = "compat_format_patch_flag_surface"
 path = "tests/compat/format_patch_flag_surface.rs"
 
 [[test]]
+name = "compat_format_patch_mail_roundtrip"
+path = "tests/compat/format_patch_mail_roundtrip_test.rs"
+
+[[test]]
 name = "compat_otlp_feature_gate_guard"
 path = "tests/compat/otlp_feature_gate_guard.rs"
 
@@ -328,6 +336,10 @@ path = "tests/compat/previous_branch_shortcut_test.rs"
 [[test]]
 name = "compat_mail_am_basic"
 path = "tests/compat/mail_am_basic_test.rs"
+
+[[test]]
+name = "compat_mailinfo_basic"
+path = "tests/compat/mailinfo_basic_test.rs"
 
 [[test]]
 name = "compat_switch_orphan_root"

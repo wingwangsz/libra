@@ -7,8 +7,6 @@
 
 use std::{collections::HashSet, fs, str::FromStr};
 
-use base64::Engine as _;
-use chrono::DateTime;
 use clap::Parser;
 use git_internal::{
     hash::ObjectHash,
@@ -24,6 +22,7 @@ use crate::{
             validate_patch_target,
         },
         commit::create_commit_signatures,
+        mailinfo::{invalid_mail, parse_mail, validate_author},
         save_object, status,
     },
     common_utils::format_commit_msg,
@@ -658,309 +657,24 @@ fn read_mail_patches(paths: &[String]) -> CliResult<Vec<MailPatch>> {
             CliError::fatal(format!("mail patch '{source}' is not valid UTF-8"))
                 .with_stable_code(StableErrorCode::CliInvalidArguments)
         })?;
-        patches.push(parse_mail_patch(source, &text)?);
+        let parsed = parse_mail(source, &text)?;
+        let author = parsed.author();
+        let message = parsed.commit_message();
+        let targets = patch_targets(&parsed.apply_patch, 1)
+            .map_err(|detail| invalid_mail(source, &detail))?;
+        if targets.is_empty() {
+            return Err(invalid_mail(source, "mail patch contains no file changes"));
+        }
+        patches.push(MailPatch {
+            source: source.to_string(),
+            author,
+            author_date: parsed.author_date,
+            message,
+            patch: parsed.apply_patch,
+            targets,
+        });
     }
     Ok(patches)
-}
-
-fn parse_mail_patch(source: &str, raw: &str) -> CliResult<MailPatch> {
-    let normalized = raw.replace("\r\n", "\n").replace('\r', "\n");
-    let without_envelope = normalized
-        .strip_prefix("From ")
-        .and_then(|text| text.split_once('\n').map(|(_, rest)| rest))
-        .unwrap_or(&normalized);
-    let (raw_headers, encoded_body) = without_envelope
-        .split_once("\n\n")
-        .ok_or_else(|| invalid_mail(source, "missing blank line after mail headers"))?;
-    let headers = parse_headers(raw_headers).map_err(|detail| invalid_mail(source, &detail))?;
-    let content_type = header(&headers, "content-type").unwrap_or("text/plain");
-    validate_content_type(content_type).map_err(|detail| invalid_mail(source, &detail))?;
-    let transfer = header(&headers, "content-transfer-encoding").unwrap_or("8bit");
-    let body =
-        decode_transfer(encoded_body, transfer).map_err(|detail| invalid_mail(source, &detail))?;
-    if body.contains('\0') {
-        return Err(invalid_mail(source, "decoded mail body contains NUL"));
-    }
-
-    let mut author = decode_encoded_words(required_header(&headers, "from", source)?)
-        .map_err(|detail| invalid_mail(source, &detail))?;
-    let date = required_header(&headers, "date", source)?;
-    let author_date =
-        normalize_author_date(date).map_err(|detail| invalid_mail(source, &detail))?;
-    let subject = decode_encoded_words(required_header(&headers, "subject", source)?)
-        .map_err(|detail| invalid_mail(source, &detail))?;
-    validate_decoded_header("Subject", &subject).map_err(|detail| invalid_mail(source, &detail))?;
-    let subject = clean_patch_subject(&subject);
-    if subject.is_empty() {
-        return Err(invalid_mail(source, "patch subject is empty"));
-    }
-
-    let diff_start = body
-        .lines()
-        .enumerate()
-        .find_map(|(index, line)| line.starts_with("diff --git ").then_some(index))
-        .ok_or_else(|| invalid_mail(source, "mail body contains no 'diff --git' patch"))?;
-    let lines: Vec<&str> = body.lines().collect();
-    let separator = lines[..diff_start]
-        .iter()
-        .rposition(|line| *line == "---")
-        .ok_or_else(|| invalid_mail(source, "mail patch is missing the '---' separator"))?;
-    let mut message_lines = lines[..separator].to_vec();
-    while message_lines.first().is_some_and(|line| line.is_empty()) {
-        message_lines.remove(0);
-    }
-    if let Some(in_body_from) = message_lines
-        .first()
-        .and_then(|line| line.strip_prefix("From: "))
-    {
-        author = in_body_from.trim().to_string();
-        message_lines.remove(0);
-        if message_lines.first().is_some_and(|line| line.is_empty()) {
-            message_lines.remove(0);
-        }
-    }
-    validate_author(&author).map_err(|detail| invalid_mail(source, &detail))?;
-    let body_message = message_lines.join("\n").trim().to_string();
-    let message = if body_message.is_empty() {
-        subject
-    } else {
-        format!("{subject}\n\n{body_message}")
-    };
-
-    let mut patch = format!("{}\n", lines[diff_start..].join("\n"));
-    if let Some(signature) = patch.find("\n-- \n") {
-        patch.truncate(signature + 1);
-    }
-    let targets = patch_targets(&patch, 1).map_err(|detail| invalid_mail(source, &detail))?;
-    if targets.is_empty() {
-        return Err(invalid_mail(source, "mail patch contains no file changes"));
-    }
-    Ok(MailPatch {
-        source: source.to_string(),
-        author,
-        author_date,
-        message,
-        patch,
-        targets,
-    })
-}
-
-fn parse_headers(raw: &str) -> Result<Vec<(String, String)>, String> {
-    let mut headers: Vec<(String, String)> = Vec::new();
-    for line in raw.lines() {
-        if line.starts_with([' ', '\t']) {
-            let (_, value) = headers
-                .last_mut()
-                .ok_or_else(|| "mail header continuation has no preceding header".to_string())?;
-            value.push(' ');
-            value.push_str(line.trim());
-            continue;
-        }
-        let (name, value) = line
-            .split_once(':')
-            .ok_or_else(|| format!("malformed mail header '{line}'"))?;
-        if name.is_empty()
-            || !name
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
-        {
-            return Err(format!("invalid mail header name '{name}'"));
-        }
-        headers.push((name.to_ascii_lowercase(), value.trim().to_string()));
-    }
-    Ok(headers)
-}
-
-fn validate_content_type(value: &str) -> Result<(), String> {
-    let mut parts = value.split(';');
-    let media_type = parts.next().unwrap_or_default().trim();
-    if !media_type.eq_ignore_ascii_case("text/plain") {
-        return Err(format!(
-            "unsupported Content-Type '{media_type}'; expected text/plain"
-        ));
-    }
-    for parameter in parts {
-        let Some((name, value)) = parameter.trim().split_once('=') else {
-            continue;
-        };
-        if name.trim().eq_ignore_ascii_case("charset") {
-            let charset = value.trim().trim_matches('"');
-            if !matches!(charset.to_ascii_lowercase().as_str(), "utf-8" | "us-ascii") {
-                return Err(format!("unsupported text/plain charset '{charset}'"));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn validate_decoded_header(name: &str, value: &str) -> Result<(), String> {
-    if value.chars().any(char::is_control) {
-        return Err(format!(
-            "decoded {name} header contains a control character"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_author(author: &str) -> Result<(), String> {
-    validate_decoded_header("From", author)?;
-    let author = author.trim();
-    let Some(start) = author.find('<') else {
-        return Err("From header must use 'Name <email>' format".to_string());
-    };
-    let Some(relative_end) = author[start..].find('>') else {
-        return Err("From header must use 'Name <email>' format".to_string());
-    };
-    let end = start + relative_end;
-    let name = author[..start].trim();
-    let email = author[start + 1..end].trim();
-    if name.is_empty()
-        || email.is_empty()
-        || end != author.len() - 1
-        || name.contains(['<', '>'])
-        || email.contains(['<', '>'])
-    {
-        return Err("From header must use 'Name <email>' format".to_string());
-    }
-    Ok(())
-}
-
-fn header<'a>(headers: &'a [(String, String)], name: &str) -> Option<&'a str> {
-    headers
-        .iter()
-        .find(|(candidate, _)| candidate == name)
-        .map(|(_, value)| value.as_str())
-}
-
-fn required_header<'a>(
-    headers: &'a [(String, String)],
-    name: &str,
-    source: &str,
-) -> CliResult<&'a str> {
-    header(headers, name)
-        .ok_or_else(|| invalid_mail(source, &format!("missing required {name} header")))
-}
-
-fn decode_transfer(body: &str, encoding: &str) -> Result<String, String> {
-    match encoding.trim().to_ascii_lowercase().as_str() {
-        "" | "7bit" | "8bit" | "binary" => Ok(body.to_string()),
-        "base64" => {
-            let compact: String = body
-                .chars()
-                .filter(|ch| !ch.is_ascii_whitespace())
-                .collect();
-            let bytes = base64::engine::general_purpose::STANDARD
-                .decode(compact)
-                .map_err(|error| format!("invalid base64 mail body: {error}"))?;
-            String::from_utf8(bytes).map_err(|_| "decoded mail body is not UTF-8".to_string())
-        }
-        "quoted-printable" => decode_quoted_printable(body),
-        other => Err(format!("unsupported Content-Transfer-Encoding '{other}'")),
-    }
-}
-
-fn decode_quoted_printable(input: &str) -> Result<String, String> {
-    let bytes = input.as_bytes();
-    let mut decoded = Vec::with_capacity(bytes.len());
-    let mut index = 0usize;
-    while index < bytes.len() {
-        if bytes[index] != b'=' {
-            decoded.push(bytes[index]);
-            index += 1;
-            continue;
-        }
-        if bytes.get(index + 1) == Some(&b'\n') {
-            index += 2;
-            continue;
-        }
-        let high = bytes
-            .get(index + 1)
-            .and_then(|byte| hex_value(*byte))
-            .ok_or_else(|| "invalid quoted-printable escape".to_string())?;
-        let low = bytes
-            .get(index + 2)
-            .and_then(|byte| hex_value(*byte))
-            .ok_or_else(|| "invalid quoted-printable escape".to_string())?;
-        decoded.push((high << 4) | low);
-        index += 3;
-    }
-    String::from_utf8(decoded).map_err(|_| "decoded mail body is not UTF-8".to_string())
-}
-
-fn decode_encoded_words(input: &str) -> Result<String, String> {
-    let mut output = String::new();
-    let mut rest = input;
-    while let Some(start) = rest.find("=?") {
-        output.push_str(&rest[..start]);
-        let word = &rest[start + 2..];
-        let (charset, after_charset) = word
-            .split_once('?')
-            .ok_or_else(|| "malformed RFC 2047 encoded word".to_string())?;
-        let (encoding, after_encoding) = after_charset
-            .split_once('?')
-            .ok_or_else(|| "malformed RFC 2047 encoded word".to_string())?;
-        let (encoded, after_word) = after_encoding
-            .split_once("?=")
-            .ok_or_else(|| "malformed RFC 2047 encoded word".to_string())?;
-        if !matches!(charset.to_ascii_lowercase().as_str(), "utf-8" | "us-ascii") {
-            return Err(format!("unsupported RFC 2047 charset '{charset}'"));
-        }
-        let decoded = match encoding.to_ascii_lowercase().as_str() {
-            "b" => {
-                let bytes = base64::engine::general_purpose::STANDARD
-                    .decode(encoded)
-                    .map_err(|error| format!("invalid RFC 2047 base64 word: {error}"))?;
-                String::from_utf8(bytes)
-                    .map_err(|_| "decoded RFC 2047 word is not UTF-8".to_string())?
-            }
-            "q" => decode_quoted_printable(&encoded.replace('_', " "))?,
-            other => return Err(format!("unsupported RFC 2047 encoding '{other}'")),
-        };
-        output.push_str(&decoded);
-        rest = after_word;
-    }
-    output.push_str(rest);
-    Ok(output)
-}
-
-fn hex_value(byte: u8) -> Option<u8> {
-    match byte {
-        b'0'..=b'9' => Some(byte - b'0'),
-        b'a'..=b'f' => Some(byte - b'a' + 10),
-        b'A'..=b'F' => Some(byte - b'A' + 10),
-        _ => None,
-    }
-}
-
-fn clean_patch_subject(subject: &str) -> String {
-    let trimmed = subject.trim();
-    if let Some(close) = trimmed.find(']')
-        && trimmed.starts_with('[')
-        && matches!(
-            trimmed[1..close]
-                .trim()
-                .split_ascii_whitespace()
-                .next(),
-            Some(marker) if marker.eq_ignore_ascii_case("patch")
-        )
-    {
-        return trimmed[close + 1..].trim().to_string();
-    }
-    trimmed.to_string()
-}
-
-fn normalize_author_date(value: &str) -> Result<String, String> {
-    let date = DateTime::parse_from_rfc2822(value)
-        .map_err(|error| format!("invalid Date header '{value}': {error}"))?;
-    let seconds = date.offset().local_minus_utc();
-    let sign = if seconds < 0 { '-' } else { '+' };
-    let absolute = seconds.unsigned_abs();
-    Ok(format!(
-        "{} {sign}{:02}{:02}",
-        date.timestamp(),
-        absolute / 3600,
-        (absolute % 3600) / 60
-    ))
 }
 
 async fn load_state_or_error() -> CliResult<AmState> {
@@ -1127,11 +841,6 @@ fn render_output(result: &AmOutput, output: &OutputConfig) -> CliResult<()> {
     Ok(())
 }
 
-fn invalid_mail(source: &str, detail: &str) -> CliError {
-    CliError::fatal(format!("invalid mail patch '{source}': {detail}"))
-        .with_stable_code(StableErrorCode::CliInvalidArguments)
-}
-
 fn am_state_error(message: String) -> CliError {
     CliError::fatal(message).with_stable_code(StableErrorCode::RepoStateInvalid)
 }
@@ -1152,70 +861,4 @@ fn am_resolution_error(message: &str) -> CliError {
 
 fn mail_subject(message: &str) -> String {
     message.lines().next().unwrap_or("(no subject)").to_string()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn parses_plain_format_patch_mail() {
-        let mail = "From 0123456789 Mon Sep 17 00:00:00 2001\n\
-From: Alice Example <alice@example.com>\n\
-Date: Tue, 14 Jul 2026 10:00:00 +0800\n\
-Subject: [PATCH 1/1] fix greeting\n\
-Content-Type: text/plain; charset=UTF-8\n\
-Content-Transfer-Encoding: 8bit\n\
-\n\
-Explain why.\n\
----\n\
- file.txt | 2 +-\n\
- 1 file changed, 1 insertion(+), 1 deletion(-)\n\
-\n\
-diff --git a/file.txt b/file.txt\n\
---- a/file.txt\n\
-+++ b/file.txt\n\
-@@ -1 +1 @@\n\
--old\n\
-+new\n\
--- \n\
-libra 0.18.83\n";
-        let parsed = parse_mail_patch("one.patch", mail).expect("parse mail");
-        assert_eq!(parsed.author, "Alice Example <alice@example.com>");
-        assert_eq!(parsed.message, "fix greeting\n\nExplain why.");
-        assert_eq!(parsed.targets, vec!["file.txt"]);
-        assert!(!parsed.patch.contains("libra 0.18.83"));
-    }
-
-    #[test]
-    fn decodes_quoted_printable_and_encoded_subject() {
-        assert_eq!(
-            decode_quoted_printable("hello=20world=0A").expect("decode"),
-            "hello world\n"
-        );
-        assert_eq!(
-            decode_encoded_words("=?UTF-8?Q?fix=3A_caf=C3=A9?=").expect("decode"),
-            "fix: café"
-        );
-    }
-
-    #[test]
-    fn cleans_only_patch_subject_prefix() {
-        assert_eq!(clean_patch_subject("[PATCH v2 2/3] topic"), "topic");
-        assert_eq!(clean_patch_subject("[RFC] topic"), "[RFC] topic");
-        assert_eq!(clean_patch_subject("[dispatch] topic"), "[dispatch] topic");
-    }
-
-    #[test]
-    fn rejects_unsupported_content_types_and_header_injection() {
-        assert!(validate_content_type("text/plain; charset=UTF-8").is_ok());
-        assert!(validate_content_type("multipart/mixed; boundary=x").is_err());
-        assert!(validate_content_type("text/plain; charset=iso-8859-1").is_err());
-
-        let decoded = decode_encoded_words("=?UTF-8?B?QWxpY2UK?= <alice@example.com>")
-            .expect("decode injected header");
-        assert!(validate_author(&decoded).is_err());
-        assert!(validate_author("Alice Example <alice@example.com>").is_ok());
-        assert!(validate_author("Alice <alias <alice@example.com>").is_err());
-    }
 }

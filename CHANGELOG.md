@@ -4,6 +4,34 @@
 
 ### Added
 
+- **Optional `lba` installer shorthand (v0.18.88)**: `install.sh` now creates
+  a movable relative `lba -> libra` symlink by default. Same-version reruns
+  repair a missing alias, `--no-alias` and `LIBRA_NO_ALIAS=1` opt out, and
+  regular files or foreign symlinks named `lba` are preserved with a warning.
+  Symlink-unavailable platforms retain a successful Libra install and receive
+  an actionable warning. A deterministic full-installer smoke target covers
+  clean install, repair, idempotency, opt-outs, collision safety, and fallback.
+- **Reliable format-patch mail output (v0.18.86)**: adds `-1`, `--root`,
+  `--minimal`, `--histogram`, `--ignore-if-in-upstream`, and diff-prefix
+  controls; honors strict `format.subjectPrefix`, `format.signOff`,
+  `format.outputDirectory`, and `format.suffix` defaults with CLI precedence.
+  Cover-letter threading now uses unique generated message IDs, full-index is
+  effective, complete series render before atomic file writes, and stdout uses
+  quiet BrokenPipe handling. A seven-scenario L1 target proves plain and MIME
+  Libra→Git `am`, Git→Libra `am`, config, threading, root/diff, and upstream
+  patch-id behavior.
+
+- **Minimal mail parsing plumbing (v0.18.85)**: adds repo-independent
+  `libra mailinfo <msg> <patch> < mail` with Git-shaped author/email/subject/date
+  metadata, body-only message output, separator-through-signature patch output,
+  JSON/machine, and quiet modes. `mailinfo` and `am` now share one bounded
+  UTF-8 single-part transfer/RFC 2047 parser; repository-specific patch-target
+  checks remain in `am`. Both output payloads are staged before per-file atomic
+  replacement, and lexical or symlink-parent aliases cannot collapse the two
+  destinations. English/Chinese user docs and an eight-scenario Unix
+  compatibility target cover repo-free use, folded headers, output safety, and
+  fail-closed unsupported inputs.
+
 - **Minimal mail patch sequencer (v0.18.84)**: adds `libra am <patch>...`
   with `--continue`, `--skip`, and `--abort` for bounded plain-text
   `format-patch` mail files. The implementation preserves message/author/date,
@@ -107,6 +135,13 @@
 
 ### Documentation
 
+- **Explicit non-sending `send-email` policy (v0.18.87)**: records
+  `send-email` as unsupported rather than exposing a misleading transport
+  stub. Libra does not read `sendemail.*`, manage SMTP credentials, or contact
+  mail servers; users generate interoperable messages with `libra
+  format-patch` and validate/send them with stock `git send-email` or another
+  mailer. English/Chinese user guidance, the D19 governance decision, and a
+  compatibility guard pin the no-network boundary.
 - **AI provider env constructor policy (v0.17.1048)**: provider
   Rustdocs now define `Client::from_env()` as a source-compatible
   legacy helper for the 0.17 line and `Client::from_resolved_env(...)`
