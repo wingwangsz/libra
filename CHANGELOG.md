@@ -4,6 +4,17 @@
 
 ### Added
 
+- **Dedicated auto-upgrade HTTPS transport (v0.18.96, plan-20260714 §A.6)**:
+  new `internal::upgrade::http` — a pinned reqwest client (`https_only`,
+  `redirect::Policy::none()` so any 3xx is a hard failure, connect/read
+  deadlines), manifest fetch bounded to 1 MiB with the HTTPS `Date` header
+  captured for later time policy, effective-URL recheck before any body read,
+  and artifact download streaming through a pure `SizeGate` (oversized
+  `Content-Length` aborts before the body, per-chunk counting aborts past the
+  manifest size, the stream must end at exactly the expected size and match
+  the manifest sha256). Internal machinery only; live-server behavioral tests
+  land with the `test-upgrade` integration target (§A.11).
+
 - **Signed release-manifest verification core (v0.18.95, plan-20260714 §A.6)**:
   new `internal::upgrade::{manifest,trusted_keys,platform}` — a pure
   `verify_envelope_bytes` implementing the full §A.6 order (envelope parse

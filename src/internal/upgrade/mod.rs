@@ -14,6 +14,7 @@
 //! disagree about the upgrade mode.
 
 pub mod home;
+pub mod http;
 pub mod manifest;
 pub mod platform;
 pub mod settings;
