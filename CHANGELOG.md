@@ -4,6 +4,14 @@
 
 ### Changed
 
+- **`status --short` renders renames with Git's arrow form (v0.19.5,
+  plan-20260714 Part B R0-6 first slice)**: a detected rename now renders as
+  one `R  <old> -> <new>` line (colored `R` in color mode) instead of two
+  separate `R` rows for the endpoints; under `-z` the record is Git's
+  `XY SP <new> NUL <old> NUL`. Non-rename rows are unchanged, and the legacy
+  `generate_short_format_status` public API keeps its pre-existing tuple
+  shape. Porcelain v1/v2 rename records land in a follow-up slice.
+
 - **`status.renames` config cascade (v0.19.4, plan-20260714 Part B R0-7)**:
   `libra status` now honors `status.renames` (falling back to `diff.renames`)
   through the strict local → global → system cascade to set the rename-

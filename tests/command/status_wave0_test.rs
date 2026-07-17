@@ -254,6 +254,27 @@ fn rename_config_cli_find_renames_overrides_false() {
     );
 }
 
+/// `--short` renders a detected rename as a single Git-style `R  old -> new`
+/// line, not two separate `R` rows (§B.6.1).
+#[test]
+fn rename_short_format_uses_arrow() {
+    let repo = create_repo_with_committed_file("a.txt", "hello rename world\ncontent line two\n");
+    let mv = run_libra_command(&["mv", "a.txt", "b.txt"], repo.path());
+    assert_cli_success(&mv, "libra mv");
+
+    // Force no color so the line is the plain `R  a.txt -> b.txt` form.
+    let out = status_stdout(repo.path(), &["--no-color", "status", "--short"]);
+    assert!(
+        out.lines().any(|l| l.contains("a.txt -> b.txt")),
+        "short rename should use the arrow form: {out}"
+    );
+    // The endpoints must not also appear as two separate `R` rows.
+    assert!(
+        !out.lines().any(|l| l.trim_end() == "R  a.txt"),
+        "rename endpoints must not double as separate R rows: {out}"
+    );
+}
+
 /// Detection runs on repo-relative keys, so a rename is found even when
 /// `status` is invoked from a subdirectory (the historical subdir bug).
 #[test]

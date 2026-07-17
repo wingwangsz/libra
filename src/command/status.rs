@@ -2647,7 +2647,37 @@ pub async fn output_short_format(
     .await
 }
 
+/// A short-format render item: either a plain per-path change or a rename
+/// pair (rendered with Git's `old -> new` arrow instead of two `R` rows).
+enum ShortItem {
+    Path {
+        file: PathBuf,
+        x: char,
+        y: char,
+    },
+    Rename {
+        old: PathBuf,
+        new: PathBuf,
+        x: char,
+        y: char,
+    },
+}
+
+impl ShortItem {
+    /// Sort key — Git orders renames by their new (destination) path.
+    fn sort_key(&self) -> &Path {
+        match self {
+            ShortItem::Path { file, .. } => file,
+            ShortItem::Rename { new, .. } => new,
+        }
+    }
+}
+
 /// Short format output with color controlled by OutputConfig.
+///
+/// Renames are rendered as a single `R  <old> -> <new>` line (Git's short
+/// rename form), not as two separate `R` rows (§B.6.1). Under `-z` the record
+/// is `XY SP <new> NUL <old> NUL` (new before old, matching Git).
 async fn output_short_format_with_config(
     staged: &Changes,
     unstaged: &Changes,
@@ -2659,26 +2689,67 @@ async fn output_short_format_with_config(
     let use_colors = should_use_colors(output).await;
     let write_err = |e: io::Error| CliError::io(format!("failed to write status output: {e}"));
 
-    let status_list = generate_short_format_status_with_unmerged(staged, unstaged, unmerged);
+    // Collect rename pairs and their endpoints so the flattened tuple list can
+    // exclude them (they render as arrow lines instead).
+    let mut items: Vec<ShortItem> = Vec::new();
+    let mut endpoints: HashSet<PathBuf> = HashSet::new();
+    for (old, new) in &staged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        items.push(ShortItem::Rename {
+            old: old.clone(),
+            new: new.clone(),
+            x: 'R',
+            y: ' ',
+        });
+    }
+    for (old, new) in &unstaged.renamed {
+        endpoints.insert(old.clone());
+        endpoints.insert(new.clone());
+        items.push(ShortItem::Rename {
+            old: old.clone(),
+            new: new.clone(),
+            x: ' ',
+            y: 'R',
+        });
+    }
 
-    for (file, staged_status, unstaged_status) in status_list {
-        if use_colors {
-            let colored_output = format_colored_status(staged_status, unstaged_status, &file);
-            write!(writer, "{}", colored_output).map_err(write_err)?;
-        } else {
-            write!(
-                writer,
-                "{}{} {}",
-                staged_status,
-                unstaged_status,
-                file.display()
-            )
-            .map_err(write_err)?;
+    for (file, x, y) in generate_short_format_status_with_unmerged(staged, unstaged, unmerged) {
+        if endpoints.contains(&file) {
+            continue;
         }
-        if null_terminated {
-            writer.write_all(b"\0").map_err(write_err)?;
-        } else {
-            writer.write_all(b"\n").map_err(write_err)?;
+        items.push(ShortItem::Path { file, x, y });
+    }
+    items.sort_by(|a, b| a.sort_key().cmp(b.sort_key()));
+
+    for item in items {
+        match item {
+            ShortItem::Path { file, x, y } => {
+                if use_colors {
+                    write!(writer, "{}", format_colored_status(x, y, &file)).map_err(write_err)?;
+                } else {
+                    write!(writer, "{x}{y} {}", file.display()).map_err(write_err)?;
+                }
+                writer
+                    .write_all(if null_terminated { b"\0" } else { b"\n" })
+                    .map_err(write_err)?;
+            }
+            ShortItem::Rename { old, new, x, y } => {
+                if null_terminated {
+                    // `XY SP <new> NUL <old> NUL` (§B.6.1).
+                    write!(writer, "{x}{y} {}", new.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                    write!(writer, "{}", old.display()).map_err(write_err)?;
+                    writer.write_all(b"\0").map_err(write_err)?;
+                } else if use_colors {
+                    let head = format_colored_status(x, y, &old);
+                    // `format_colored_status` renders `XY <old>`; append the arrow.
+                    writeln!(writer, "{head} -> {}", new.display()).map_err(write_err)?;
+                } else {
+                    writeln!(writer, "{x}{y} {} -> {}", old.display(), new.display())
+                        .map_err(write_err)?;
+                }
+            }
         }
     }
     Ok(())
