@@ -4,6 +4,23 @@
 
 ### Added
 
+- **Auto-upgrade anti-rollback state and time policy (v0.18.97, plan-20260714
+  §A.6/§A.7)**: new `internal::upgrade::state` — durable
+  `.libra-upgrade-state.json` (atomic writes, `0600`) recording the highest
+  accepted version with per-platform artifact identities, the highest control
+  revision with its envelope digest, the monotone `trusted_time_floor`, the
+  15-min + deterministic-jitter success cooldown and the ≤1 h failure
+  backoff. Pure decision functions enforce: control-revision rollback/fork
+  rejection (a pre-revocation envelope cannot replay after a revocation was
+  seen), version rollback rejection with same-version artifact-identity
+  immutability, required HTTPS `Date` inside the manifest lifetime, expiry
+  via `effective_now = max(local, floor, Date)` (clock rollback cannot
+  resurrect a manifest; a future local clock only rejects the current round
+  and never poisons the floor), floor-anchored cooldown trust windows and
+  cache-install refusal when the local clock sits below the floor. Corrupt
+  state fails closed (skip upgrading with a warning) instead of silently
+  resetting anti-rollback history. Internal machinery only.
+
 - **Dedicated auto-upgrade HTTPS transport (v0.18.96, plan-20260714 §A.6)**:
   new `internal::upgrade::http` — a pinned reqwest client (`https_only`,
   `redirect::Policy::none()` so any 3xx is a hard failure, connect/read

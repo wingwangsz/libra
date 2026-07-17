@@ -18,4 +18,5 @@ pub mod http;
 pub mod manifest;
 pub mod platform;
 pub mod settings;
+pub mod state;
 pub mod trusted_keys;
