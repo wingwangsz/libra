@@ -15,7 +15,9 @@
 
 pub mod home;
 pub mod http;
+pub mod lock;
 pub mod manifest;
+pub mod marker;
 pub mod platform;
 pub mod settings;
 pub mod state;

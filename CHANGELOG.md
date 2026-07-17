@@ -4,6 +4,22 @@
 
 ### Added
 
+- **Install-directory lock and official-install marker (v0.18.98,
+  plan-20260714 §A.2/§A.4/§A.5)**: new `internal::upgrade::{lock,marker}` —
+  `InstallDir` opens the install directory once with
+  `O_DIRECTORY|O_NOFOLLOW` after §A.5 validation (absolute path, effective-
+  uid ownership, no group/world write; no sticky exception granted) and
+  performs every target/lock/marker/state operation fd-relative with
+  `O_NOFOLLOW` (exclusive-temp + `renameat` + directory fsync atomic writes,
+  refusing path separators and dot entries). The advisory `flock` upgrade
+  lock uses try-lock (busy ⇒ Skip) for checks and blocking acquire for
+  recovery. `.libra-official-install.json` establishes official provenance
+  only when the marker parses with `install_source=official_signed_manifest`
+  AND its platform/sha256/size match the actual target binary — a marker
+  copied next to a foreign binary, or a binary hashing itself, never
+  qualifies (§A.2). Non-Unix platforms fail closed (`UnsupportedPlatform`).
+  Internal machinery only.
+
 - **Auto-upgrade anti-rollback state and time policy (v0.18.97, plan-20260714
   §A.6/§A.7)**: new `internal::upgrade::state` — durable
   `.libra-upgrade-state.json` (atomic writes, `0600`) recording the highest
