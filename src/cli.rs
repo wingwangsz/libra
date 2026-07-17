@@ -1735,6 +1735,14 @@ pub async fn parse_async(args: Option<&[&str]>) -> CliResult<()> {
         Some(args) => args.iter().map(|s| s.to_string()).collect::<Vec<_>>(),
         None => env::args().collect::<Vec<_>>(),
     };
+    // Auto-upgrade candidate self-check (§A.7): recognized at the very front,
+    // before any argv rewrite, warning-tracker/env side effect, clap parse,
+    // repo preflight, schema migration or background task. It runs ONLY a
+    // side-effect-free identity self-check and exits; it never forwards to a
+    // real user command.
+    if let Some(probe) = command::upgrade::parse_probe_argv(&argv) {
+        return command::upgrade::run_probe(probe);
+    }
     let argv = rewrite_log_short_number_args(argv);
     let argv = rewrite_index_pack_progress_args(argv);
     let argv = rewrite_reset_pathspec_separator_args(argv);

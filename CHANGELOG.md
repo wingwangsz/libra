@@ -4,6 +4,21 @@
 
 ### Added
 
+- **Auto-upgrade decision pipeline and candidate self-check entry (v0.19.0,
+  plan-20260714 §A.7/§A.10)**: new `internal::upgrade::flow` composes the
+  pure decision — verify → anti-rollback/time → platform support (Windows
+  published-but-unsupported in R0) → `paused`/`revoked`/`newer` gates →
+  artifact selection — into a single `Install`/`Skip` verdict carrying the
+  marker and anti-rollback state to persist on commit. A new hidden
+  front-of-argv `__upgrade-probe --kind <version|pre-install|post-install>
+  --expected-version <X.Y.Z>` entry (recognized in `cli.rs` before clap, repo
+  preflight, schema migration, config writes and background tasks) runs only
+  a side-effect-free identity self-check of the running binary and exits,
+  never forwarding to a real command; a malformed or mismatched probe exits
+  non-zero silently so the orchestrator fails closed. Because it is
+  front-scanned like `help error-codes`, it stays invisible to help, the
+  Command-Groups banner and every compat guard. Internal machinery only.
+
 - **Crash-safe install transaction and candidate probes (v0.18.99,
   plan-20260714 §A.7)**: new `internal::upgrade::{txn,probe}`. `txn`
   journals the install to `.libra-upgrade-txn.json` through the seven-state

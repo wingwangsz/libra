@@ -13,6 +13,7 @@
 //! `command::config::route_upgrade_namespace`) so the two stores can never
 //! disagree about the upgrade mode.
 
+pub mod flow;
 pub mod home;
 pub mod http;
 pub mod lock;
