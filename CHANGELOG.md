@@ -27,6 +27,16 @@
 
 ### Fixed
 
+- **AI session/MCP storage roots no longer silently mint a phantom `.libra`
+  (v0.19.12, plan-20260714 Part C W0 §C.4.1)**: the AI session-transcript store
+  now fails closed (returns "no store", with a warning) when storage-root
+  resolution fails, instead of rooting itself at a library-less
+  `<working_dir>/.libra`. The `code` runtime's `resolve_storage_root` and the
+  MCP server's `init_mcp_server` still degrade (they are designed to keep a
+  read-only session alive) but now log a loud, diagnosable warning naming the
+  fallback and pointing linked-worktree corruption at `libra worktree repair`,
+  rather than falling back silently.
+
 - **Linked worktree with a corrupt `commondir` fails closed instead of routing
   a phantom repository (v0.19.11, plan-20260714 Part C W0 §C.4.1)**:
   `worktree_common_storage` previously fell through to treating a linked
