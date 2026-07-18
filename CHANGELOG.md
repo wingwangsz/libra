@@ -4,6 +4,13 @@
 
 ### Changed
 
+- **`symbolic-ref HEAD` refuses a branch checked out in another worktree
+  (v0.19.18, plan-20260714 Part C W0 §C.11)**: `symbolic-ref HEAD
+  refs/heads/<branch>` now fails closed when `<branch>` is already checked out
+  in a different worktree, preventing a forbidden duplicate checkout (the same
+  guard `switch`/`checkout` already apply). Re-pointing at this worktree's own
+  current branch is still allowed.
+
 - **`update-ref` refuses to move/delete a branch checked out in another
   worktree (v0.19.17, plan-20260714 Part C W0 §C.11)**: `update-ref
   refs/heads/<branch>` now fails closed when `<branch>` is checked out in a

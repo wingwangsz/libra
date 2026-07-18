@@ -436,6 +436,44 @@ fn update_ref_refuses_branch_checked_out_elsewhere() {
     );
 }
 
+/// Part C W0 (§C.11): `symbolic-ref HEAD refs/heads/<b>` refuses to point HEAD
+/// at a branch already checked out in another worktree (would create a
+/// duplicate checkout).
+#[test]
+fn symbolic_ref_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+
+    // From main (on `main`), pointing HEAD at `feature` is refused.
+    let refused = run_libra_command(&["symbolic-ref", "HEAD", "refs/heads/feature"], main);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "symbolic-ref to wt branch refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("checked out"),
+        "names the collision: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // Re-pointing at main's own current branch is allowed.
+    assert_cli_success(
+        &run_libra_command(&["symbolic-ref", "HEAD", "refs/heads/main"], main),
+        "symbolic-ref to own branch works",
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();
