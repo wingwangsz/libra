@@ -394,6 +394,48 @@ fn branch_writers_refuse_branch_checked_out_in_another_worktree() {
     );
 }
 
+/// Part C W0 (§C.11): `update-ref` refuses to move or delete a branch that is
+/// checked out in another worktree, but may still update this worktree's own
+/// current branch.
+#[test]
+fn update_ref_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    // main HEAD commit, to use as an update target.
+    let main_oid = String::from_utf8_lossy(&run_libra_command(&["rev-parse", "HEAD"], main).stdout)
+        .trim()
+        .to_string();
+
+    // From main, update-ref on `feature` (checked out in wt) is refused.
+    let refused = run_libra_command(&["update-ref", "refs/heads/feature", &main_oid], main);
+    assert_ne!(
+        refused.status.code(),
+        Some(0),
+        "update-ref on wt branch refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&refused.stderr).contains("checked out"),
+        "names the other worktree: {}",
+        String::from_utf8_lossy(&refused.stderr)
+    );
+
+    // update-ref on main's OWN current branch is still allowed.
+    assert_cli_success(
+        &run_libra_command(&["update-ref", "refs/heads/main", &main_oid], main),
+        "update-ref on own branch works",
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

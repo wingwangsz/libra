@@ -4,6 +4,13 @@
 
 ### Changed
 
+- **`update-ref` refuses to move/delete a branch checked out in another
+  worktree (v0.19.17, plan-20260714 Part C W0 §C.11)**: `update-ref
+  refs/heads/<branch>` now fails closed when `<branch>` is checked out in a
+  different worktree (its HEAD would dangle or its working tree diverge),
+  joining the `branch -d`/`-m`/`reset` guards. Updating this worktree's own
+  current branch is still allowed.
+
 - **Destructive branch writers refuse a branch checked out in another worktree
   (v0.19.16, plan-20260714 Part C W0 §C.11)**: `branch -d`/`-D` (delete),
   `branch -m`/`-M` (rename), and `branch reset` now fail closed when the target
