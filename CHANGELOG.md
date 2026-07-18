@@ -4,6 +4,18 @@
 
 ### Changed
 
+- **Repository-global-state commands fail closed in a linked worktree
+  (v0.19.14, plan-20260714 Part C W0 transition guards)**: `stash` (all
+  subcommands, incl. `stash branch`), `layer`, `sparse-view`, `dirty`, and the
+  composite `fetch`/`pull` now refuse to run inside a linked worktree with an
+  actionable "run it in the main worktree" error, joining the existing
+  merge/rebase/cherry-pick/revert/bisect/am refusal. Their stores (the stash
+  stack, dirty cache, layer/sparse tables, shared `FETCH_HEAD`) are still
+  repository-global, so a linked invocation could read or clobber the wrong
+  worktree's state; the guard fires before any side effect. The main worktree
+  is unaffected. Each guard is lifted per-command as W1/W2 make that store
+  worktree-scoped.
+
 - **`rev-parse --git-dir`/`--absolute-git-dir`/`--is-inside-git-dir` return the
   current worktree's local gitdir (v0.19.13, plan-20260714 Part C W0 §C.5)**:
   these queries now resolve (and test) THIS worktree's own `.libra` rather than

@@ -251,6 +251,55 @@ fn same_branch_is_refused_across_worktrees() {
     );
 }
 
+/// Part C W0 (§C.11 transition guards): the states whose stores are still
+/// repository-global — the stash stack, the dirty cache, the layer/sparse
+/// tables, and the composite `fetch`/`pull` (shared `FETCH_HEAD`) — must fail
+/// closed in a linked worktree until W1/W2 make them worktree-scoped. The
+/// guard fires before any side effect, so no remote/network is needed.
+#[test]
+fn repository_global_state_commands_refused_in_linked_worktree() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let cases: &[&[&str]] = &[
+        &["stash", "list"],
+        &["layer", "list"],
+        &["sparse-view", "status"],
+        &["dirty", "--list"],
+        &["fetch"],
+        &["pull"],
+    ];
+    for argv in cases {
+        let out = run_libra_command(argv, &wt);
+        assert_ne!(
+            out.status.code(),
+            Some(0),
+            "{argv:?} must fail closed in a linked worktree"
+        );
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("linked worktree"),
+            "{argv:?} should fail with the linked-worktree guard, got: {stderr}"
+        );
+    }
+
+    // The SAME commands succeed in the main worktree (guard is main-only).
+    assert_cli_success(
+        &run_libra_command(&["stash", "list"], main),
+        "stash list works in main",
+    );
+    assert_cli_success(
+        &run_libra_command(&["layer", "list"], main),
+        "layer list works in main",
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();
