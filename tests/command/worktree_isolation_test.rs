@@ -140,6 +140,44 @@ fn porcelain_reports_per_worktree_head() {
     );
 }
 
+/// Part C §C.4.1: a linked worktree whose `commondir` pointer is corrupt
+/// (emptied) must FAIL CLOSED rather than silently treating its library-less
+/// local gitdir as the shared storage (a "phantom repository" that routes
+/// db/objects lookups at an empty dir).
+#[test]
+fn corrupt_commondir_fails_closed_not_phantom_repo() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Corrupt the commondir pointer (empty it) — the shared-storage link is now
+    // unresolvable.
+    fs::write(wt.join(".libra/commondir"), "").unwrap();
+
+    let out = run_libra_command(&["status"], &wt);
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "a corrupt commondir must fail closed, not operate on a phantom repo"
+    );
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    // The failure happens at path resolution (repo-not-found), NOT by routing
+    // the DB lookup at a phantom `<wt>/.libra/libra.db` — the pre-fix symptom.
+    assert!(
+        !stderr.contains(".libra/libra.db"),
+        "must not route db lookups at the phantom local gitdir: {stderr}"
+    );
+    assert!(
+        stderr.contains("LBR-REPO-001") || stderr.contains("not a libra repository"),
+        "fails closed at repo resolution: {stderr}"
+    );
+}
+
 #[test]
 fn same_branch_is_refused_across_worktrees() {
     let repo = repo_with_feature();

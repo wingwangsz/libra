@@ -27,6 +27,17 @@
 
 ### Fixed
 
+- **Linked worktree with a corrupt `commondir` fails closed instead of routing
+  a phantom repository (v0.19.11, plan-20260714 Part C W0 §C.4.1)**:
+  `worktree_common_storage` previously fell through to treating a linked
+  worktree's library-less local `.libra` as the shared storage whenever its
+  `commondir` pointer was unreadable or had an empty first line, so every
+  db/objects lookup silently targeted a non-existent database inside the
+  worktree (a "phantom repo", surfacing as a confusing `LBR-REPO-002` at
+  `<wt>/.libra/libra.db`). It now fails closed at path resolution: a missing
+  `commondir` still resolves to the gitdir (the main worktree), but a present
+  yet corrupt pointer is an error pointing at `libra worktree repair`.
+
 - **`status` no longer reports an unreadable tracked file as deleted (v0.19.7,
   plan-20260714 Part B §B.6.0.1)**: `collect_tracked_worktree_changes`
   previously treated ANY `symlink_metadata` error on a tracked path as a
