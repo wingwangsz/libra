@@ -178,6 +178,49 @@ fn corrupt_commondir_fails_closed_not_phantom_repo() {
     );
 }
 
+/// Part C §C.5: `rev-parse --git-dir`/`--absolute-git-dir` return the LINKED
+/// worktree's own local gitdir, and `--is-inside-git-dir` tests it — not the
+/// shared common storage. Scripts locating the index/EDITMSG via `--git-dir`
+/// must hit the per-worktree gitdir.
+#[test]
+fn rev_parse_git_dir_is_worktree_local() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    let git_dir =
+        String::from_utf8_lossy(&run_libra_command(&["rev-parse", "--git-dir"], &wt).stdout)
+            .trim()
+            .to_string();
+    let wt_libra = wt.join(".libra");
+    // The linked worktree's --git-dir must be ITS OWN .libra, not the main's.
+    assert!(
+        std::fs::canonicalize(&git_dir).ok() == std::fs::canonicalize(&wt_libra).ok(),
+        "linked --git-dir should be the worktree-local gitdir: got {git_dir}, want {}",
+        wt_libra.display()
+    );
+    assert!(
+        !git_dir.contains(main.file_name().unwrap().to_str().unwrap()),
+        "linked --git-dir must not point at the main worktree's storage: {git_dir}"
+    );
+
+    // --is-inside-git-dir from inside the linked .libra is true.
+    let inside = String::from_utf8_lossy(
+        &run_libra_command(&["rev-parse", "--is-inside-git-dir"], &wt_libra).stdout,
+    )
+    .trim()
+    .to_string();
+    assert_eq!(
+        inside, "true",
+        "cwd inside the linked .libra is inside GIT_DIR"
+    );
+}
+
 #[test]
 fn same_branch_is_refused_across_worktrees() {
     let repo = repo_with_feature();

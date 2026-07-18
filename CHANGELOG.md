@@ -4,6 +4,15 @@
 
 ### Changed
 
+- **`rev-parse --git-dir`/`--absolute-git-dir`/`--is-inside-git-dir` return the
+  current worktree's local gitdir (v0.19.13, plan-20260714 Part C W0 §C.5)**:
+  these queries now resolve (and test) THIS worktree's own `.libra` rather than
+  the shared common storage. For the main worktree the result is unchanged
+  (local == common); for a linked worktree `--git-dir` now points at its
+  private `.libra` (holding its own HEAD/index), so scripts that locate the
+  index/EDITMSG via `--git-dir` hit the correct per-worktree gitdir and
+  `--is-inside-git-dir` no longer misreports a cwd inside the linked `.libra`.
+
 - **`for-each-ref %(worktreepath)` resolves across worktrees (v0.19.10,
   plan-20260714 Part C W0 §C.3.3)**: the atom now reports the path of the
   worktree that actually has each branch checked out — resolved across ALL
