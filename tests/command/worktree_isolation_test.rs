@@ -512,6 +512,55 @@ fn ignore_other_worktrees_flag_cannot_bypass_in_multi_worktree() {
     );
 }
 
+/// Part C W0 (§C.11): `reflog expire --updateref` moves a branch tip; it
+/// refuses a branch checked out in another worktree (before any write).
+#[test]
+fn reflog_expire_updateref_refuses_branch_checked_out_elsewhere() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+    assert_cli_success(
+        &run_libra_command(&["switch", "feature"], &wt),
+        "wt switch feature",
+    );
+    // Commit on `feature` in the linked worktree so it has a (shared) branch
+    // reflog for `reflog expire` to resolve — otherwise expire errors with
+    // "reflog not found" before the cross-worktree guard runs.
+    fs::write(wt.join("f.txt"), "f\n").unwrap();
+    assert_cli_success(&run_libra_command(&["add", "f.txt"], &wt), "wt add");
+    assert_cli_success(
+        &run_libra_command(&["commit", "-m", "on-feature", "--no-verify"], &wt),
+        "wt commit on feature",
+    );
+
+    // From main, `reflog expire --updateref feature` is refused.
+    let out = run_libra_command(
+        &["reflog", "expire", "--updateref", "--expire=all", "feature"],
+        main,
+    );
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "reflog expire --updateref on a wt branch refused"
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("checked out"),
+        "names the collision: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // `--updateref` on main's own branch is allowed (no other-worktree conflict).
+    assert_cli_success(
+        &run_libra_command(&["reflog", "expire", "--updateref", "main"], main),
+        "reflog expire --updateref on own branch works",
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

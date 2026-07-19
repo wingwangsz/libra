@@ -4,6 +4,13 @@
 
 ### Changed
 
+- **`reflog expire --updateref` refuses a branch checked out in another
+  worktree (v0.19.21, plan-20260714 Part C W0 §C.11)**: `--updateref` moves a
+  pruned branch's tip to its newest surviving reflog entry; it now fails closed,
+  before any write, when a target branch is checked out in a different worktree
+  (moving its tip would diverge that worktree's working tree). Plain reflog
+  expiry (no `--updateref`) only trims entries and is unaffected.
+
 - **`op restore` refuses a branch checked out in another worktree (v0.19.20,
   plan-20260714 Part C W0 §C.11)**: `op restore` rewrites and prunes shared
   branch refs to reproduce a past operation's view; it now fails closed, before
