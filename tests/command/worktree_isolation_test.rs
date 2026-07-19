@@ -597,6 +597,54 @@ fn fast_import_refuses_branch_checked_out_elsewhere() {
     );
 }
 
+/// Part C W0 release gate (§C.11): GC's reachability walk reads only the
+/// CURRENT worktree's index, so a blob staged (but not committed) in a LINKED
+/// worktree is not yet a root. Until the typed `GcObjectSource` inventory
+/// lands, `maintenance run --task gc` must skip the loose-object prune in a
+/// multi-worktree repository rather than delete objects it cannot see.
+#[test]
+fn gc_skips_prune_in_multi_worktree_repo() {
+    let repo = repo_with_feature();
+    let main = repo.path();
+    let parent = tempfile::tempdir().expect("wt parent");
+    let wt = parent.path().join("wt");
+    assert_cli_success(
+        &run_libra_command(&["worktree", "add", wt.to_str().unwrap()], main),
+        "worktree add",
+    );
+
+    // Stage a blob ONLY in the linked worktree (never committed). Its object is
+    // reachable only from that worktree's private index.
+    fs::write(wt.join("staged-only.txt"), "precious\n").unwrap();
+    assert_cli_success(
+        &run_libra_command(&["add", "staged-only.txt"], &wt),
+        "stage blob in wt",
+    );
+    let oid = String::from_utf8_lossy(
+        &run_libra_command(&["hash-object", "staged-only.txt"], &wt).stdout,
+    )
+    .trim()
+    .to_string();
+    assert!(!oid.is_empty(), "hashed the staged blob");
+
+    // GC from the MAIN worktree must skip the prune (not delete the blob).
+    let gc = run_libra_command(&["maintenance", "run", "--task", "gc"], main);
+    assert_cli_success(&gc, "maintenance gc");
+    let text = String::from_utf8_lossy(&gc.stdout) + String::from_utf8_lossy(&gc.stderr);
+    assert!(
+        text.contains("linked worktree"),
+        "gc should report skipping the prune for linked worktrees: {text}"
+    );
+
+    // The staged-only blob must still be readable (no data loss).
+    let cat = run_libra_command(&["cat-file", "-p", &oid], main);
+    assert_cli_success(&cat, "staged-only blob survives gc");
+    assert!(
+        String::from_utf8_lossy(&cat.stdout).contains("precious"),
+        "the linked worktree's staged blob was pruned by gc"
+    );
+}
+
 #[test]
 fn sequencer_ops_refused_in_linked_worktree() {
     let repo = repo_with_feature();

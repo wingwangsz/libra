@@ -112,6 +112,18 @@
 
 ### Fixed
 
+- **`gc` no longer prunes objects reachable only from a linked worktree
+  (v0.19.23, plan-20260714 Part C W0 release gate §C.11)**: the
+  garbage-collection reachability walk reads only the CURRENT worktree's index,
+  so a blob staged (but not yet committed) in a linked worktree was not a root —
+  running `maintenance run --task gc` from the main worktree could delete it.
+  In a repository with linked worktrees `gc` now skips the loose-object prune
+  entirely and says so in its task message, instead of deleting objects it
+  cannot see. `--dry-run` still previews, and single-worktree repositories are
+  unaffected. Pruning is re-enabled there once every worktree's reachability
+  roots are collected. (`repack -d` was never affected — it only removes loose
+  objects that are now inside the new pack.)
+
 - **AI session/MCP storage roots no longer silently mint a phantom `.libra`
   (v0.19.12, plan-20260714 Part C W0 §C.4.1)**: the AI session-transcript store
   now fails closed (returns "no store", with a warning) when storage-root

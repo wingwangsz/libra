@@ -357,6 +357,21 @@ async fn run_cache_evict(dry_run: bool) -> CliResult<TaskResult> {
     })
 }
 
+/// plan-20260714 Part C W0 (§C.11 release gate): does this repository have any
+/// LINKED worktree besides the main one?
+///
+/// Object deletion is only safe when every worktree's reachability roots are
+/// collected. Until the typed `GcObjectSource` inventory covers linked private
+/// indexes / held sidecars / operation-view pointers, deletion paths fail
+/// closed whenever this returns true. A registry read failure is treated as
+/// "yes" (fail closed) rather than silently enabling a prune.
+fn repository_has_linked_worktrees() -> bool {
+    match crate::command::worktree::run_list_worktrees() {
+        Ok(list) => list.worktrees.iter().any(|entry| !entry.is_main),
+        Err(_) => true,
+    }
+}
+
 async fn run_gc(
     repo_path: &Path,
     dry_run: bool,
@@ -379,6 +394,28 @@ async fn run_gc(
             refs_packed: 0,
             packs_repacked: 0,
             message: "skipped loose-object prune: this store is shared (other repos borrow from                       it via alternates); have borrowers run 'libra alternates remove' first"
+                .to_string(),
+        });
+    }
+    // plan-20260714 Part C W0 release gate (§C.11): the reachability walk below
+    // reads only THIS worktree's index (`path::index()`) plus shared refs and
+    // sidecars. A linked worktree's private index — blobs staged or unmerged
+    // there but not yet committed — is NOT yet a GC root, so pruning here would
+    // delete objects that only that worktree can still reach. Until the typed
+    // `GcObjectSource` inventory lands, refuse to prune in a multi-worktree
+    // repository (the plan's prescribed fallback: fail closed rather than ship
+    // an incomplete root set).
+    if !dry_run && repository_has_linked_worktrees() {
+        return Ok(TaskResult {
+            task: "gc".to_string(),
+            success: true,
+            objects_removed: 0,
+            objects_packed: 0,
+            refs_packed: 0,
+            packs_repacked: 0,
+            message: "skipped loose-object prune: this repository has linked worktrees, whose \
+                      private index objects are not yet reachability roots; remove them with \
+                      'libra worktree remove' first, or run with --dry-run to preview"
                 .to_string(),
         });
     }
